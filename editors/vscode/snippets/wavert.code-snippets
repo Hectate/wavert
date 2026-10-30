@@ -1,0 +1,103 @@
+{
+  "Program": {
+    "prefix": "program",
+    "description": "A program: statements, then ;exit (§13)",
+    "body": [
+      "$0",
+      ";exit"
+    ]
+  },
+  "Library": {
+    "prefix": "library",
+    "description": "A library: declarations marked export, then ;end (§13.1)",
+    "body": [
+      ";export fn ${1:name}(${2:x}) {",
+      "\t$0",
+      "}",
+      "",
+      ";end"
+    ]
+  },
+  "Import": {
+    "prefix": "import",
+    "description": "Import a library (§13.1)",
+    "body": [
+      ";import ${1:lib} from \"${2:$1}.wvt\""
+    ]
+  },
+  "Function": {
+    "prefix": "fn",
+    "description": "Function definition (§6.1)",
+    "body": [
+      ";fn ${1:name}(${2:a, b}) {",
+      "\t$0",
+      "}"
+    ]
+  },
+  "Enum": {
+    "prefix": "enum",
+    "description": "Enumeration, top level only (§4.1)",
+    "body": [
+      ";enum ${1:Name} (${2:a, b})"
+    ]
+  },
+  "If": {
+    "prefix": "if",
+    "description": "if (§7.1)",
+    "body": [
+      ";if (${1:cond}) {",
+      "\t$0",
+      "}"
+    ]
+  },
+  "If else": {
+    "prefix": "if-else",
+    "description": "if / else (§7.1)",
+    "body": [
+      ";if (${1:cond}) {",
+      "\t$2",
+      "} else {",
+      "\t$0",
+      "}"
+    ]
+  },
+  "Loop over an array": {
+    "prefix": "while-each",
+    "description": "while loop over an array's elements (§7.4)",
+    "body": [
+      ";var ${1:i} is 0",
+      ";while (${1:i} < ${2:xs}(\\$length)) {",
+      "\t;const ${3:x} is ${2:xs}[${1:i}]",
+      "\t$0",
+      "\t;set ${1:i} += 1",
+      "}"
+    ]
+  },
+  "Match": {
+    "prefix": "match",
+    "description": "Multi-way branch (§7.5)",
+    "body": [
+      ";match (${1:x}) {",
+      "\tcase ${2:\"a\"} {",
+      "\t\t$0",
+      "\t}",
+      "\telse {",
+      "\t}",
+      "}"
+    ]
+  },
+  "Onfail": {
+    "prefix": "onfail",
+    "description": "Fail handler on its own line, indented one level (§8.2)",
+    "body": [
+      "\tonfail (${1:c}) { ${0:null} }"
+    ]
+  },
+  "Record": {
+    "prefix": "record",
+    "description": "Record literal (§10.7)",
+    "body": [
+      "{ ${1:kind}: ${2:value} }"
+    ]
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "name": "wavert-language",
+  "displayName": "Wavert",
+  "description": "Syntax highlighting, brackets and snippets for Wavert (.wvt)",
+  "version": "0.1.0",
+  "publisher": "wavert",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Snippets"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "wavert",
+        "aliases": [
+          "Wavert",
+          "wvt"
+        ],
+        "extensions": [
+          ".wvt"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "wavert",
+        "scopeName": "source.wavert",
+        "path": "./syntaxes/wavert.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "wavert",
+        "path": "./snippets/wavert.code-snippets"
+      }
+    ]
+  }
+}

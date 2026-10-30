@@ -6,8 +6,8 @@
 // for C) are wahc's, with Wavert wording in their messages. loader.wvt loads
 // the modules of the program being compiled. This file is the command line.
 //
-// Section numbers (§) in the comments refer to the Γ-- spec, wah/wah-spec.md:
-// Wavert changes its syntax and names, not its semantics.
+// Section numbers (§) in the comments refer to the Wavert specification,
+// docs/wavert-spec.md.
 //
 // Usage: wvc <file.wvt> [--target c|js] [-o <out>] [--runtime <runtime>]
 //        wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]

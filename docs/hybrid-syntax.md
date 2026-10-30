@@ -1,5 +1,7 @@
 # Wavert: a hybrid of Γ-- syntax (proposed changes)
 
+> This is the design document that derived Wavert from Γ--. The language itself is specified in [wavert-spec.md](wavert-spec.md).
+
 Γ-- inverts C-style syntax but keeps standard operator semantics (spec: [wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). Writing programs in it showed that only some of the inversions help. This document lists what Wavert, a "hybrid" syntax derived from Γ--, keeps, changes and drops. It also replaces every themed element (keywords, numerals, signals, type and constant names) with a standard equivalent, so that the result is judged on structure alone.
 
 Goal: keep the inversions that make code easier to write, parse and debug, and remove the ones that make it harder to read and to support in an editor.
@@ -202,4 +204,4 @@ Decisions made during the implementation, beyond this document:
 - A negative number is a literal: the parser folds `-` applied to a number literal, so `case -1` works and the syntax tree matches Γ--'s `WAH`. `-(5)` stays a negation.
 - Runtime messages call non-`var` arrays and records *frozen*: `cannot modify a frozen array`.
 - `wvc`'s default target is C. `--target js` is still available.
-- The syntax tree keeps `wahc`'s node kinds (`scheme`, `claim`, `lineup`, `suspect`, …), so the checker and code generators are unchanged. Renaming them is a possible later cleanup.
+- The syntax tree kept `wahc`'s node kinds (`scheme`, `claim`, `lineup`, `suspect`, …) through the bootstrap. They were renamed afterwards (`fn`, `decl`, `enum`, `match`, …), as were the runtime's internal names (`rt_tantrum` → `rt_panic`), with the generated code checked to be unchanged. `tools/verify.mjs` maps `wahc`'s names when it compares.

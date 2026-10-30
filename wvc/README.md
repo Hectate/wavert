@@ -31,14 +31,14 @@ Warnings and errors go to stderr, with exit code 2 on an error. The lexer and pa
 | `text.wvt` | Characters and text helpers |
 | `diag.wvt` | Diagnostics |
 | `lexer.wvt` | Lexer |
-| `parser.wvt` | Parser. It builds `wahc`'s syntax tree, whose node kinds keep their Γ-- names (`scheme` for `fn`, `claim` for `const`/`var`/`ref`, …); the comment at its top lists them. |
+| `parser.wvt` | Parser. The comment at its top lists the syntax tree's nodes. |
 | `loader.wvt` | Loading the modules of the program being compiled |
 | `checker.wvt` | Checker |
 | `codegen.wvt` | Code generator for `--target js` |
 | `codegen_c.wvt` | Code generator for C |
 | `dump.wvt` | `--tokens` and `--ast` |
 
-Section numbers (§) in comments and messages refer to the Γ-- spec, [../wah/wah-spec.md](../wah/wah-spec.md). Wavert changes Γ--'s syntax and names, not its semantics.
+Section numbers (§) in comments refer to the Wavert specification, [../docs/wavert-spec.md](../docs/wavert-spec.md).
 
 ## Changing wvc
 
@@ -65,4 +65,6 @@ Run `npm test` here (Node ≥ 22.3). The tests need [Zig](https://ziglang.org), 
 | `examples.test.js` | Every example, natively and on Node, prints what it should. |
 | `syntax.test.js` | Wavert's syntax and what it means: precedence, argument grouping, declarations, `set`, `match`, `fail`/`onfail`, modules. |
 | `errors.test.js` | The diagnostics for common mistakes. |
+| `spec.test.js` | The complete programs in [../docs/wavert-spec.md](../docs/wavert-spec.md) compile, and its §14 example runs. |
+| `grammar.test.js` | The VS Code grammar ([../editors/vscode](../editors/vscode)) agrees with the lexer's keywords, the stdlib table and the number syntax. |
 | `convert.test.js` | `tools/wah2wvt.wah`, built with `wahc` from `../wah`: the Γ-- examples convert to Wavert that has the same syntax tree and compiles to the same C and JavaScript. |

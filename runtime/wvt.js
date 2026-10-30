@@ -7,19 +7,19 @@
 // record -> null-prototype object with keys f_<name> (frozen, or sealed if mutable),
 // enum member -> frozen Member.
 //
-// A host object on globalThis.$wahHost may override I/O (used by tests and `wahc0 run`):
+// A host object on globalThis.$wvtHost may override I/O (used by tests):
 // { fs, args, write(fd, s), readLine(), env(name), exit(code) }.
 
 const $rt = (function () {
   'use strict';
-  const host = globalThis.$wahHost || {};
+  const host = globalThis.$wvtHost || {};
   let fsMod = host.fs || null;
   const fs = () => fsMod || (fsMod = process.getBuiltinModule('node:fs'));
   const MAX = 9007199254740991;
   Error.stackTraceLimit = 50;
 
   class F { constructor(v) { this.v = v; } }
-  class Wah {
+  class Fail {
     constructor(code, fresh, from) {
       this.code = code;
       this.fresh = fresh; // true until it leaves the function that raised it
@@ -28,13 +28,13 @@ const $rt = (function () {
   }
   // An enum member (§4.1): immutable, and equal only to itself.
   class Member {
-    constructor(lineup, name) {
-      this.lineup = lineup;
+    constructor(enumName, name) {
+      this.enumName = enumName;
       this.name = name;
       Object.freeze(this);
     }
   }
-  class Tantrum extends Error {
+  class Panic extends Error {
     constructor(value) {
       super(typeof value === 'string' ? value : show(value));
       this.name = 'panic';
@@ -42,8 +42,8 @@ const $rt = (function () {
     }
   }
 
-  const NOBODY = new F(NaN);
-  const EVERYBODY = new F(Infinity);
+  const NAN = new F(NaN);
+  const INF = new F(Infinity);
   const f = (v) => new F(v);
   const isNum = (x) => typeof x === 'number' || x instanceof F;
   const isRec = (x) => x !== null && typeof x === 'object' && Object.getPrototypeOf(x) === null;
@@ -57,11 +57,11 @@ const $rt = (function () {
     if (x === null) return 'null';
     if (Array.isArray(x)) return 'array';
     if (isRec(x)) return 'record';
-    if (x instanceof Member) return x.lineup;
+    if (x instanceof Member) return x.enumName;
     return 'unknown';
   }
 
-  function fail(msg) { throw new Tantrum(msg); }
+  function fail(msg) { throw new Panic(msg); }
 
   function int(r, op) {
     if (!(r <= MAX && r >= -MAX)) fail(`integer overflow in '${op}'`);
@@ -253,13 +253,13 @@ const $rt = (function () {
 
   // ---- enums (§4.1, §7.5) ----
 
-  function lineup(name, members) {
+  function makeEnum(name, members) {
     const l = Object.create(null);
     for (const m of members) l['m_' + m] = new Member(name, m);
     return Object.freeze(l);
   }
   // An exhaustive match whose subject is not one of the enum's members.
-  function noAlibi(v) { fail(`match: no case for ${show(v)}`); }
+  function noCase(v) { fail(`match: no case for ${show(v)}`); }
 
   // ---- arrays (§10) ----
 
@@ -291,26 +291,26 @@ const $rt = (function () {
   }
   const frozen = (a) => Object.freeze(a);
   // Copy happens only when mutability changes (§10.4, §10.9).
-  function bind(v, shifty) {
+  function bind(v, isMut) {
     if (isRec(v)) {
       const sh = SHIFTY.has(v);
-      if (shifty) return sh ? v : rec(Object.assign(Object.create(null), v), true);
+      if (isMut) return sh ? v : rec(Object.assign(Object.create(null), v), true);
       return sh ? Object.freeze(Object.assign(Object.create(null), v)) : v;
     }
     if (!Array.isArray(v)) return v;
     const fr = Object.isFrozen(v);
-    if (shifty) return fr ? v.slice() : v;
+    if (isMut) return fr ? v.slice() : v;
     return fr ? v : Object.freeze(v.slice());
   }
 
   // ---- records (§10.7-§10.10) ----
   // Keys are mangled as f_<name>, so no Γ-- key can reach a JS built-in, and
-  // reads check own properties. Shifty records are sealed (fixed shape) and
+  // reads check own properties. Mutable records are sealed (fixed shape) and
   // tracked in SHIFTY, because an empty sealed object also counts as frozen.
 
   const SHIFTY = new WeakSet();
-  function rec(o, shifty) {
-    if (!shifty) return Object.freeze(o);
+  function rec(o, isMut) {
+    if (!isMut) return Object.freeze(o);
     SHIFTY.add(Object.seal(o));
     return o;
   }
@@ -342,33 +342,33 @@ const $rt = (function () {
 
   // ---- fails, panics, exit (§8, §13) ----
 
-  function signal(code) {
+  function failWith(code) {
     if (typeof code !== 'number' || code < 1) fail(`a fail code must be an integer >= 1, got ${show(code)}`);
-    return new Wah(code, true, null);
+    return new Fail(code, true, null);
   }
-  // A signal raised by a stdlib function arrives at its caller already "left".
-  const wah = (from, code = 1) => new Wah(code, false, from);
+  // A fail raised by a stdlib function arrives at its caller already "left".
+  const stdFail = (from, code = 1) => new Fail(code, false, from);
 
   function tdz(e) {
     const m = /\bw\d*_(\w+)/.exec(e.message);
-    return new Tantrum(m ? `'${m[1]}' was used before its declaration` : e.message);
+    return new Panic(m ? `'${m[1]}' was used before its declaration` : e.message);
   }
-  // Called when an error leaves a scheme. A signal the scheme raised itself goes
-  // on to its caller; a signal that came from a callee and was not handled with
-  // whine becomes a runtime error here (one-frame rule).
+  // Called when an error leaves a function. A fail the function raised itself goes
+  // on to its caller; a fail that came from a callee and was not handled with
+  // onfail becomes a runtime error here (one-frame rule).
   function leave(e, name) {
-    if (e instanceof Wah) {
+    if (e instanceof Fail) {
       if (e.fresh) {
         e.fresh = false;
         e.from = name;
         return e;
       }
-      return new Tantrum(`unhandled fail (code ${e.code}) from '${e.from}' in '${name}'`);
+      return new Panic(`unhandled fail (code ${e.code}) from '${e.from}' in '${name}'`);
     }
     if (e instanceof ReferenceError) return tdz(e);
     return e;
   }
-  const tantrum = (v) => new Tantrum(v);
+  const panic = (v) => new Panic(v);
 
   function exit(code) {
     if (typeof code !== 'number') fail(`an exit code must be an int, got ${typeName(code)}`);
@@ -380,13 +380,13 @@ const $rt = (function () {
     try {
       fn();
     } catch (e0) {
-      if (e0 && e0.__wahExit !== undefined) throw e0;
+      if (e0 && e0.__wvtExit !== undefined) throw e0;
       let e = e0;
-      if (e instanceof Wah) e = new Tantrum(`unhandled fail (code ${e.code}) from '${e.from}'`);
+      if (e instanceof Fail) e = new Panic(`unhandled fail (code ${e.code}) from '${e.from}'`);
       else if (e instanceof ReferenceError) e = tdz(e);
-      else if (e instanceof RangeError && /call stack/.test(e.message)) e = new Tantrum('stack overflow');
+      else if (e instanceof RangeError && /call stack/.test(e.message)) e = new Panic('stack overflow');
       let out = '';
-      if (e instanceof Tantrum) {
+      if (e instanceof Panic) {
         out += `uncaught panic: ${e.message}\n`;
         for (const m of String(e.stack).matchAll(/at w\d*_(\w+)/g)) out += `    in ${m[1]}\n`;
       } else {
@@ -490,36 +490,36 @@ const $rt = (function () {
   std.eprint = (v) => { write(2, text(v) + '\n'); return null; };
   std.readLine = () => {
     const line = readLine();
-    if (line === null) throw wah('$readLine');
+    if (line === null) throw stdFail('$readLine');
     return line;
   };
 
   std.readFile = (p) => {
     aString(p, '$readFile');
-    try { return fs().readFileSync(p, 'utf8'); } catch { throw wah('$readFile'); }
+    try { return fs().readFileSync(p, 'utf8'); } catch { throw stdFail('$readFile'); }
   };
   std.writeFile = (p, t) => {
     aString(p, '$writeFile');
     aString(t, '$writeFile');
-    try { fs().writeFileSync(p, t, 'utf8'); } catch { throw wah('$writeFile'); }
+    try { fs().writeFileSync(p, t, 'utf8'); } catch { throw stdFail('$writeFile'); }
     return null;
   };
   std.appendFile = (p, t) => {
     aString(p, '$appendFile');
     aString(t, '$appendFile');
-    try { fs().appendFileSync(p, t, 'utf8'); } catch { throw wah('$appendFile'); }
+    try { fs().appendFileSync(p, t, 'utf8'); } catch { throw stdFail('$appendFile'); }
     return null;
   };
   std.fileExists = (p) => fs().existsSync(aString(p, '$fileExists'));
   std.listDir = (p) => {
     aString(p, '$listDir');
     let names;
-    try { names = fs().readdirSync(p); } catch { throw wah('$listDir'); }
+    try { names = fs().readdirSync(p); } catch { throw stdFail('$listDir'); }
     return Object.freeze(names.slice().sort(cmpStr));
   };
   std.deleteFile = (p) => {
     aString(p, '$deleteFile');
-    try { fs().unlinkSync(p); } catch { throw wah('$deleteFile'); }
+    try { fs().unlinkSync(p); } catch { throw stdFail('$deleteFile'); }
     return null;
   };
 
@@ -530,7 +530,7 @@ const $rt = (function () {
   std.env = (n) => {
     aString(n, '$env');
     const v = host.env ? host.env(n) : process.env[n];
-    if (v === undefined) throw wah('$env');
+    if (v === undefined) throw stdFail('$env');
     return v;
   };
   // The file the host started (§12.4): the compiled .js under node, or what the host says.
@@ -549,7 +549,7 @@ const $rt = (function () {
     if (host.run) return host.run(program, args.slice());
     const r = process.getBuiltinModule('node:child_process')
       .spawnSync(program, args, { stdio: 'inherit', shell: false, windowsHide: true });
-    if (r.error) throw wah('$run');
+    if (r.error) throw stdFail('$run');
     if (r.status !== null) return r.status;
     return 128 + (process.getBuiltinModule('node:os').constants.signals[r.signal] ?? 0);
   };
@@ -613,9 +613,9 @@ const $rt = (function () {
     if (/^-?\d+$/.test(x)) {
       const v = Number(x);
       if (Number.isSafeInteger(v)) return v + 0;
-      throw wah('$toInt');
+      throw stdFail('$toInt');
     }
-    throw wah('$toInt');
+    throw stdFail('$toInt');
   };
   std.toFloat = (x) => {
     if (typeof x === 'number') return new F(x);
@@ -624,10 +624,10 @@ const $rt = (function () {
     if (/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(x)) {
       // Number() rounds correctly; a result too large for a double signals (§9.5).
       const v = Number(x);
-      if (!Number.isFinite(v)) throw wah('$toFloat');
+      if (!Number.isFinite(v)) throw stdFail('$toFloat');
       return new F(v);
     }
-    throw wah('$toFloat');
+    throw stdFail('$toFloat');
   };
 
   function rounder(name, fn) {
@@ -673,10 +673,10 @@ const $rt = (function () {
   };
 
   return {
-    F, Wah, Tantrum, NOBODY, EVERYBODY, f,
+    F, Fail, Panic, NAN, INF, f,
     add, sub, mul, div, mod, pow, neg, eq, ne, lt, le, gt, ge,
-    band, bor, bxor, bnot, shl, shr, bool, not, cond, text, lineup, noAlibi,
-    idx, setIdx, updIdx, frozen, bind, rec, get, setMem, updMem, signal, leave, tantrum, exit, main, std,
+    band, bor, bxor, bnot, shl, shr, bool, not, cond, text, makeEnum, noCase,
+    idx, setIdx, updIdx, frozen, bind, rec, get, setMem, updMem, failWith, leave, panic, exit, main, std,
   };
 })();
 const $std = $rt.std;

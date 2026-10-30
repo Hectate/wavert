@@ -5,19 +5,16 @@
 // Several arguments are grouped before the call, `(a, b)(f)`, and `(f)` or
 // `(module.f)` where an expression starts is a call with no arguments.
 //
-// The syntax tree is wahc's, so the checker and the code generators are
-// shared with it, and its node kinds keep wahc's Γ-- names:
+// The syntax tree has the shape of wahc's (the Γ-- compiler this one was
+// forked from), with Wavert names:
 // Expression nodes (k): int float str bool null nan inf name std arr rec idx mem
-//   un bin tern call sigcall chain suspect. Each has pos and paren (true when parenthesized).
-// Statement nodes (k): empty scheme lineup steal bribe getaway tantrum bail loiter
-//   lurk signal exit expr claim cheat. Each has pos, end and handler: null, or the statement's
+//   un bin tern call failWith chain match. Each has pos and paren (true when parenthesized).
+//   failWith is `;fail c` with a computed code; chain is an if/!if/else chain.
+// Statement nodes (k): empty fn enum import end return panic break continue
+//   while fail exit expr decl set. Each has pos, end and handler: null, or the statement's
 //   onfail handler as { pos, param, paramPos, body }.
-// Wavert words map onto them: fn is a scheme, enum a lineup, import a steal,
-// const/var/ref a claim (isShifty for var, isFickle for ref), set a cheat,
-// return a getaway, panic a tantrum, break and continue are bail and loiter,
-// while is lurk, if and !if are a chain, match/case a suspect with alibis,
-// fail a signal (or a sigcall statement), and exit is exit. The export
-// modifiers are collected into the bribe statement that ;end becomes.
+//   decl is const, var (isVar) or ref (isRef); fail has a literal code; end holds
+//   the names of the declarations marked export, which the parser collects.
 
 ;import text from "text.wvt"
 ;import diag from "diag.wvt"
@@ -25,7 +22,7 @@
 
 ;const exprStart is ["int", "float", "str", "true", "false", "null", "nan", "inf", "id", "std",
   "(", "[", "{{", "if", "!if", "match", "-", "!", "~"]
-;const whineOk is ["expr", "claim", "cheat", "getaway", "tantrum", "exit"]
+;const onfailOk is ["expr", "decl", "set", "return", "panic", "exit"]
 ;const callees is ["id", "std"]
 ;const exportable is ["fn", "const", "var", "ref", "enum"]
 
@@ -76,7 +73,7 @@
 // Conditional chains count as having an effect.
 ;fn hasEffect(e) {
     ;const kind is e.k
-    ;if (kind == "call" || kind == "sigcall" || kind == "chain" || kind == "suspect") { ;return true }
+    ;if (kind == "call" || kind == "failWith" || kind == "chain" || kind == "match") { ;return true }
     ;if (kind == "str") {
         ;var i is 0
         ;while (i < e.parts($length)) {
@@ -177,9 +174,9 @@
             ;if (ended != null && s.k != "empty") {
                 ;(ended, "';end' must be the last statement of a library")(failAt)
             }
-            ;if (s.k == "steal" && started) { ;(s.pos, "'import' must come before every other statement")(diag.abort) }
-            ;if (s.k != "steal" && s.k != "empty") { ;set started to true }
-            ;if (s.k == "bribe") { ;set ended to { pos: s.pos } }
+            ;if (s.k == "import" && started) { ;(s.pos, "'import' must come before every other statement")(diag.abort) }
+            ;if (s.k != "import" && s.k != "empty") { ;set started to true }
+            ;if (s.k == "end") { ;set ended to { pos: s.pos } }
             ;(stmts, s)($push)
         }
         ;if (firstExport != null && ended == null) {
@@ -198,7 +195,7 @@
         ;set s.pos to tk.pos
         ;if ("onfail"(at)) {
             ;const w is (next)
-            ;if (!(whineOk, s.k)(text.contains)) {
+            ;if (!(onfailOk, s.k)(text.contains)) {
                 ;(w, "'onfail' must follow a statement whose value comes from a call")(failAt)
             }
             ;var param is null
@@ -230,20 +227,20 @@
         ;if (kind == "return") {
             ;(next)
             ;const e is (exprStart, (peek).t)(text.contains) ? (expr) : null
-            ;return ("getaway", e)(simpleStatement)
+            ;return ("return", e)(simpleStatement)
         }
         ;if (kind == "panic") {
             ;(next)
-            ;return ("tantrum", (expr))(simpleStatement)
+            ;return ("panic", (expr))(simpleStatement)
         }
         ;if (kind == "break" || kind == "continue") {
             ;(next)
-            ;return { k: kind == "break" ? "bail" : "loiter", pos: null, end: null, handler: null }
+            ;return { k: kind == "break" ? "break" : "continue", pos: null, end: null, handler: null }
         }
         ;if (kind == "while" || kind == "!while") {
             ;(next)
             ;return {
-                k: "lurk", neg: kind == "!while", cond: kind(cond), body: (block),
+                k: "while", neg: kind == "!while", cond: kind(cond), body: (block),
                 pos: null, end: null, handler: null
             }
         }
@@ -278,7 +275,7 @@
         ;("is", ";{kw.t} {name.v} is value")(expectWord)
         ;const e is (expr)
         {
-            k: "claim", e: e, isShifty: kw.t == "var", isFickle: kw.t == "ref", name: name.v, namePos: name.pos,
+            k: "decl", e: e, isVar: kw.t == "var", isRef: kw.t == "ref", name: name.v, namePos: name.pos,
             pos: null, end: null, handler: null
         }
     }
@@ -289,11 +286,11 @@
         ;const target is (lvalue)
         ;if ("to"(atWord)) {
             ;(next)
-            ;return { k: "cheat", e: (expr), op: null, target: target, pos: null, end: null, handler: null }
+            ;return { k: "set", e: (expr), op: null, target: target, pos: null, end: null, handler: null }
         }
         ;if ("opset"(at)) {
             ;const op is (next)
-            ;return { k: "cheat", e: (expr), op: op.v, target: target, pos: null, end: null, handler: null }
+            ;return { k: "set", e: (expr), op: op.v, target: target, pos: null, end: null, handler: null }
         }
         ;const found is (peek)
         ;(found, "expected 'to' or a compound assignment such as '+=' after the target, found {found(describe)}",
@@ -304,7 +301,7 @@
     ;fn failStatement() {
         ;const kw is (next)
         ;if (!(exprStart, (peek).t)(text.contains)) {
-            ;return { k: "signal", code: 1, pos: null, end: null, handler: null }
+            ;return { k: "fail", code: 1, pos: null, end: null, handler: null }
         }
         ;const first is (peek)
         ;const e is (expr)
@@ -312,9 +309,9 @@
             ;(first, "a fail code must be an integer >= 1")(failAt)
         }
         ;if (e.k == "int") {
-            ;return { k: "signal", code: e.v, pos: null, end: null, handler: null }
+            ;return { k: "fail", code: e.v, pos: null, end: null, handler: null }
         }
-        ("expr", { k: "sigcall", arg: e, pos: kw.pos, paren: false })(simpleStatement)
+        ("expr", { k: "failWith", arg: e, pos: kw.pos, paren: false })(simpleStatement)
     }
 
     // ;import name from "path.wvt" (§13.1). The path is a plain string literal.
@@ -333,7 +330,7 @@
         ;if (!(path($length) >= 4 && (path, -4, path($length))($slice) == ".wvt")) {
             ;(e, "an import path includes the .wvt extension")(failAt)
         }
-        { k: "steal", path: path, pathPos: e.pos, name: name.v, namePos: name.pos, pos: null, end: null, handler: null }
+        { k: "import", path: path, pathPos: e.pos, name: name.v, namePos: name.pos, pos: null, end: null, handler: null }
     }
 
     // ;export before a top-level declaration (§13.1).
@@ -357,7 +354,7 @@
         ;if (exports($length) == 0) {
             ;(kw, "a library must export at least one declaration", "mark one with 'export', e.g. ;export fn name(x) {{ ... }}")(failAtHint)
         }
-        { k: "bribe", names: exports, pos: null, end: null, handler: null }
+        { k: "end", names: exports, pos: null, end: null, handler: null }
     }
 
     // ;fn name(a, var b, ref c) { ... } (§6.1).
@@ -371,16 +368,16 @@
         ;var params is []
         ;if (!")"(at)) {
             ;while (true) {
-                ;const isShifty is "var"(accept) != null
-                ;const isFickle is !isShifty && ("ref"(accept) != null)
+                ;const isVar is "var"(accept) != null
+                ;const isRef is !isVar && ("ref"(accept) != null)
                 ;const pname is ("id", "expected a parameter name", "a parameter is a name, var name or ref name")(expect)
-                ;(params, { name: pname.v, isShifty: isShifty, isFickle: isFickle, pos: pname.pos })($push)
+                ;(params, { name: pname.v, isVar: isVar, isRef: isRef, pos: pname.pos })($push)
                 ;if (","(accept) == null) { ;break }
             }
         }
         ;(")", "expected ')' to close the parameter list", null)(expect)
         {
-            k: "scheme", name: name.v, namePos: name.pos, params: params, body: (block),
+            k: "fn", name: name.v, namePos: name.pos, params: params, body: (block),
             pos: null, end: null, handler: null
         }
     }
@@ -416,7 +413,7 @@
         }
         ;(")", "expected ',' or ')' in the member list", null)(expect)
         {
-            k: "lineup", name: name.v, namePos: name.pos, members: members,
+            k: "enum", name: name.v, namePos: name.pos, members: members,
             pos: null, end: null, handler: null
         }
     }
@@ -687,7 +684,7 @@
         ;const kw is (next)
         ;const subject is "match"(cond)
         ;("{{", "expected '{{' after the match's subject", null)(expect)
-        ;var alibis is []
+        ;var cases is []
         ;var els is null
         ;while (true) {
             ;if ("case"(at)) {
@@ -699,21 +696,21 @@
                 ;var values is []
                 ;(values, (caseValue))($push)
                 ;while (","(accept) != null) { ;(values, (caseValue))($push) }
-                ;(alibis, { values: values, body: (block), pos: a.pos })($push)
+                ;(cases, { values: values, body: (block), pos: a.pos })($push)
             } else if ("else"(at)) {
                 ;const a is (next)
                 ;if (els != null) { ;(a, "a match has only one 'else'")(failAt) }
-                ;if (alibis($length) == 0) { ;(a, "a match needs at least one case before 'else'")(failAt) }
+                ;if (cases($length) == 0) { ;(a, "a match needs at least one case before 'else'")(failAt) }
                 ;set els to (block)
             } else {
                 ;break
             }
         }
-        ;if (alibis($length) == 0) {
+        ;if (cases($length) == 0) {
             ;((peek), "a match needs at least one case", "match (x) {{ case \"a\" {{ ... }} }}")(failAtHint)
         }
         ;("}}", "expected 'case', 'else' or '}}' in a match", null)(expect)
-        { k: "suspect", subject: subject, alibis: alibis, els: els, pos: kw.pos, paren: false }
+        { k: "match", subject: subject, cases: cases, els: els, pos: kw.pos, paren: false }
     }
 
     // A case value: a literal, or Enum.member, which the checker resolves (§7.5).

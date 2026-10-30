@@ -22,15 +22,15 @@
 // How an expression's evaluation interacts with others (see seq).
 ;const constK is 0 // a constant: nothing can change it
 ;const pureK is 1 // reads a binding, so another argument's effects could change it
-;const effectK is 2 // may have effects or raise a tantrum
+;const effectK is 2 // may have effects or panic
 
 ;fn binFn(op) {
     ;var k is 0
     ;while (binOps[k] != op) { ;set k += 1 }
     binFns[k]
 }
-// How a declaration or parameter binds its values (§10.4): "shifty", "fickle" or "const".
-;fn modeOf(x) { x.isShifty ? "shifty" : x.isFickle ? "fickle" : "const" }
+// How a declaration or parameter binds its values (§10.4): "var", "ref" or "const".
+;fn modeOf(x) { x.isVar ? "var" : x.isRef ? "ref" : "const" }
 
 ;fn unFn(op) { op == "-" ? "neg" : op == "!" ? "not" : "bnot" }
 
@@ -103,7 +103,7 @@
     ;var strings is []
     ;var fields is []
     ;var shapes is []
-    ;var lineupDefs is []
+    ;var enumDefs is []
     ;var globals is []
     ;var frames is []
     ;var functions is []
@@ -113,8 +113,8 @@
     ;var loops is 0
     ;var iife is false
 
-    // Bindings: { kind, name, func, cname, isFickle, captured, schemeFn }, where func
-    // is the index of the function that owns it, and schemeFn, for a function, its
+    // Bindings: { kind, name, func, cname, isRef, captured, fnIndex }, where func
+    // is the index of the function that owns it, and fnIndex, for a function, its
     // own function. Functions: { name, parent, depth, top, children, cname },
     // where parent is null for a module's top level.
     ;var decls is []
@@ -129,7 +129,7 @@
     ;var mod is ""
     ;var curSlot is []
     ;var stolen is []
-    ;var ownLineups is []
+    ;var ownEnums is []
     ;var cur is 0
 
     // The id of module m: its place in initialization order for a library, "" for the entry file.
@@ -177,12 +177,12 @@
     ;fn bind(kind, name, f, atTop, mode) {
         ;var cname is "w{mod}_{name}"
         ;if (!atTop) {
-            ;set cname to (kind == "scheme" ? "s" : "v") + "{n}_{name}"
+            ;set cname to (kind == "fn" ? "s" : "v") + "{n}_{name}"
             ;set n += 1
         }
-        ;var d is { kind: kind, name: name, func: f, cname: cname, isFickle: mode == "fickle", captured: false, schemeFn: null }
+        ;var d is { kind: kind, name: name, func: f, cname: cname, isRef: mode == "ref", captured: false, fnIndex: null }
         ;(decls, d)($push)
-        ;if (fns[f].top && kind != "scheme") { ;(globals, cname)($push) }
+        ;if (fns[f].top && kind != "fn") { ;(globals, cname)($push) }
         decls($length) - 1
     }
 
@@ -192,20 +192,20 @@
         ;var k is 0
         ;while (k < list($length)) {
             ;const s is list[k]
-            ;if (s.k == "scheme") {
-                ;const d is ("scheme", s.name, f, atTop, "")(bind)
+            ;if (s.k == "fn") {
+                ;const d is ("fn", s.name, f, atTop, "")(bind)
                 ;const child is (s.name, f)(newFn)
                 ;set fns[child].cname to decls[d].cname
-                ;set decls[d].schemeFn to child
+                ;set decls[d].fnIndex to child
                 ;set fns[f].children += 1
                 ;set curSlot[s.namePos] to d
-                ;(scope, s.name, "scheme", d)(put)
-            } else if (s.k == "lineup") {
-                ;(scope, s.name, "lineup", null)(put)
-            } else if (s.k == "claim") {
-                ;const d is ("claim", s.name, f, atTop, s(modeOf))(bind)
+                ;(scope, s.name, "fn", d)(put)
+            } else if (s.k == "enum") {
+                ;(scope, s.name, "enum", null)(put)
+            } else if (s.k == "decl") {
+                ;const d is ("decl", s.name, f, atTop, s(modeOf))(bind)
                 ;set curSlot[s.namePos] to d
-                ;(scope, s.name, "claim", d)(put)
+                ;(scope, s.name, "decl", d)(put)
             }
             ;set k += 1
         }
@@ -219,9 +219,9 @@
 
     ;fn astmt(ref s, scope, f, topScope) {
         ;const kind is s.k
-        ;if (kind == "scheme") {
+        ;if (kind == "fn") {
             ;const d is curSlot[s.namePos]
-            ;const child is decls[d].schemeFn
+            ;const child is decls[d].fnIndex
             ;const ps is scope(newScope)
             ;var k is 0
             ;while (k < s.params($length)) {
@@ -232,14 +232,14 @@
                 ;set k += 1
             }
             ;(s.body, ps(newScope), child, topScope)(ablock)
-        } else if (kind == "lurk") {
+        } else if (kind == "while") {
             ;(s.cond, scope, f)(aexpr)
             ;(s.body, scope(newScope), f, topScope)(ablock)
-        } else if (kind == "getaway" || kind == "tantrum" || kind == "exit" || kind == "claim") {
+        } else if (kind == "return" || kind == "panic" || kind == "exit" || kind == "decl") {
             ;if (s.e != null) { ;(s.e, scope, f)(aexpr) }
         } else if (kind == "expr") {
-            ;if (s.e.k == "sigcall") { ;(s.e.arg, scope, f)(aexpr) } else { ;(s.e, scope, f)(aexpr) }
-        } else if (kind == "cheat") {
+            ;if (s.e.k == "failWith") { ;(s.e.arg, scope, f)(aexpr) } else { ;(s.e, scope, f)(aexpr) }
+        } else if (kind == "set") {
             ;(s.e, scope, f)(aexpr)
             ;(s.target, scope, f)(atarget)
         }
@@ -247,9 +247,9 @@
             ;const h is s.handler
             ;const hs is scope(newScope)
             ;if (h.param != null) {
-                ;const wd is ("whine", h.param, f, false, "")(bind)
+                ;const wd is ("onfail", h.param, f, false, "")(bind)
                 ;set curSlot[h.paramPos] to wd
-                ;(hs, h.param, "whine", wd)(put)
+                ;(hs, h.param, "onfail", wd)(put)
             }
             ;(h.body, hs(newScope), f, topScope)(ablock)
         }
@@ -273,7 +273,7 @@
         ;if (x.k == "mem") { ;return x.rec.k == "name" && (scope, x.rec.name)(kindOf) == "module" }
         ;if (x.k != "name") { ;return false }
         ;const kind is (scope, x.name)(kindOf)
-        kind == "lineup" || kind == "module"
+        kind == "enum" || kind == "module"
     }
 
     ;fn aexpr(ref e, scope, f) {
@@ -318,11 +318,11 @@
                 ;set k += 1
             }
             ;if (e.els != null) { ;(e.els, scope(newScope), f, null)(ablock) }
-        } else if (kind == "suspect") {
+        } else if (kind == "match") {
             ;(e.subject, scope, f)(aexpr)
             ;var k is 0
-            ;while (k < e.alibis($length)) {
-                ;(e.alibis[k].body, scope(newScope), f, null)(ablock)
+            ;while (k < e.cases($length)) {
+                ;(e.cases[k].body, scope(newScope), f, null)(ablock)
                 ;set k += 1
             }
             ;if (e.els != null) { ;(e.els, scope(newScope), f, null)(ablock) }
@@ -343,10 +343,10 @@
         ;(slots, slot)($push)
         ;set curSlot to slot
         ;const scope is null(newScope)
-        ;const steals is modules[m].steals
+        ;const imports is modules[m].imports
         ;var k is 0
-        ;while (k < steals($length)) {
-            ;(scope, steals[k].node.name, "module", null)(put)
+        ;while (k < imports($length)) {
+            ;(scope, imports[k].node.name, "module", null)(put)
             ;set k += 1
         }
         ;({ stmts: modules[m].program.stmts, value: null }, scope, top, scope)(ablock)
@@ -362,17 +362,17 @@
         ;set curSlot to slots[m]
         ;set cur to tops[m]
         ;set stolen to []
-        ;set ownLineups to []
+        ;set ownEnums to []
         ;const list is modules[m].program.stmts
         ;var k is 0
         ;while (k < list($length)) {
-            ;if (list[k].k == "lineup") { ;(ownLineups, list[k])($push) }
+            ;if (list[k].k == "enum") { ;(ownEnums, list[k])($push) }
             ;set k += 1
         }
-        ;const steals is modules[m].steals
+        ;const imports is modules[m].imports
         ;set k to 0
-        ;while (k < steals($length)) {
-            ;(stolen, { name: steals[k].node.name, lib: steals[k].lib })($push)
+        ;while (k < imports($length)) {
+            ;(stolen, { name: imports[k].node.name, lib: imports[k].lib })($push)
             ;set k += 1
         }
     }
@@ -396,7 +396,7 @@
     }
 
     // An enum is a static array of its members (§4.1).
-    ;fn lineupDef(s, m) {
+    ;fn enumDef(s, m) {
         ;const nm is s.name(str)
         ;var members is []
         ;var k is 0
@@ -404,7 +404,7 @@
             ;(members, "{{ {nm}, {s.members[k].name(str)} }}")($push)
             ;set k += 1
         }
-        ;(lineupDefs, "static const wmem l{m}_{s.name}[] = {{ {(members, ", ")($join)} }};")($push)
+        ;(enumDefs, "static const wmem l{m}_{s.name}[] = {{ {(members, ", ")($join)} }};")($push)
     }
 
     // The index of the module that x names, or null. The checker forbids shadowing a module name.
@@ -419,19 +419,19 @@
     }
 
     // The enum statement named name in a list of statements, or null.
-    ;fn lineupIn(ref list, name) {
+    ;fn enumIn(ref list, name) {
         ;var k is 0
         ;while (k < list($length)) {
-            ;if (list[k].k == "lineup" && list[k].name == name) { ;return list[k] }
+            ;if (list[k].k == "enum" && list[k].name == name) { ;return list[k] }
             ;set k += 1
         }
         null
     }
 
     // The C name and statement of the enum x names (Enum or module.Enum), as { c, node }, or null.
-    ;fn lineupOf(ref x) {
+    ;fn enumOf(ref x) {
         ;if (x.k == "name") {
-            ;const s is (ownLineups, x.name)(lineupIn)
+            ;const s is (ownEnums, x.name)(enumIn)
             ;return s == null ? null : { c: "l{mod}_{x.name}", node: s }
         }
         ;if (x.k != "mem") { ;return null }
@@ -440,8 +440,8 @@
         ;const xs is modules[lib].exports
         ;var k is 0
         ;while (k < xs($length) && xs[k].name != x.field) { ;set k += 1 }
-        ;if (k == xs($length) || xs[k].kind != "lineup") { ;return null }
-        { c: "l{lib(modId)}_{x.field}", node: (modules[lib].program.stmts, x.field)(lineupIn) }
+        ;if (k == xs($length) || xs[k].kind != "enum") { ;return null }
+        { c: "l{lib(modId)}_{x.field}", node: (modules[lib].program.stmts, x.field)(enumIn) }
     }
 
     // Where binding d lives, seen from the current function.
@@ -452,7 +452,7 @@
         "up{("->up", fns[cur].depth - fns[owner].depth - 1)(repeat)}->{decls[d].cname}"
     }
     // Does reading d need the temporal dead zone check (§5.1)?
-    ;fn tdz(d) { decls[d].kind == "claim" && decls[d].func != cur }
+    ;fn tdz(d) { decls[d].kind == "decl" && decls[d].func != cur }
     ;fn read(d) {
         d(tdz) ? { c: "rt_def({d(place)}, {decls[d].name(text.quote)})", k: effectK } : { c: d(place), k: pureK }
     }
@@ -505,7 +505,7 @@
         ;var k is 0
         ;while (k < b.stmts($length)) {
             ;ref s is b.stmts[k]
-            ;if (s.k == "claim") {
+            ;if (s.k == "decl") {
                 ;const d is curSlot[s.namePos]
                 ;if (decls[d].captured) { ;"{d(place)} = RT_UNSET;"(emit) }
             }
@@ -523,22 +523,22 @@
     ;fn valueOf(b) { b.value == null ? "RT_NULL" : b.value(expr).c }
 
     ;fn stmt(ref s) {
-        ;if (s.handler != null) { ;s(whineStmt) ;return }
+        ;if (s.handler != null) { ;s(onfailStmt) ;return }
         ;const kind is s.k
-        ;if (kind == "empty" || kind == "lineup" || kind == "steal" || kind == "bribe") { ;return }
-        ;if (kind == "scheme") { ;s(schemeDef) ;return }
-        ;if (kind == "getaway") {
+        ;if (kind == "empty" || kind == "enum" || kind == "import" || kind == "end") { ;return }
+        ;if (kind == "fn") { ;s(fnDef) ;return }
+        ;if (kind == "return") {
             ;if (iife) { ;(s.pos, "'return' inside a conditional used as a value is not supported yet")(diag.abort) }
             ;"RT_RET({s.e == null ? "RT_NULL" : s.e(expr).c});"(emit)
             ;return
         }
-        ;if (kind == "tantrum") { ;"rt_tantrum({s.e(expr).c});"(emit) ;return }
-        ;if (kind == "bail" || kind == "loiter") {
-            ;if (loops == 0) { ;(s.pos, "'{kind == "bail" ? "break" : "continue"}' cannot leave a conditional used as a value yet")(diag.abort) }
-            ;(kind == "bail" ? "break;" : "continue;")(emit)
+        ;if (kind == "panic") { ;"rt_panic({s.e(expr).c});"(emit) ;return }
+        ;if (kind == "break" || kind == "continue") {
+            ;if (loops == 0) { ;(s.pos, "'{kind == "break" ? "break" : "continue"}' cannot leave a conditional used as a value yet")(diag.abort) }
+            ;(kind == "break" ? "break;" : "continue;")(emit)
             ;return
         }
-        ;if (kind == "lurk") {
+        ;if (kind == "while") {
             ;"while ({s.neg ? "!" : ""}rt_cond({s.cond(expr).c})) {{"(emit)
             ;set indent += 1
             ;set loops += 1
@@ -548,28 +548,28 @@
             ;"}}"(emit)
             ;return
         }
-        ;if (kind == "signal") { ;"rt_i({s.code})"(signal) ;return }
+        ;if (kind == "fail") { ;"rt_i({s.code})"(signal) ;return }
         ;if (kind == "exit") { ;"rt_exit({s.e == null ? "rt_i(0)" : s.e(expr).c});"(emit) ;return }
         ;if (kind == "expr") {
             ;if (s.e.k == "chain") { ;s.e(chainStmt) ;return }
-            ;if (s.e.k == "suspect") { ;s.e(suspectStmt) ;return }
-            ;if (s.e.k == "sigcall") { ;s.e.arg(expr).c(signal) ;return }
+            ;if (s.e.k == "match") { ;s.e(matchStmt) ;return }
+            ;if (s.e.k == "failWith") { ;s.e.arg(expr).c(signal) ;return }
             ;"(void){s.e(expr).c};"(emit)
             ;return
         }
-        ;if (kind == "claim") { ;(curSlot[s.namePos], (s.e, s(modeOf))(bindRhs))(claimDecl) ;return }
-        ;if (kind == "cheat") { ;s(cheatStmt) ;return }
+        ;if (kind == "decl") { ;(curSlot[s.namePos], (s.e, s(modeOf))(bindRhs))(bindDecl) ;return }
+        ;if (kind == "set") { ;s(setStmt) ;return }
         ;panic "codegen: unhandled statement {kind}"
     }
 
     // A fail leaves the function at once; the caller sees the code (§8.2).
     ;fn signal(code) {
-        ;"rt_signal({code});"(emit)
+        ;"rt_fail_with({code});"(emit)
         ;"RT_RET(RT_NULL);"(emit)
     }
 
     // Sets binding d for the first time: a new C local, or its frame slot or global.
-    ;fn claimDecl(d, value) {
+    ;fn bindDecl(d, value) {
         ;const owner is decls[d].func
         ;if (!fns[owner].top && owner == cur && !decls[d].captured) {
             ;"wv {decls[d].cname} = {value};"(emit)
@@ -578,9 +578,9 @@
         }
     }
 
-    ;fn schemeDef(s) {
+    ;fn fnDef(s) {
         ;const d is curSlot[s.namePos]
-        ;const f is decls[d].schemeFn
+        ;const f is decls[d].fnIndex
         ;const pf is fns[f].parent
         ;const hasUp is !fns[pf].top
         ;var params is []
@@ -613,8 +613,8 @@
             ;const cn is decls[pd].cname
             // A ref parameter takes the argument as it is (§6.1).
             ;const arg is decls[pd].captured ? "p_{cn}" : cn
-            ;const v is p.isFickle ? arg : "rt_bind({arg}, {p.isShifty ? 1 : 0})"
-            ;if (decls[pd].captured) { ;"fr.{cn} = {v};"(emit) } else if (!p.isFickle) { ;"{cn} = {v};"(emit) }
+            ;const v is p.isRef ? arg : "rt_bind({arg}, {p.isVar ? 1 : 0})"
+            ;if (decls[pd].captured) { ;"fr.{cn} = {v};"(emit) } else if (!p.isRef) { ;"{cn} = {v};"(emit) }
             ;set k += 1
         }
         ;s.body.stmts(stmts)
@@ -628,23 +628,23 @@
     }
 
     // The value bound by a declaration or set, applying the copy table (§10.4, §10.9).
-    // mode: the column of the copy table, "const", "shifty" or "fickle". A
+    // mode: the column of the copy table, "const", "var" or "ref". A
     // literal is frozen unless bound var; ref keeps any other value as it is.
     ;fn bindRhs(e, mode) {
-        ;const mutable is mode == "shifty"
+        ;const mutable is mode == "var"
         ;if (e.k == "arr") { ;return (e, mutable)(array).c }
         ;if (e.k == "rec") { ;return (e, mutable)(record).c }
-        ;if ((scalarKinds, e.k)(text.contains) || mode == "fickle") { ;return e(expr).c }
+        ;if ((scalarKinds, e.k)(text.contains) || mode == "ref") { ;return e(expr).c }
         "rt_bind({e(expr).c}, {mutable ? 1 : 0})"
     }
 
-    ;fn cheatStmt(s) {
+    ;fn setStmt(s) {
         ;const t is s.target
         ;if (t.k == "name") {
             ;const d is curSlot[t.pos]
             ;const at is d(place)
             ;if (s.op == null) {
-                ;const v is (s.e, decls[d].isFickle ? "fickle" : "shifty")(bindRhs)
+                ;const v is (s.e, decls[d].isRef ? "ref" : "var")(bindRhs)
                 ;if (!d(tdz)) { ;"{at} = {v};"(emit) ;return }
                 // The value is evaluated first; then the binding must exist (§5.1).
                 ;const temp is (tmp)
@@ -726,7 +726,7 @@
 
     // `whine` catches a signal from the statement's outermost call only, so the
     // call's arguments are evaluated before it.
-    ;fn whineStmt(s) {
+    ;fn onfailStmt(s) {
         ;const call is s.e
         ;var args is []
         ;var k is 0
@@ -743,11 +743,11 @@
         }
         ;const r is (tmp)
         ;"wv {r} = {(call.callee, args, false)(callC)};"(emit)
-        ;"if (rt_sigcode) {{"(emit)
+        ;"if (rt_failcode) {{"(emit)
         ;set indent += 1
         ;const h is s.handler
-        ;if (h.param != null) { ;(curSlot[h.paramPos], "rt_i(rt_sigcode)")(claimDecl) }
-        ;"rt_sigcode = 0;"(emit)
+        ;if (h.param != null) { ;(curSlot[h.paramPos], "rt_i(rt_failcode)")(bindDecl) }
+        ;"rt_failcode = 0;"(emit)
         ;"{{"(emit)
         ;set indent += 1
         ;h.body(resets)
@@ -787,9 +787,9 @@
     // Branches used as values, shared by conditional chains and matches. For a
     // chain, branch i is its i-th branch; for a match, its i-th case, tested
     // against the temporary t that holds the subject.
-    ;fn branchCount(e) { e.k == "chain" ? e.branches($length) : e.alibis($length) }
-    ;fn branchBody(e, i) { e.k == "chain" ? e.branches[i].body : e.alibis[i].body }
-    ;fn branchTest(e, t, i) { e.k == "chain" ? e.branches[i](test) : (t, e.alibis[i])(alibiTest) }
+    ;fn branchCount(e) { e.k == "chain" ? e.branches($length) : e.cases($length) }
+    ;fn branchBody(e, i) { e.k == "chain" ? e.branches[i].body : e.cases[i].body }
+    ;fn branchTest(e, t, i) { e.k == "chain" ? e.branches[i](test) : (t, e.cases[i])(caseTest) }
 
     // Is every block, the else included, just a value?
     ;fn isPlain(e) {
@@ -867,7 +867,7 @@
 
     // match (§7.5): the subject is evaluated once into a temporary, then
     // compared with each case value by ==.
-    ;fn alibiTest(t, a) {
+    ;fn caseTest(t, a) {
         ;var tests is []
         ;var k is 0
         ;while (k < a.values($length)) {
@@ -879,23 +879,23 @@
 
     // The else block, or for an exhaustive enum match (which has none), a
     // block that raises a panic for a subject that is not one of the members.
-    ;fn suspectElse(e, t) {
-        ;if (e.els != null || e.alibis[0].values[0].k != "mem") { ;return e.els }
-        { stmts: [], value: { k: "raw", js: "(rt_no_alibi({t}), RT_NULL)", pos: null, paren: false }, close: null }
+    ;fn matchElse(e, t) {
+        ;if (e.els != null || e.cases[0].values[0].k != "mem") { ;return e.els }
+        { stmts: [], value: { k: "raw", js: "(rt_no_case({t}), RT_NULL)", pos: null, paren: false }, close: null }
     }
 
-    ;fn suspectStmt(e) {
+    ;fn matchStmt(e) {
         ;const t is (tmp)
         ;"wv {t} = {e.subject(expr).c};"(emit)
         ;var k is 0
-        ;while (k < e.alibis($length)) {
-            ;"{k > 0 ? "}} else " : ""}if ({(t, e.alibis[k])(alibiTest)}) {{"(emit)
+        ;while (k < e.cases($length)) {
+            ;"{k > 0 ? "}} else " : ""}if ({(t, e.cases[k])(caseTest)}) {{"(emit)
             ;set indent += 1
-            ;e.alibis[k].body(blockBody)
+            ;e.cases[k].body(blockBody)
             ;set indent -= 1
             ;set k += 1
         }
-        ;const els is (e, t)(suspectElse)
+        ;const els is (e, t)(matchElse)
         ;if (els != null) {
             ;"}} else {{"(emit)
             ;set indent += 1
@@ -907,11 +907,11 @@
 
     // A match used as a value: a statement expression that sets the subject,
     // then a ternary chain when every block is just a value.
-    ;fn suspectExpr(e) {
+    ;fn matchExpr(e) {
         ;const t is (tmp)
         ;const subject is e.subject(expr).c
         ;var withElse is e
-        ;set withElse.els to (e, t)(suspectElse)
+        ;set withElse.els to (e, t)(matchElse)
         ;if (withElse(isPlain)) { ;return "({{ wv {t} = {subject}; {(withElse, t)(ternaryChain)}; }})" }
         (withElse, t, subject)(branchValue)
     }
@@ -929,7 +929,7 @@
                 ;set f to "w{callee.rec(stolenFrom)(modId)}_{callee.field}"
             } else {
                 ;const d is curSlot[callee.pos]
-                ;const sf is decls[d].schemeFn
+                ;const sf is decls[d].fnIndex
                 ;set f to fns[sf].cname
                 ;const pf is fns[sf].parent
                 ;if (!fns[pf].top) { ;set parent to pf }
@@ -969,8 +969,8 @@
         }
         ;if (kind == "bool") { ;return { c: "rt_b({e.v ? 1 : 0})", k: constK } }
         ;if (kind == "null") { ;return { c: "RT_NULL", k: constK } }
-        ;if (kind == "nan") { ;return { c: "RT_NOBODY", k: constK } }
-        ;if (kind == "inf") { ;return { c: "RT_EVERYBODY", k: constK } }
+        ;if (kind == "nan") { ;return { c: "RT_NAN", k: constK } }
+        ;if (kind == "inf") { ;return { c: "RT_INF", k: constK } }
         ;if (kind == "name") { ;return curSlot[e.pos](read) }
         ;if (kind == "std") { ;return { c: "std_{e.name}()", k: constK } }
         ;if (kind == "arr") { ;return (e, false)(array) }
@@ -982,7 +982,7 @@
         ;if (kind == "mem") {
             // An enum member, a declaration imported from a module, or a record field. The
             // checker forbids shadowing enum and module names, so these are exact.
-            ;const lin is e.rec(lineupOf)
+            ;const lin is e.rec(enumOf)
             ;if (lin != null) {
                 ;const ms is lin.node.members
                 ;var k is 0
@@ -1011,7 +1011,7 @@
             ;return (sq, (e.callee, sq.cs, true)(callC))(wrap)
         }
         ;if (kind == "chain") { ;return { c: e(chainExpr), k: effectK } }
-        ;if (kind == "suspect") { ;return { c: e(suspectExpr), k: effectK } }
+        ;if (kind == "match") { ;return { c: e(matchExpr), k: effectK } }
         ;if (kind == "raw") { ;return { c: e.js, k: constK } }
         ;panic "codegen: unhandled expression {kind}"
     }
@@ -1034,7 +1034,7 @@
             ;set k += 1
         }
         ;set k to 0
-        ;while (k < lineupDefs($length)) { ;(all, lineupDefs[k])($push) ;set k += 1 }
+        ;while (k < enumDefs($length)) { ;(all, enumDefs[k])($push) ;set k += 1 }
         ;set k to 0
         ;while (k < frames($length)) {
             ;const f is frames[k]
@@ -1043,7 +1043,7 @@
             ;if (!fns[pf].top) { ;(members, "struct fr{pf} *up;")($push) }
             ;var j is 0
             ;while (j < decls($length)) {
-                ;if (decls[j].func == f && decls[j].captured && decls[j].kind != "scheme") {
+                ;if (decls[j].func == f && decls[j].captured && decls[j].kind != "fn") {
                     ;(members, "wv {decls[j].cname};")($push)
                 }
                 ;set j += 1
@@ -1067,7 +1067,7 @@
             ;set k += 1
         }
         ;(all, "")($push)
-        ;(all, "static void wah_main(void) {{")($push)
+        ;(all, "static void wvt_main(void) {{")($push)
         ;if (fields($length) > 0) {
             ;var refs is []
             ;set k to 0
@@ -1091,7 +1091,7 @@
         ;const list is modules[mi].program.stmts
         ;var li is 0
         ;while (li < list($length)) {
-            ;if (list[li].k == "lineup") { ;(list[li], mi(modId))(lineupDef) }
+            ;if (list[li].k == "enum") { ;(list[li], mi(modId))(enumDef) }
             ;set li += 1
         }
         ;set mi += 1

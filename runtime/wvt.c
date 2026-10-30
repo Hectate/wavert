@@ -1,4 +1,4 @@
-// Wavert native runtime, forked from Γ--'s runtime/wah.c. This file is inlined
+// Wavert native runtime, forked from Γ--'s runtime/wah.c (wah/runtime). This file is inlined
 // verbatim at the top of every program compiled with --target c, the
 // counterpart of runtime/wvt.js.
 // It needs a GNU C compiler (clang or gcc; `zig cc` is clang).
@@ -11,7 +11,7 @@
 //
 // Memory is allocated from an arena and never freed.
 //
-// A fail is a pending code in rt_sigcode: a function or stdlib function sets
+// A fail is a pending code in rt_failcode: a function or stdlib function sets
 // it and returns, and the caller either handles it (onfail) or turns it into
 // a panic with rt_chk (the one-frame rule, §8.2). A panic ends the program:
 // panics cannot be caught yet, so nothing unwinds.
@@ -53,9 +53,9 @@ typedef struct wstr {
   int32_t ascii, sym; // sym: interned as a record key
   const char *data;
 } wstr;
-typedef struct warr { int64_t len, cap; int shifty; struct wv *items; } warr;
-typedef struct wrec { int64_t n; int shifty; const wstr *const *keys; struct wv *vals; } wrec;
-typedef struct wmem { const wstr *lineup, *name; } wmem;
+typedef struct warr { int64_t len, cap; int is_mut; struct wv *items; } warr;
+typedef struct wrec { int64_t n; int is_mut; const wstr *const *keys; struct wv *vals; } wrec;
+typedef struct wmem { const wstr *enum_name, *name; } wmem;
 typedef struct wv {
   uint32_t tag;
   union { int64_t i; double f; int b; const wstr *s; warr *a; wrec *r; const wmem *m; };
@@ -69,8 +69,8 @@ static inline wv rt_f(double x) { return (wv){ .tag = T_FLOAT, .f = x }; }
 static inline wv rt_b(int x) { return (wv){ .tag = T_BOOL, .b = !!x }; }
 static inline wv rt_s(const wstr *s) { return (wv){ .tag = T_STR, .s = s }; }
 static inline wv rt_m(const wmem *m) { return (wv){ .tag = T_MEM, .m = m }; }
-#define RT_NOBODY rt_f(NAN)
-#define RT_EVERYBODY rt_f(INFINITY)
+#define RT_NAN rt_f(NAN)
+#define RT_INF rt_f(INFINITY)
 static inline int isnum(wv x) { return x.tag == T_INT || x.tag == T_FLOAT; }
 static inline double nv(wv x) { return x.tag == T_INT ? (double)x.i : x.f; }
 
@@ -369,12 +369,12 @@ static void rt_write(int fd, const char *p, size_t n) {
 #define RT_DEPTH 100000
 static const char *rt_stack[RT_DEPTH];
 static int rt_depth;
-static int64_t rt_sigcode;     // a pending fail's code, or 0
-static const char *rt_sigfrom; // the function or stdlib function that failed
+static int64_t rt_failcode;     // a pending fail's code, or 0
+static const char *rt_failfrom; // the function or stdlib function that failed
 
 static _Noreturn void rt_die(const char *msg, size_t n) {
-#ifdef WAH_TEST_DIE
-  WAH_TEST_DIE(msg, n); // the runtime tests report a panic and go on
+#ifdef WVT_TEST_DIE
+  WVT_TEST_DIE(msg, n); // the runtime tests report a panic and go on
 #endif
   sb b = { 0 };
   sb_puts(&b, "uncaught panic: ");
@@ -417,7 +417,7 @@ static const char *type_name(wv x) {
     case T_NULL: return "null";
     case T_ARR: return "array";
     case T_REC: return "record";
-    case T_MEM: return x.m->lineup->data;
+    case T_MEM: return x.m->enum_name->data;
   }
   return "unknown";
 }
@@ -998,7 +998,7 @@ static int rt_cond(wv x) {
 
 // ---- enums (§4.1, §7.5) ----
 
-static _Noreturn void rt_no_alibi(wv v) {
+static _Noreturn void rt_no_case(wv v) {
   sb b = { 0 };
   sb_puts(&b, "match: no case for ");
   show_to(&b, v);
@@ -1007,26 +1007,26 @@ static _Noreturn void rt_no_alibi(wv v) {
 
 // ---- arrays (§10) ----
 
-static warr *arr_new(int64_t n, int shifty) {
+static warr *arr_new(int64_t n, int is_mut) {
   warr *a = rt_alloc(sizeof(warr));
-  *a = (warr){ n, n, shifty, n ? rt_alloc(sizeof(wv) * n) : NULL };
+  *a = (warr){ n, n, is_mut, n ? rt_alloc(sizeof(wv) * n) : NULL };
   return a;
 }
 // An array literal: n values, frozen unless mutable (var).
-static wv rt_arr(int64_t n, const wv *items, int shifty) {
-  warr *a = arr_new(n, shifty);
+static wv rt_arr(int64_t n, const wv *items, int is_mut) {
+  warr *a = arr_new(n, is_mut);
   if (n) memcpy(a->items, items, sizeof(wv) * n);
   return (wv){ .tag = T_ARR, .a = a };
 }
-static wv arr_copy(const warr *src, int64_t from, int64_t to, int shifty) {
-  return rt_arr(to - from, src->items + from, shifty);
+static wv arr_copy(const warr *src, int64_t from, int64_t to, int is_mut) {
+  return rt_arr(to - from, src->items + from, is_mut);
 }
 
-static wv rec_copy(const wrec *src, int shifty);
+static wv rec_copy(const wrec *src, int is_mut);
 // Copy happens only when mutability changes (§10.4, §10.9).
-static wv rt_bind(wv v, int shifty) {
-  if (v.tag == T_ARR) return v.a->shifty == shifty ? v : arr_copy(v.a, 0, v.a->len, shifty);
-  if (v.tag == T_REC) return v.r->shifty == shifty ? v : rec_copy(v.r, shifty);
+static wv rt_bind(wv v, int is_mut) {
+  if (v.tag == T_ARR) return v.a->is_mut == is_mut ? v : arr_copy(v.a, 0, v.a->len, is_mut);
+  if (v.tag == T_REC) return v.r->is_mut == is_mut ? v : rec_copy(v.r, is_mut);
   return v;
 }
 
@@ -1041,19 +1041,19 @@ static int64_t slot(wv i, wv arr) {
   return i.i < 0 ? i.i + n : i.i;
 }
 static void mutable(const warr *a, const char *what) {
-  if (!a->shifty) rt_fail("cannot modify a frozen array%s%s", what ? " with " : "", what ? what : "");
+  if (!a->is_mut) rt_fail("cannot modify a frozen array%s%s", what ? " with " : "", what ? what : "");
 }
 
 // ---- records (§10.7-§10.10) ----
 
 // A record literal: keys is shared by every record of the literal.
-static wv rt_rec(int shifty, int64_t n, const wstr *const *keys, const wv *vals) {
+static wv rt_rec(int is_mut, int64_t n, const wstr *const *keys, const wv *vals) {
   wrec *r = rt_alloc(sizeof(wrec) + sizeof(wv) * n);
-  *r = (wrec){ n, shifty, keys, (wv *)(r + 1) };
+  *r = (wrec){ n, is_mut, keys, (wv *)(r + 1) };
   if (n) memcpy(r->vals, vals, sizeof(wv) * n);
   return (wv){ .tag = T_REC, .r = r };
 }
-static wv rec_copy(const wrec *src, int shifty) { return rt_rec(shifty, src->n, src->keys, src->vals); }
+static wv rec_copy(const wrec *src, int is_mut) { return rt_rec(is_mut, src->n, src->keys, src->vals); }
 static const wstr *rec_key(wv k) {
   if (k.tag != T_STR) rt_fail("type error: a record key must be a string, got %s", type_name(k));
   return k.s;
@@ -1070,7 +1070,7 @@ static wv *field(const wstr *key, const wstr *name, wv r) {
 }
 static wv rt_get(const wstr *key, wv r) { return *field(key, key, r); }
 static void writable(wv r) {
-  if (!r.r->shifty) rt_fail("cannot modify a field of a frozen record");
+  if (!r.r->is_mut) rt_fail("cannot modify a field of a frozen record");
 }
 static void rt_set_mem(wv v, const wstr *key, wv r) {
   wv *p = field(key, key, r);
@@ -1116,7 +1116,7 @@ static void rt_upd_idx(wv v, wv i, wv arr, wv (*op)(wv, wv)) {
   arr.a->items[k] = op(arr.a->items[k], v);
 }
 
-// ---- bindings, signals, exit ----
+// ---- bindings, fails, exit ----
 
 // A captured binding read before its declaration has executed (§5.1).
 static inline wv rt_def(wv v, const char *name) {
@@ -1125,33 +1125,33 @@ static inline wv rt_def(wv v, const char *name) {
 }
 
 // ;fail c inside a function: the caller sees code c from this function.
-static void rt_signal(wv code) {
+static void rt_fail_with(wv code) {
   if (code.tag != T_INT || code.i < 1) {
     sb b = { 0 };
     sb_puts(&b, "a fail code must be an integer >= 1, got ");
     show_to(&b, code);
     rt_fail_sb(&b);
   }
-  rt_sigcode = code.i;
-  rt_sigfrom = rt_stack[rt_depth - 1];
+  rt_failcode = code.i;
+  rt_failfrom = rt_stack[rt_depth - 1];
 }
 // A stdlib function fails with code 1.
-static wv rt_wah(const char *from) {
-  rt_sigcode = 1;
-  rt_sigfrom = from;
+static wv rt_std_fail(const char *from) {
+  rt_failcode = 1;
+  rt_failfrom = from;
   return RT_NULL;
 }
 // After a call that is not handled with onfail: a pending fail becomes a
 // panic in the caller (one-frame rule). caller is NULL at the top level.
 static inline wv rt_chk(wv v, const char *caller) {
-  if (__builtin_expect(rt_sigcode != 0, 0)) {
-    if (caller) rt_fail("unhandled fail (code %lld) from '%s' in '%s'", (long long)rt_sigcode, rt_sigfrom, caller);
-    rt_fail("unhandled fail (code %lld) from '%s'", (long long)rt_sigcode, rt_sigfrom);
+  if (__builtin_expect(rt_failcode != 0, 0)) {
+    if (caller) rt_fail("unhandled fail (code %lld) from '%s' in '%s'", (long long)rt_failcode, rt_failfrom, caller);
+    rt_fail("unhandled fail (code %lld) from '%s'", (long long)rt_failcode, rt_failfrom);
   }
   return v;
 }
 
-static _Noreturn void rt_tantrum(wv v) {
+static _Noreturn void rt_panic(wv v) {
   if (v.tag == T_STR) rt_die(v.s->data, v.s->bytes);
   sb b = { 0 };
   show_to(&b, v);
@@ -1312,7 +1312,7 @@ static wv std_write(wv v) { return print_to(1, v, 0); }
 static wv std_eprint(wv v) { return print_to(2, v, 1); }
 static wv std_readLine(void) {
   wv line;
-  return read_line(&line) ? line : rt_wah("$readLine");
+  return read_line(&line) ? line : rt_std_fail("$readLine");
 }
 
 // Reads a whole file; returns 0 on failure.
@@ -1340,7 +1340,7 @@ static wv std_readFile(wv p) {
   const wstr *path = a_string(p, "$readFile");
   char *data;
   int64_t n;
-  if (!read_file(path, &data, &n)) return rt_wah("$readFile");
+  if (!read_file(path, &data, &n)) return rt_std_fail("$readFile");
   wv s = rt_decode(data ? data : "", n);
   free(data);
   return s;
@@ -1348,17 +1348,17 @@ static wv std_readFile(wv p) {
 static wv put_file(wv p, wv t, const char *fn, int append) {
   const wstr *path = a_string(p, fn), *text = a_string(t, fn);
   pchar *hp = host_path(path);
-  if (!hp) return rt_wah(fn);
+  if (!hp) return rt_std_fail(fn);
 #ifdef _WIN32
   FILE *f = _wfopen(hp, append ? L"ab" : L"wb");
 #else
   FILE *f = fopen(hp, append ? "ab" : "wb");
 #endif
   free(hp);
-  if (!f) return rt_wah(fn);
+  if (!f) return rt_std_fail(fn);
   int ok = fwrite(text->data, 1, text->bytes, f) == (size_t)text->bytes;
   if (fclose(f) != 0) ok = 0;
-  return ok ? RT_NULL : rt_wah(fn);
+  return ok ? RT_NULL : rt_std_fail(fn);
 }
 static wv std_writeFile(wv p, wv t) { return put_file(p, t, "$writeFile", 0); }
 static wv std_appendFile(wv p, wv t) { return put_file(p, t, "$appendFile", 1); }
@@ -1377,9 +1377,9 @@ static wv std_fileExists(wv p) {
 static int cmp_wv_str(const void *a, const void *b) { return str_cmp(((const wv *)a)->s, ((const wv *)b)->s); }
 static wv std_listDir(wv p) {
   const wstr *path = a_string(p, "$listDir");
-  if (path->bytes == 0) return rt_wah("$listDir");
+  if (path->bytes == 0) return rt_std_fail("$listDir");
   pchar *hp = host_path(path);
-  if (!hp) return rt_wah("$listDir");
+  if (!hp) return rt_std_fail("$listDir");
   warr *a = arr_new(0, 0);
   int64_t cap = 0;
 #ifdef _WIN32
@@ -1391,7 +1391,7 @@ static wv std_listDir(wv p) {
   WIN32_FIND_DATAW fd;
   HANDLE h = FindFirstFileW(pat, &fd);
   free(pat);
-  if (h == INVALID_HANDLE_VALUE) return rt_wah("$listDir");
+  if (h == INVALID_HANDLE_VALUE) return rt_std_fail("$listDir");
   do {
     const wchar_t *n = fd.cFileName;
     if (!wcscmp(n, L".") || !wcscmp(n, L"..")) continue;
@@ -1399,7 +1399,7 @@ static wv std_listDir(wv p) {
 #else
   DIR *d = opendir(hp);
   free(hp);
-  if (!d) return rt_wah("$listDir");
+  if (!d) return rt_std_fail("$listDir");
   struct dirent *e;
   while ((e = readdir(d))) {
     if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
@@ -1425,14 +1425,14 @@ static wv std_listDir(wv p) {
 }
 static wv std_deleteFile(wv p) {
   pchar *hp = host_path(a_string(p, "$deleteFile"));
-  if (!hp) return rt_wah("$deleteFile");
+  if (!hp) return rt_std_fail("$deleteFile");
 #ifdef _WIN32
   int ok = DeleteFileW(hp);
 #else
   int ok = unlink(hp) == 0;
 #endif
   free(hp);
-  return ok ? RT_NULL : rt_wah("$deleteFile");
+  return ok ? RT_NULL : rt_std_fail("$deleteFile");
 }
 
 static int rt_argc;
@@ -1455,15 +1455,15 @@ static wv std_args(void) {
 }
 static wv std_env(wv name) {
   const wstr *n = a_string(name, "$env");
-  if (n->bytes == 0 || memchr(n->data, 0, n->bytes)) return rt_wah("$env");
+  if (n->bytes == 0 || memchr(n->data, 0, n->bytes)) return rt_std_fail("$env");
 #ifdef _WIN32
   wchar_t *w = to_wide(n->data, n->bytes);
   const wchar_t *v = _wgetenv(w);
   free(w);
-  return v ? from_wide(v, wcslen(v)) : rt_wah("$env");
+  return v ? from_wide(v, wcslen(v)) : rt_std_fail("$env");
 #else
   const char *v = getenv(n->data);
-  return v ? rt_decode(v, strlen(v)) : rt_wah("$env");
+  return v ? rt_decode(v, strlen(v)) : rt_std_fail("$env");
 #endif
 }
 static wv program_path_cache = { .tag = T_UNSET };
@@ -1563,12 +1563,12 @@ static wv std_run(wv program, wv args) {
     }
   }
   rt_flush();
-  if (prog->bytes == 0 || memchr(prog->data, 0, prog->bytes)) return rt_wah("$run");
+  if (prog->bytes == 0 || memchr(prog->data, 0, prog->bytes)) return rt_std_fail("$run");
 #ifdef _WIN32
   wchar_t *wname = to_wide(prog->data, prog->bytes);
   wchar_t *app = find_program(wname);
   free(wname);
-  if (!app) return rt_wah("$run");
+  if (!app) return rt_std_fail("$run");
   sb cmd = { 0 };
   quote_arg(&cmd, prog);
   for (int64_t i = 0; i < a->len; i++) {
@@ -1593,7 +1593,7 @@ static wv std_run(wv program, wv args) {
   for (int i = 0; i < 3; i++) if (std[i]) CloseHandle(std[i]);
   free(app);
   free(wcmd);
-  if (!ok) return rt_wah("$run");
+  if (!ok) return rt_std_fail("$run");
   WaitForSingleObject(pi.hProcess, INFINITE);
   DWORD code = 0;
   GetExitCodeProcess(pi.hProcess, &code);
@@ -1608,9 +1608,9 @@ static wv std_run(wv program, wv args) {
   pid_t pid;
   int err = posix_spawnp(&pid, prog->data, NULL, NULL, argv, environ);
   free(argv);
-  if (err) return rt_wah("$run");
+  if (err) return rt_std_fail("$run");
   int status;
-  while (waitpid(pid, &status, 0) < 0) if (errno != EINTR) return rt_wah("$run");
+  while (waitpid(pid, &status, 0) < 0) if (errno != EINTR) return rt_std_fail("$run");
   if (WIFSIGNALED(status)) return rt_i(128 + WTERMSIG(status));
   return rt_i(WEXITSTATUS(status));
 #endif
@@ -1765,10 +1765,10 @@ static wv std_toInt(wv x) {
   int64_t n = x.s->bytes, neg = n > 0 && p[0] == '-';
   if (all_digits(p + neg, n - neg, 10)) {
     int64_t v;
-    if (!parse_uint(p + neg, n - neg, 10, &v)) return rt_wah("$toInt");
+    if (!parse_uint(p + neg, n - neg, 10, &v)) return rt_std_fail("$toInt");
     return rt_i(neg ? -v : v);
   }
-  return rt_wah("$toInt");
+  return rt_std_fail("$toInt");
 }
 static wv std_toFloat(wv x) {
   if (x.tag == T_INT) return rt_f((double)x.i);
@@ -1777,9 +1777,9 @@ static wv std_toFloat(wv x) {
   if (float_text(s->data, s->bytes, 1)) {
     // A result too large for a double signals (§9.5).
     double v = to_double(s->data, s->bytes);
-    return isfinite(v) ? rt_f(v) : rt_wah("$toFloat");
+    return isfinite(v) ? rt_f(v) : rt_std_fail("$toFloat");
   }
-  return rt_wah("$toFloat");
+  return rt_std_fail("$toFloat");
 }
 
 static wv rounder(wv x, const char *name, double (*fn)(double)) {
@@ -1842,7 +1842,7 @@ static int same(wv a, wv b) {
   return eq(a, b);
 }
 static wv std_same(wv a, wv b) { return rt_b(same(a, b)); }
-static wv std_typeOf(wv x) { return x.tag == T_MEM ? rt_s(x.m->lineup) : rt_cstr(type_name(x)); }
+static wv std_typeOf(wv x) { return x.tag == T_MEM ? rt_s(x.m->enum_name) : rt_cstr(type_name(x)); }
 static wv std_fields(wv r) {
   if (r.tag != T_REC) rt_fail("type error: $fields expects a record, got %s", type_name(r));
   warr *a = arr_new(r.r->n, 0);
@@ -1853,25 +1853,25 @@ static wv std_fields(wv r) {
 // ---- startup ----
 
 // The compiled program: library initialization, then the entry file's body.
-static void wah_main(void);
+static void wvt_main(void);
 
 #ifdef _WIN32
 static DWORD WINAPI rt_thread(LPVOID arg) {
   (void)arg;
-  wah_main();
+  wvt_main();
   rt_exit_code(0);
   return 0;
 }
 #else
 static void *rt_thread(void *arg) {
   (void)arg;
-  wah_main();
+  wvt_main();
   rt_exit_code(0);
   return NULL;
 }
 #endif
 
-// The program runs on a thread with a large stack, since schemes recurse deeply.
+// The program runs on a thread with a large stack, since functions recurse deeply.
 int main(int argc, char **argv) {
   rt_argc = argc;
   rt_argv = argv;

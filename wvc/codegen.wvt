@@ -20,8 +20,8 @@
     ;while (binOps[k] != op) { ;set k += 1 }
     binFns[k]
 }
-// How a declaration or parameter binds its values (§10.4): "shifty", "fickle" or "const".
-;fn modeOf(x) { x.isShifty ? "shifty" : x.isFickle ? "fickle" : "const" }
+// How a declaration or parameter binds its values (§10.4): "var", "ref" or "const".
+;fn modeOf(x) { x.isVar ? "var" : x.isRef ? "ref" : "const" }
 
 ;fn unFn(op) { op == "-" ? "neg" : op == "!" ? "not" : "bnot" }
 ;fn jsBool(b) { b ? "true" : "false" }
@@ -68,8 +68,8 @@
     // of its set targets that are ref bindings.
     ;var mod is ""
     ;var stolen is []
-    ;var lineups is []
-    ;var fickles is []
+    ;var enums is []
+    ;var refPositions is []
 
     // The id of module m: its place in initialization order for a library, "" for the entry file.
     ;fn modId(m) { m == modules($length) - 1 ? "" : "{m + 1}" }
@@ -79,18 +79,18 @@
         ;(modules[m].file, modules[m].chars)(diag.setSource)
         ;set mod to m(modId)
         ;set stolen to []
-        ;set lineups to []
-        ;set fickles to modules[m].fickleTargets
+        ;set enums to []
+        ;set refPositions to modules[m].refTargets
         ;const list is modules[m].program.stmts
         ;var k is 0
         ;while (k < list($length)) {
-            ;if (list[k].k == "lineup") { ;(lineups, list[k].name)($push) }
+            ;if (list[k].k == "enum") { ;(enums, list[k].name)($push) }
             ;set k += 1
         }
-        ;const steals is modules[m].steals
+        ;const imports is modules[m].imports
         ;set k to 0
-        ;while (k < steals($length)) {
-            ;(stolen, { name: steals[k].node.name, lib: steals[k].lib })($push)
+        ;while (k < imports($length)) {
+            ;(stolen, { name: imports[k].node.name, lib: imports[k].lib })($push)
             ;set k += 1
         }
     }
@@ -118,11 +118,11 @@
     }
 
     // The JS name of the enum x names (Enum or module.Enum), or null.
-    ;fn lineupJs(x) {
-        ;if (x.k == "name") { ;return (lineups, x.name)(text.contains) ? "l{mod}_{x.name}" : null }
+    ;fn enumJs(x) {
+        ;if (x.k == "name") { ;return (enums, x.name)(text.contains) ? "l{mod}_{x.name}" : null }
         ;if (x.k != "mem") { ;return null }
         ;const lib is x.rec(stolenFrom)
-        lib != null && (lib, x.field)(exportKind) == "lineup" ? "l{lib(modId)}_{x.field}" : null
+        lib != null && (lib, x.field)(exportKind) == "enum" ? "l{lib(modId)}_{x.field}" : null
     }
 
     ;fn emit(line) { ;(out, ("  ", indent)(repeat) + line)($push) }
@@ -149,22 +149,22 @@
     ;fn valueOf(b) { b.value == null ? "null" : b.value(expr) }
 
     ;fn stmt(s) {
-        ;if (s.handler != null) { ;s(whineStmt) ;return }
+        ;if (s.handler != null) { ;s(onfailStmt) ;return }
         ;const kind is s.k
-        ;if (kind == "empty" || kind == "lineup" || kind == "steal" || kind == "bribe") { ;return }
-        ;if (kind == "scheme") { ;s(schemeDef) ;return }
-        ;if (kind == "getaway") {
+        ;if (kind == "empty" || kind == "enum" || kind == "import" || kind == "end") { ;return }
+        ;if (kind == "fn") { ;s(fnDef) ;return }
+        ;if (kind == "return") {
             ;if (iife) { ;(s.pos, "'return' inside a conditional used as a value is not supported yet")(diag.abort) }
             ;"return {s.e == null ? "null" : s.e(expr)};"(emit)
             ;return
         }
-        ;if (kind == "tantrum") { ;"throw \$rt.tantrum({s.e(expr)});"(emit) ;return }
-        ;if (kind == "bail" || kind == "loiter") {
-            ;if (loops == 0) { ;(s.pos, "'{kind == "bail" ? "break" : "continue"}' cannot leave a conditional used as a value yet")(diag.abort) }
-            ;(kind == "bail" ? "break;" : "continue;")(emit)
+        ;if (kind == "panic") { ;"throw \$rt.panic({s.e(expr)});"(emit) ;return }
+        ;if (kind == "break" || kind == "continue") {
+            ;if (loops == 0) { ;(s.pos, "'{kind == "break" ? "break" : "continue"}' cannot leave a conditional used as a value yet")(diag.abort) }
+            ;(kind == "break" ? "break;" : "continue;")(emit)
             ;return
         }
-        ;if (kind == "lurk") {
+        ;if (kind == "while") {
             ;"while ({s.neg ? "!" : ""}\$rt.cond({s.cond(expr)})) {{"(emit)
             ;set indent += 1
             ;set loops += 1
@@ -174,24 +174,24 @@
             ;"}}"(emit)
             ;return
         }
-        ;if (kind == "signal") { ;"throw \$rt.signal({s.code});"(emit) ;return }
+        ;if (kind == "fail") { ;"throw \$rt.failWith({s.code});"(emit) ;return }
         ;if (kind == "exit") { ;"\$rt.exit({s.e == null ? "0" : s.e(expr)});"(emit) ;return }
         ;if (kind == "expr") {
             ;if (s.e.k == "chain") { ;s.e(chainStmt) ;return }
-            ;if (s.e.k == "suspect") { ;s.e(suspectStmt) ;return }
-            ;if (s.e.k == "sigcall") { ;"throw \$rt.signal({s.e.arg(expr)});"(emit) ;return }
+            ;if (s.e.k == "match") { ;s.e(matchStmt) ;return }
+            ;if (s.e.k == "failWith") { ;"throw \$rt.failWith({s.e.arg(expr)});"(emit) ;return }
             ;"{s.e(expr)};"(emit)
             ;return
         }
-        ;if (kind == "claim") {
-            ;"{s.isShifty || s.isFickle ? "let" : "const"} {s.name(id)} = {(s.e, s(modeOf))(bindRhs)};"(emit)
+        ;if (kind == "decl") {
+            ;"{s.isVar || s.isRef ? "let" : "const"} {s.name(id)} = {(s.e, s(modeOf))(bindRhs)};"(emit)
             ;return
         }
-        ;if (kind == "cheat") { ;s(cheatStmt) ;return }
+        ;if (kind == "set") { ;s(setStmt) ;return }
         ;panic "codegen: unhandled statement {kind}"
     }
 
-    ;fn schemeDef(s) {
+    ;fn fnDef(s) {
         ;var names is []
         ;var k is 0
         ;while (k < s.params($length)) {
@@ -204,7 +204,7 @@
         ;while (k < s.params($length)) {
             ;const param is s.params[k]
             // A ref parameter takes the argument as it is (§6.1).
-            ;if (!param.isFickle) { ;"{param.name(id)} = \$rt.bind({param.name(id)}, {param.isShifty(jsBool)});"(emit) }
+            ;if (!param.isRef) { ;"{param.name(id)} = \$rt.bind({param.name(id)}, {param.isVar(jsBool)});"(emit) }
             ;set k += 1
         }
         ;"try {{"(emit)
@@ -226,34 +226,34 @@
     }
 
     // An enum is l_<name>, a frozen object whose m_<member> properties are its members.
-    ;fn lineupDef(s, m) {
+    ;fn enumDef(s, m) {
         ;var names is []
         ;var k is 0
         ;while (k < s.members($length)) {
             ;(names, s.members[k].name(text.quote))($push)
             ;set k += 1
         }
-        ;"const l{m}_{s.name} = \$rt.lineup({s.name(text.quote)}, [{(names, ", ")($join)}]);"(emit)
+        ;"const l{m}_{s.name} = \$rt.makeEnum({s.name(text.quote)}, [{(names, ", ")($join)}]);"(emit)
     }
 
     // The value bound by a declaration or set, applying the copy table (§10.4, §10.9).
-    // mode: the column of the copy table, "const", "shifty" or "fickle". A
+    // mode: the column of the copy table, "const", "var" or "ref". A
     // literal is frozen unless bound var; ref keeps any other value as it is.
     ;fn bindRhs(e, mode) {
-        ;const mutable is mode == "shifty"
+        ;const mutable is mode == "var"
         ;if (e.k == "arr") {
             ;const items is e.items(exprList)
             ;return mutable ? "[{items}]" : "\$rt.frozen([{items}])"
         }
         ;if (e.k == "rec") { ;return (e, mutable)(record) }
-        ;if ((scalarKinds, e.k)(text.contains) || mode == "fickle") { ;return e(expr) }
+        ;if ((scalarKinds, e.k)(text.contains) || mode == "ref") { ;return e(expr) }
         "\$rt.bind({e(expr)}, {mutable(jsBool)})"
     }
 
-    ;fn cheatStmt(s) {
+    ;fn setStmt(s) {
         ;const t is s.target
         ;if (t.k == "name") {
-            ;const mode is (fickles, t.pos)(text.contains) ? "fickle" : "shifty"
+            ;const mode is (refPositions, t.pos)(text.contains) ? "ref" : "var"
             ;if (s.op == null) { ;"{t.name(id)} = {(s.e, mode)(bindRhs)};"(emit) ;return }
             // The value is evaluated before the target is read (source order).
             ;var v is s.e(expr)
@@ -290,7 +290,7 @@
 
     // `whine` catches a signal from the statement's outermost call only, so the
     // call's arguments are evaluated before the try.
-    ;fn whineStmt(s) {
+    ;fn onfailStmt(s) {
         ;const call is s.e
         ;var args is []
         ;var k is 0
@@ -313,7 +313,7 @@
         ;"  {r} = {(call.callee, args)(callJs)};"(emit)
         ;"}} catch ({ev}) {{"(emit)
         ;set indent += 1
-        ;"if (!({ev} instanceof \$rt.Wah)) throw {ev};"(emit)
+        ;"if (!({ev} instanceof \$rt.Fail)) throw {ev};"(emit)
         ;if (s.handler.param != null) { ;"const {s.handler.param(id)} = {ev}.code;"(emit) }
         ;"{{"(emit)
         ;set indent += 1
@@ -353,9 +353,9 @@
     // Branches used as values, shared by conditional chains and matches. For a
     // chain, branch i is its i-th branch; for a match, its i-th case, tested
     // against the temporary t that holds the subject.
-    ;fn branchCount(e) { e.k == "chain" ? e.branches($length) : e.alibis($length) }
-    ;fn branchBody(e, i) { e.k == "chain" ? e.branches[i].body : e.alibis[i].body }
-    ;fn branchTest(e, t, i) { e.k == "chain" ? e.branches[i](test) : (t, e.alibis[i])(alibiTest) }
+    ;fn branchCount(e) { e.k == "chain" ? e.branches($length) : e.cases($length) }
+    ;fn branchBody(e, i) { e.k == "chain" ? e.branches[i].body : e.cases[i].body }
+    ;fn branchTest(e, t, i) { e.k == "chain" ? e.branches[i](test) : (t, e.cases[i])(caseTest) }
 
     // Is every block, the else included, just a value?
     ;fn isPlain(e) {
@@ -427,7 +427,7 @@
 
     // match (§7.5): the subject is evaluated once into a temporary, then
     // compared with each case value by ==.
-    ;fn alibiTest(t, a) {
+    ;fn caseTest(t, a) {
         ;var tests is []
         ;var k is 0
         ;while (k < a.values($length)) {
@@ -439,23 +439,23 @@
 
     // The else block, or for an exhaustive enum match (which has none), a
     // block that raises a panic for a subject that is not one of the members.
-    ;fn suspectElse(e, t) {
-        ;if (e.els != null || e.alibis[0].values[0].k != "mem") { ;return e.els }
-        { stmts: [], value: { k: "raw", js: "\$rt.noAlibi({t})", pos: null, paren: false }, close: null }
+    ;fn matchElse(e, t) {
+        ;if (e.els != null || e.cases[0].values[0].k != "mem") { ;return e.els }
+        { stmts: [], value: { k: "raw", js: "\$rt.noCase({t})", pos: null, paren: false }, close: null }
     }
 
-    ;fn suspectStmt(e) {
+    ;fn matchStmt(e) {
         ;const t is (tmp)
         ;"const {t} = {e.subject(expr)};"(emit)
         ;var k is 0
-        ;while (k < e.alibis($length)) {
-            ;"{k > 0 ? "}} else " : ""}if ({(t, e.alibis[k])(alibiTest)}) {{"(emit)
+        ;while (k < e.cases($length)) {
+            ;"{k > 0 ? "}} else " : ""}if ({(t, e.cases[k])(caseTest)}) {{"(emit)
             ;set indent += 1
-            ;e.alibis[k].body(blockBody)
+            ;e.cases[k].body(blockBody)
             ;set indent -= 1
             ;set k += 1
         }
-        ;const els is (e, t)(suspectElse)
+        ;const els is (e, t)(matchElse)
         ;if (els != null) {
             ;"}} else {{"(emit)
             ;set indent += 1
@@ -467,11 +467,11 @@
 
     // A match used as a value: an arrow function taking the subject, whose body
     // is a ternary chain when every block is just a value.
-    ;fn suspectExpr(e) {
+    ;fn matchExpr(e) {
         ;const t is (tmp)
         ;const subject is e.subject(expr)
         ;var withElse is e
-        ;set withElse.els to (e, t)(suspectElse)
+        ;set withElse.els to (e, t)(matchElse)
         ;if (withElse(isPlain)) { ;return "(({t}) => {(withElse, t)(ternaryChain)})({subject})" }
         ;const body is (withElse, t)(branchFunction)
         "(({t}) => {{\n{body}\n{("  ", indent)(repeat)}}})({subject})"
@@ -515,8 +515,8 @@
         }
         ;if (kind == "bool") { ;return e.v(jsBool) }
         ;if (kind == "null") { ;return "null" }
-        ;if (kind == "nan") { ;return "\$rt.NOBODY" }
-        ;if (kind == "inf") { ;return "\$rt.EVERYBODY" }
+        ;if (kind == "nan") { ;return "\$rt.NAN" }
+        ;if (kind == "inf") { ;return "\$rt.INF" }
         ;if (kind == "name") { ;return e.name(id) }
         ;if (kind == "std") { ;return "\$std.{e.name}" }
         ;if (kind == "arr") { ;return "\$rt.frozen([{e.items(exprList)}])" }
@@ -525,7 +525,7 @@
         ;if (kind == "mem") {
             // An enum member, a declaration imported from a module, or a record field. The
             // checker forbids shadowing enum and module names, so these are exact.
-            ;const lin is e.rec(lineupJs)
+            ;const lin is e.rec(enumJs)
             ;if (lin != null) { ;return "{lin}.m_{e.field}" }
             ;const lib is e.rec(stolenFrom)
             ;if (lib != null) { ;return "w{lib(modId)}_{e.field}" }
@@ -549,7 +549,7 @@
             ;return (e.callee, args)(callJs)
         }
         ;if (kind == "chain") { ;return e(chainExpr) }
-        ;if (kind == "suspect") { ;return e(suspectExpr) }
+        ;if (kind == "match") { ;return e(matchExpr) }
         ;if (kind == "raw") { ;return e.js }
         ;panic "codegen: unhandled expression {kind}"
     }
@@ -560,7 +560,7 @@
         ;const list is modules[mi].program.stmts
         ;var li is 0
         ;while (li < list($length)) {
-            ;if (list[li].k == "lineup") { ;(list[li], mi(modId))(lineupDef) }
+            ;if (list[li].k == "enum") { ;(list[li], mi(modId))(enumDef) }
             ;set li += 1
         }
         ;set mi += 1

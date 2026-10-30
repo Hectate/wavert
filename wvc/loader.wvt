@@ -1,8 +1,8 @@
-// wvc: Loading the modules of the program being compiled (Γ-- spec §13.1).
-// A module is { file, chars, path, program, steals, exports, notLibrary, fickleTargets },
-// where steals is [{ node, lib }] (its imports) and lib is the imported module's index in the
+// wvc: Loading the modules of the program being compiled (spec §13.1).
+// A module is { file, chars, path, program, imports, exports, notLibrary, refTargets },
+// where imports is [{ node, lib }] (its imports) and lib is the imported module's index in the
 // module list. The checker fills in exports (the declarations it exports),
-// notLibrary, and fickleTargets (the positions of set targets that are
+// notLibrary, and refTargets (the positions of set targets that are
 // ref bindings, which the code generator binds without copying, §10.4).
 
 ;import diag from "diag.wvt"
@@ -73,12 +73,12 @@
     ;fn visit(file, chars, path, chain) {
         ;(file, chars)(diag.setSource)
         ;const program is chars(lexer.lex)(parser.parse)
-        ;var steals is []
+        ;var imports is []
         ;var k is 0
         ;while (k < program.stmts($length)) {
             ;const s is program.stmts[k]
             ;set k += 1
-            ;if (s.k != "steal") { ;continue }
+            ;if (s.k != "import") { ;continue }
             ;const libPath is (path(dirOf) + s.path)(normalize)
             ;var at is 0
             ;while (at < chain($length) && chain[at] != libPath) { ;set at += 1 }
@@ -94,12 +94,12 @@
                 ;const bom is cs($length) > 0 && cs[0] == "\u{FEFF}" ? 1 : 0
                 ;set lib to (libPath, (cs, bom, cs($length))($slice), libPath, (chain, libPath)(with))(visit)
             }
-            ;(steals, { node: s, lib: lib })($push)
+            ;(imports, { node: s, lib: lib })($push)
         }
-        ;var fickleTargets is []
+        ;var refTargets is []
         ;var mod is {
-            file: file, chars: chars, path: path, program: program, steals: steals, exports: [], notLibrary: false,
-            fickleTargets: fickleTargets
+            file: file, chars: chars, path: path, program: program, imports: imports, exports: [], notLibrary: false,
+            refTargets: refTargets
         }
         ;(modules, mod)($push)
         modules($length) - 1

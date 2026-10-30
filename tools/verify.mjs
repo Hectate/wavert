@@ -42,9 +42,28 @@ function ast(exe, file) {
   return { text: renamed(r.out.split('\n').filter((l) => !positionKeys.test(l)).join('\n').replace(/\.wah"/g, '.wvt"')) };
 }
 
+// wvc's syntax tree names the node kinds and fields that wahc's names in Γ--.
+const kinds = {
+  scheme: 'fn', lineup: 'enum', steal: 'import', bribe: 'end', getaway: 'return', tantrum: 'panic',
+  bail: 'break', loiter: 'continue', lurk: 'while', signal: 'fail', sigcall: 'failWith', claim: 'decl',
+  cheat: 'set', suspect: 'match',
+};
+const fields = { isShifty: 'isVar', isFickle: 'isRef', alibis: 'cases' };
+// What the code generators call in the runtime, which Wavert renamed.
+const runtimeNames = {
+  rt_tantrum: 'rt_panic', rt_no_alibi: 'rt_no_case', rt_signal: 'rt_fail_with', rt_sigcode: 'rt_failcode',
+  RT_NOBODY: 'RT_NAN', RT_EVERYBODY: 'RT_INF', wah_main: 'wvt_main',
+  '$rt.tantrum': '$rt.panic', '$rt.lineup': '$rt.makeEnum', '$rt.noAlibi': '$rt.noCase', '$rt.signal': '$rt.failWith',
+  '$rt.Wah': '$rt.Fail', '$rt.NOBODY': '$rt.NAN', '$rt.EVERYBODY': '$rt.INF',
+};
+
 // Γ-- output with Wavert's names for the renamed standard library functions,
-// and with values in a --ast dump spelled as Wavert's wvc prints them.
+// and a --ast dump with wvc's node names and values spelled as wvc prints them.
+const lookup = (map, w) => (Object.hasOwn(map, w) ? map[w] : w);
 const renamed = (text) => text
+  .replace(/(\$rt\.)?\b\w+\b/g, (w) => lookup(runtimeNames, w))
+  .replace(/^(\s*k: ")(\w+)"$/gm, (m, key, k) => `${key}${lookup(kinds, k)}"`)
+  .replace(/^(\s*)(\w+):/gm, (m, sp, f) => `${sp}${lookup(fields, f)}:`)
   .replace(/(\bstd_|\$std\.|\bname: ")toPurple\b/g, '$1toString')
   .replace(/(\bstd_|\$std\.|\bname: ")isNobody\b/g, '$1isNan')
   .replace(/^(\s*\w+: )(uninvited|real|fake)$/gm, (m, key, v) => key + { uninvited: 'null', real: 'true', fake: 'false' }[v]);

@@ -1,0 +1,317 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Wavert",
+  "scopeName": "source.wavert",
+  "fileTypes": ["wvt"],
+  "patterns": [
+    { "include": "#expression" }
+  ],
+  "repository": {
+    "expression": {
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        { "include": "#fn-definition" },
+        { "include": "#enum-definition" },
+        { "include": "#declaration" },
+        { "include": "#import" },
+        { "include": "#set" },
+        { "include": "#end-marker" },
+        { "include": "#onfail-handler" },
+        { "include": "#record-key" },
+        { "include": "#bang-keywords" },
+        { "include": "#keywords" },
+        { "include": "#constants" },
+        { "include": "#numbers" },
+        { "include": "#stdlib" },
+        { "include": "#call" },
+        { "include": "#member-access" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.wavert",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.begin.wavert" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.end.wavert" } }
+        },
+        {
+          "name": "comment.line.double-slash.wavert",
+          "match": "(//).*$",
+          "captures": { "1": { "name": "punctuation.definition.comment.wavert" } }
+        }
+      ]
+    },
+
+    "strings": {
+      "name": "string.quoted.double.wavert",
+      "begin": "\"",
+      "end": "\"|$",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.wavert" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.wavert" } },
+      "patterns": [
+        {
+          "name": "constant.character.escape.wavert",
+          "match": "\\\\(?:[nrt\\\\\"$]|u\\{[0-9A-Fa-f]{1,6}\\})"
+        },
+        {
+          "name": "invalid.illegal.unknown-escape.wavert",
+          "match": "\\\\."
+        },
+        {
+          "name": "constant.character.escape.brace.wavert",
+          "match": "\\{\\{|\\}\\}"
+        },
+        {
+          "name": "meta.interpolation.wavert",
+          "contentName": "meta.embedded.line.wavert",
+          "begin": "\\{",
+          "end": "\\}",
+          "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.wavert" } },
+          "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.wavert" } },
+          "patterns": [
+            { "include": "#nested-braces" },
+            { "include": "#expression" }
+          ]
+        },
+        {
+          "name": "invalid.illegal.lone-brace.wavert",
+          "match": "\\}"
+        }
+      ]
+    },
+
+    "nested-braces": {
+      "begin": "\\{",
+      "end": "\\}",
+      "beginCaptures": { "0": { "name": "punctuation.section.braces.begin.wavert" } },
+      "endCaptures": { "0": { "name": "punctuation.section.braces.end.wavert" } },
+      "patterns": [
+        { "include": "#nested-braces" },
+        { "include": "#expression" }
+      ]
+    },
+
+    "fn-definition": {
+      "comment": ";export fn name(a, var b, ref c) { ... }",
+      "begin": "\\b(?:(export)\\s+)?(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(\\()",
+      "end": "\\)",
+      "beginCaptures": {
+        "1": { "name": "storage.modifier.export.wavert" },
+        "2": { "name": "storage.type.function.wavert" },
+        "3": { "name": "entity.name.function.wavert" },
+        "4": { "name": "punctuation.definition.parameters.begin.wavert" }
+      },
+      "endCaptures": { "0": { "name": "punctuation.definition.parameters.end.wavert" } },
+      "patterns": [
+        { "include": "#comments" },
+        { "name": "storage.modifier.wavert", "match": "\\b(?:var|ref)\\b" },
+        { "name": "variable.parameter.wavert", "match": "[A-Za-z_][A-Za-z0-9_]*" },
+        { "name": "punctuation.separator.parameter.wavert", "match": "," }
+      ]
+    },
+
+    "enum-definition": {
+      "comment": ";export enum Name (a, b)",
+      "begin": "\\b(?:(export)\\s+)?(enum)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(\\()",
+      "end": "\\)",
+      "beginCaptures": {
+        "1": { "name": "storage.modifier.export.wavert" },
+        "2": { "name": "storage.type.enum.wavert" },
+        "3": { "name": "entity.name.type.enum.wavert" },
+        "4": { "name": "punctuation.definition.enum.begin.wavert" }
+      },
+      "endCaptures": { "0": { "name": "punctuation.definition.enum.end.wavert" } },
+      "patterns": [
+        { "include": "#comments" },
+        { "name": "variable.other.enummember.wavert", "match": "[A-Za-z_][A-Za-z0-9_]*" },
+        { "name": "punctuation.separator.comma.wavert", "match": "," }
+      ]
+    },
+
+    "declaration": {
+      "comment": ";export const name is value; is is a keyword only here",
+      "match": "\\b(?:(export)\\s+)?(const|var|ref)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(is)\\b",
+      "captures": {
+        "1": { "name": "storage.modifier.export.wavert" },
+        "2": { "name": "storage.type.wavert" },
+        "3": { "name": "variable.other.declaration.wavert" },
+        "4": { "name": "keyword.operator.assignment.wavert" }
+      }
+    },
+
+    "import": {
+      "comment": ";import name from \"path.wvt\"; from is a keyword only here",
+      "match": "\\b(import)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(from)\\b",
+      "captures": {
+        "1": { "name": "keyword.control.import.wavert" },
+        "2": { "name": "entity.name.namespace.wavert" },
+        "3": { "name": "keyword.control.import.wavert" }
+      }
+    },
+
+    "set": {
+      "comment": ";set target to value, or ;set target += value; to is a keyword only here",
+      "begin": "\\bset\\b",
+      "end": "\\b(to)\\b|(\\*\\*=|<<=|>>=|[-+*/%&|^]=)|(?=;)|$",
+      "beginCaptures": { "0": { "name": "keyword.other.assignment.wavert" } },
+      "endCaptures": {
+        "1": { "name": "keyword.operator.assignment.wavert" },
+        "2": { "name": "keyword.operator.assignment.compound.wavert" }
+      },
+      "patterns": [
+        { "include": "#expression" }
+      ]
+    },
+
+    "end-marker": {
+      "comment": ";end, the last statement of a library; end is a keyword only as a whole statement",
+      "match": "(?<=;)\\s*(end)\\b(?=\\s*(?:$|;|}|//))",
+      "captures": { "1": { "name": "keyword.control.end.wavert" } }
+    },
+
+    "onfail-handler": {
+      "comment": "onfail (c) { ... }: the code binding is a parameter, not a call",
+      "match": "\\b(onfail)\\s*(\\()\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(\\))",
+      "captures": {
+        "1": { "name": "keyword.control.exception.wavert" },
+        "2": { "name": "punctuation.definition.parameters.begin.wavert" },
+        "3": { "name": "variable.parameter.wavert" },
+        "4": { "name": "punctuation.definition.parameters.end.wavert" }
+      }
+    },
+
+    "record-key": {
+      "comment": "{ key: value }. A key follows '{' or ',' (or starts a line), which keeps ternary branches out.",
+      "match": "(?:(?<=[{,])|^)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(:)",
+      "captures": {
+        "1": { "name": "variable.other.property.wavert" },
+        "2": { "name": "punctuation.separator.key-value.wavert" }
+      }
+    },
+
+    "bang-keywords": {
+      "patterns": [
+        { "name": "keyword.control.conditional.wavert", "match": "!if\\b" },
+        { "name": "keyword.control.loop.wavert", "match": "!while\\b" }
+      ]
+    },
+
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.conditional.wavert", "match": "\\b(?:if|else|match|case)\\b" },
+        { "name": "keyword.control.loop.wavert", "match": "\\b(?:while|break|continue)\\b" },
+        { "name": "keyword.control.flow.wavert", "match": "\\b(?:return|exit)\\b" },
+        { "name": "keyword.control.exception.wavert", "match": "\\b(?:fail|onfail|panic)\\b" },
+        { "name": "keyword.control.import.wavert", "match": "\\b(?:import|export)\\b" },
+        { "name": "keyword.other.assignment.wavert", "match": "\\bset\\b" },
+        { "name": "storage.type.function.wavert", "match": "\\bfn\\b" },
+        { "name": "storage.type.enum.wavert", "match": "\\benum\\b" },
+        { "name": "storage.type.wavert", "match": "\\b(?:const|var|ref)\\b" },
+        { "name": "invalid.illegal.reserved.wavert", "match": "\\b(?:fails|recover|finally)\\b" }
+      ]
+    },
+
+    "constants": {
+      "patterns": [
+        { "name": "constant.language.boolean.wavert", "match": "\\b(?:true|false)\\b" },
+        { "name": "constant.language.null.wavert", "match": "\\bnull\\b" },
+        { "name": "constant.language.numeric.wavert", "match": "\\b(?:nan|inf)\\b" }
+      ]
+    },
+
+    "numbers": {
+      "comment": "42, 0xFF, 0b101, 1.5, 1e9, 2.5e-3 (§2.3). Anything else that starts with a digit is a lex error.",
+      "patterns": [
+        { "name": "constant.numeric.hex.wavert", "match": "\\b0x[0-9A-Fa-f]+\\b" },
+        { "name": "constant.numeric.binary.wavert", "match": "\\b0b[01]+\\b" },
+        { "name": "constant.numeric.decimal.wavert", "match": "\\b[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\\b(?!\\.[0-9])" },
+        { "name": "invalid.illegal.numeric.wavert", "match": "\\b[0-9][0-9A-Za-z_.]*" }
+      ]
+    },
+
+    "stdlib": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.wavert",
+          "match": "\\$(?:print|write|eprint|readLine|readFile|writeFile|appendFile|fileExists|listDir|deleteFile|env|run|length|at|slice|code|fromCode|split|join|toString|toInt|toFloat|push|pop|same|typeOf|fields|floor|ceil|round|trunc|toUint32|isNan)\\b"
+        },
+        {
+          "name": "support.constant.builtin.wavert",
+          "match": "\\$(?:args|programPath)\\b"
+        },
+        {
+          "name": "invalid.illegal.unknown-builtin.wavert",
+          "match": "\\$[A-Za-z_][A-Za-z0-9_]*|\\$"
+        }
+      ]
+    },
+
+    "call": {
+      "comment": "(f), ($f) and (module.f) are calls wherever they appear (§6.2), except as the condition after if, while, match or onfail",
+      "match": "(?<!\\bif|\\bwhile|\\bmatch|\\bonfail|\\bif |\\bwhile |\\bmatch |\\bonfail )(\\()\\s*(\\$?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)?)\\s*(\\))",
+      "captures": {
+        "1": { "name": "punctuation.definition.call.begin.wavert" },
+        "2": { "patterns": [{ "include": "#callee" }] },
+        "3": { "name": "punctuation.definition.call.end.wavert" }
+      }
+    },
+
+    "callee": {
+      "patterns": [
+        { "include": "#stdlib" },
+        {
+          "comment": "module.f: a function an imported module exports (§13.1)",
+          "match": "([A-Za-z_][A-Za-z0-9_]*)(\\.)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "entity.name.namespace.wavert" },
+            "2": { "name": "punctuation.accessor.wavert" },
+            "3": { "name": "entity.name.function.call.wavert" }
+          }
+        },
+        { "name": "entity.name.function.call.wavert", "match": "[A-Za-z_][A-Za-z0-9_]*" }
+      ]
+    },
+
+    "member-access": {
+      "comment": "record.field: the label after '.' is a field name, not a variable (§10.8)",
+      "patterns": [
+        {
+          "match": "(?<=[A-Za-z0-9_\\])}])(\\.)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "punctuation.accessor.wavert" },
+            "2": { "name": "variable.other.property.wavert" }
+          }
+        },
+        { "name": "invalid.illegal.dot.wavert", "match": "\\." }
+      ]
+    },
+
+    "operators": {
+      "patterns": [
+        { "name": "invalid.illegal.operator.wavert", "match": ">>>|\\+\\+|--" },
+        { "name": "keyword.operator.assignment.compound.wavert", "match": "\\*\\*=|<<=|>>=" },
+        { "name": "keyword.operator.wavert", "match": "\\*\\*|==|!=|<=|>=|&&|\\|\\||<<|>>" },
+        { "name": "keyword.operator.assignment.compound.wavert", "match": "[-+*/%&|^]=" },
+        { "name": "keyword.operator.wavert", "match": "[-+*/%<>&|^~!]" },
+        { "name": "keyword.operator.ternary.wavert", "match": "[?:]" },
+        { "name": "invalid.illegal.assignment.wavert", "match": "=" }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.terminator.statement.wavert", "match": ";" },
+        { "name": "punctuation.separator.comma.wavert", "match": "," },
+        { "name": "punctuation.section.braces.wavert", "match": "[{}]" },
+        { "name": "punctuation.section.brackets.wavert", "match": "[\\[\\]]" },
+        { "name": "punctuation.section.parens.wavert", "match": "[()]" }
+      ]
+    }
+  }
+}

@@ -12,7 +12,7 @@ A programming language derived from [Γ--](wah/README.md) ("wah"). Wavert keeps 
 ;exit
 ```
 
-The design, and the reasoning behind each decision, is in [docs/hybrid-syntax.md](docs/hybrid-syntax.md). Wavert's semantics are Γ--'s, specified in [wah/wah-spec.md](wah/wah-spec.md).
+The language is specified in [docs/wavert-spec.md](docs/wavert-spec.md). The reasoning behind each way it differs from Γ-- is in [docs/hybrid-syntax.md](docs/hybrid-syntax.md).
 
 ## Quick tour
 
@@ -38,12 +38,13 @@ The design, and the reasoning behind each decision, is in [docs/hybrid-syntax.md
 
 | Path | Contents |
 |---|---|
-| [docs/](docs/) | Wavert design documents. |
+| [docs/](docs/) | The Wavert specification, and the design document that derived Wavert from Γ--. |
 | [wvc/](wvc/) | `wvc`, the Wavert compiler, written in Wavert, with its tests; `wvc/wvc.c` is the bootstrap seed. |
 | [runtime/](runtime/) | The runtimes that compiled programs inline: `wvt.c` for C, `wvt.js` for `--target js`. |
 | [examples/](examples/) | Hello World, echo, FizzBuzz, records, `match`, enums, modules, `ref` bindings, and a Wavert tokenizer written in Wavert. |
 | [src/](src/) | Programs, built by `build.ps1`. |
 | [build.ps1](build.ps1) | Builds every program in `src\` into `bin\` with `wvc` and Zig. |
+| [editors/vscode/](editors/vscode/) | VS Code syntax highlighting and snippets. |
 | [tools/](tools/) | `wah2wvt.wah`, a Γ-- to Wavert converter written in Γ--, and `verify.mjs`, which checks a conversion. |
 | [wah/](wah/) | The Γ-- language and toolchain, imported from the wah repo (commit `5d2318b`): spec, compilers, runtime, examples, editor support and project template. It was the seed for bootstrapping Wavert, and Wavert no longer depends on it. This repo does not depend on the wah repo. |
 
