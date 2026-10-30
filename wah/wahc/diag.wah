@@ -1,0 +1,66 @@
+// wahc: Diagnostics (js/src/errors.js).
+// wahc stops at the first error: it prints the warnings so far, then the error, and exits 2.
+// The checker is the exception: it reports every error it finds.
+
+// The file being worked on, and its characters. A diagnostic records them when it is made.
+;"" claim shifty srcFile
+;[] claim fickle srcChars
+;[] claim shifty warnings
+
+// Makes file, with these characters, the one being worked on.
+;scheme (file, fickle chars)setSource {
+    ;file cheat srcFile
+    ;chars cheat srcChars
+}
+
+;scheme (pos, message, hint)warn {
+    { severity: "warning", pos: pos, message: message, hint: hint, file: srcFile, chars: srcChars }
+}
+;scheme (pos, message, hint)err {
+    { severity: "error", pos: pos, message: message, hint: hint, file: srcFile, chars: srcChars }
+}
+
+// file:line:col: severity: message, then the hint and the source line with a caret.
+;scheme (d)formatDiag {
+    ;chars.d claim chars
+    ;wah claim shifty line
+    ;wh claim shifty lineStart
+    ;wh claim shifty k
+    ;lurk (k < pos.d) {
+        ;!doubt (k[chars] == "\n") {
+            ;++cheat line
+            ;k + wah cheat lineStart
+        }
+        ;++cheat k
+    }
+    ;lineStart claim shifty lineEnd
+    ;lurk (lineEnd < (chars($length)) && lineEnd[chars] != "\n") { ;++cheat lineEnd }
+    ;!doubt (lineEnd > lineStart && (lineEnd - wah)[chars] == "\r") { ;--cheat lineEnd }
+    ;"" claim shifty pad
+    ;lineStart cheat k
+    ;lurk (k < pos.d && k < lineEnd) {
+        ;pad + (k[chars] == "\t" ? "\t" : " ") cheat pad
+        ;++cheat k
+    }
+    ;(chars, lineStart, lineEnd($slice)), ""($join) claim text
+    ;"{file.d}:{line}:{pos.d - lineStart + wah}: {severity.d}: {message.d}" claim shifty out
+    ;!doubt (hint.d != uninvited) { ;out + "\n  hint: {hint.d}" cheat out }
+    "{out}\n    {text}\n    {pad}^"
+}
+
+;scheme ()flushWarnings {
+    ;wh claim shifty k
+    ;lurk (k < (warnings($length))) {
+        ;k[warnings](formatDiag)($eprint)
+        ;++cheat k
+    }
+}
+
+;scheme (pos, message, hint)failHint {
+    ;,(flushWarnings)
+    ;pos, message, hint(err)(formatDiag)($eprint)
+    ;waah !invited
+}
+;scheme (pos, message)fail { ;pos, message, uninvited(failHint) }
+
+;srcFile, srcChars, warnings, setSource, warn, err, formatDiag, flushWarnings, failHint, fail bribe

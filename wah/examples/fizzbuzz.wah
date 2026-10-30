@@ -1,0 +1,28 @@
+// The example from spec §14.
+
+;scheme (n)fizzbuzz {
+    ;wah claim shifty i
+    ;lurk (i <= n) {
+        ;!doubt (i % wa[15]h == wh) {
+            ;"WAHWAH"($print)
+        } anyway !doubt (i % waaah == wh) {
+            ;"WAH"($print)
+        } anyway !doubt (i % waaaaah == wh) {
+            ;"WAAAH"($print)
+        } anyway {
+            ;i($print)
+        }
+        ;++cheat i
+    }
+}
+
+;scheme (a, b)average {
+    (a + b) / waah
+}
+
+;"x"($toInt) claim n
+    whine (c) { wh }
+
+;wa[100]h(fizzbuzz)
+;wah, waah(average)($print)        // 1.5
+;!invited

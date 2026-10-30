@@ -1,0 +1,451 @@
+// wahc: The lexer (js/src/lexer.js, spec §2).
+//
+// Token: { t, pos, end, sp, v, text, parts }
+//   t      token type: punctuation/operator text, a keyword, "!doubt" | "!lurk" | "!invited",
+//          "int" | "float" | "sig" | "str" | "id" | "std" | "opcheat" | "eof"
+//   sp     real when whitespace or a comment precedes the token (used by lints)
+//   nl     real when that whitespace or comment contains a newline (used by hints)
+//   v      int/float/sig value, id/std name, or the operator of an opcheat
+//   text   source text of a numeral or signal
+//   parts  for "str": purples and { tokens, pos } interpolations, alternating
+// Positions count code points; wahc0 counts UTF-16 units, so they differ after
+// a character outside the BMP.
+
+;"text.wah" steal text
+;"diag.wah" steal diag
+
+;["scheme", "getaway", "claim", "shifty", "fickle", "cheat", "doubt", "anyway", "lurk", "bail", "loiter",
+  "tantrum", "whine", "real", "fake", "uninvited", "nobody", "everybody", "suspect", "alibi",
+  "lineup", "steal", "bribe"] claim keywords
+;[
+    { word: "blame", message: "'blame' is reserved: catching tantrums is not designed yet" },
+    { word: "sulk", message: "'sulk' is reserved: catching tantrums is not designed yet" },
+    { word: "regret", message: "'regret' is reserved: catching tantrums is not designed yet" },
+    { word: "wails", message: "'wails' is reserved for after stage 0" },
+    { word: "invited", message: "'invited' is reserved; did you mean '!invited'?" }
+] claim reserved
+;["doubt", "lurk", "invited"] claim bangWords
+;["**", "<<", ">>", "++", "--", "+", "-", "*", "/", "%", "&", "|", "^"] claim cheatOps
+;["**", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>",
+  "+", "-", "*", "/", "%", "<", ">", "&", "|", "^", "~", "!", "?", ":",
+  ";", ",", "(", ")", "[", "]", "{{", "}}"] claim ops
+
+// w a* h or W A* H, in any mix of cases.
+;scheme (w)isNumeralShape {
+    ;w, ""($split) claim cs
+    ;cs($length) claim len
+    ;!doubt (len < waah || (wh[cs] != "w" && wh[cs] != "W") || (WAH[cs] != "h" && WAH[cs] != "H")) { ;getaway fake }
+    ;wah claim shifty k
+    ;lurk (k < len - wah) {
+        ;!doubt (k[cs] != "a" && k[cs] != "A") { ;getaway fake }
+        ;++cheat k
+    }
+    real
+}
+;scheme (w)isUpper { w == (w(toUpper.text)) }
+
+// The index just past the run of digits starting at k.
+;scheme (cs, k)digitRun {
+    ;k claim shifty j
+    ;lurk (j < (cs($length)) && (j[cs](isDigit.text))) { ;++cheat j }
+    j
+}
+
+// The index past an optional exponent ([eE][+-]?[0-9]+) at k, or WAH if it is malformed.
+;scheme (cs, k)exponentEnd {
+    ;!doubt (k >= (cs($length)) || (k[cs] != "e" && k[cs] != "E")) { ;getaway k }
+    ;k + wah claim shifty j
+    ;!doubt (j < (cs($length)) && (j[cs] == "+" || j[cs] == "-")) { ;++cheat j }
+    ;cs, j(digitRun) claim end
+    end > j ? end : WAH
+}
+
+// Classifies the literal inside wa[...]h (wahc0's parseBracketLiteral):
+// { kind: "int" | "float", error: uninvited } or { kind: "", error: message }.
+;scheme (b)bracketLiteral {
+    ;b, ""($split) claim cs
+    ;cs($length) claim len
+    ;fake claim shifty isInt
+    ;!doubt (len > waah && wh[cs] == "0" && (wah[cs] == "x" || wah[cs] == "b")) {
+        ;waah claim shifty k
+        ;lurk (k < len && (wah[cs] == "x" && (k[cs](isHexDigit.text)) || k[cs] == "0" || k[cs] == "1")) { ;++cheat k }
+        ;k == len cheat isInt
+    }
+    ;!doubt (len > wh && (cs, wh(digitRun)) == len) { ;real cheat isInt }
+    ;!doubt (isInt) {
+        ;"wa[{b}]h"($toInt) claim v
+            whine { uninvited }
+        ;!doubt (v == uninvited) { ;getaway { kind: "", error: "integer literal exceeds the 53-bit safe range" } }
+        ;getaway { kind: "int", error: uninvited }
+    }
+    // [0-9]+(\.[0-9]+)?(exponent)?
+    ;cs, wh(digitRun) claim whole
+    ;whole claim shifty p
+    ;!doubt (p < len && p[cs] == ".") {
+        ;cs, p + wah(digitRun) claim frac
+        ;!doubt (frac > p + wah) { ;frac cheat p } anyway { ;WAH cheat p }
+    }
+    ;!doubt (whole > wh && p >= wh) {
+        ;!doubt ((cs, p(exponentEnd)) == len) {
+            ;"wa[{b}]h"($toFloat) claim f
+                whine { uninvited }
+            ;!doubt (f == uninvited) { ;getaway { kind: "", error: "float literal is out of range" } }
+            ;getaway { kind: "float", error: uninvited }
+        }
+    }
+    // [0-9]*\.[0-9]*(exponent)?
+    ;!doubt (whole < len && whole[cs] == ".") {
+        ;!doubt ((cs, (cs, whole + wah(digitRun))(exponentEnd)) == len) {
+            ;getaway { kind: "", error: "digits are required on both sides of '.'" }
+        }
+    }
+    { kind: "", error: "'{b}' is not a numeric literal" }
+}
+
+// The value of the escape \e, or uninvited unless e is a one-character escape.
+;scheme (e)simpleEscape {
+    ;!doubt (e == "n") { ;getaway "\n" }
+    ;!doubt (e == "r") { ;getaway "\r" }
+    ;!doubt (e == "t") { ;getaway "\t" }
+    ;!doubt (e == "\\" || e == "\"" || e == "$") { ;getaway e }
+    uninvited
+}
+
+// Lexes cs, an array of characters; the result ends with an "eof" token.
+;scheme (cs)lex {
+    ;cs($length) claim n
+    ;wh claim shifty i
+    ;"" claim shifty prevT
+    // Whether the whitespace before the current token contains a newline (used by hints).
+    ;fake claim shifty nlNow
+    ;[] claim shifty toks
+
+    // The character at k, or "" outside the text.
+    ;scheme (k)ch { k >= wh && k < n ? k[cs] : "" }
+    ;scheme (a, b)cut { (cs, a, b($slice)), ""($join) }
+
+    // Does the text s occur at k?
+    ;scheme (k, s)startsWith {
+        ;s, ""($split) claim sc
+        ;!doubt (k + (sc($length)) > n) { ;getaway fake }
+        ;wh claim shifty q
+        ;lurk (q < (sc($length))) {
+            ;!doubt ((k + q)[cs] != q[sc]) { ;getaway fake }
+            ;++cheat q
+        }
+        real
+    }
+
+    // The first index at or after from where s occurs, or WAH.
+    ;scheme (s, from)find {
+        ;from claim shifty q
+        ;lurk (q < n) {
+            ;!doubt (q, s(startsWith)) { ;getaway q }
+            ;++cheat q
+        }
+        WAH
+    }
+
+    ;scheme (t, pos, sp, v, spelling, parts)tok {
+        ;t cheat prevT
+        { t: t, pos: pos, end: i, sp: sp, nl: nlNow, v: v, text: spelling, parts: parts }
+    }
+    ;scheme (t, pos, sp)plain { t, pos, sp, uninvited, uninvited, uninvited(tok) }
+
+    // Skips whitespace and comments; returns real if anything was skipped.
+    ;scheme ()skip {
+        ;fake claim shifty skipped
+        ;lurk (real) {
+            ;i(ch) claim c
+            ;!doubt (c(isSpace.text)) {
+                ;++cheat i
+                ;real cheat skipped
+            } anyway !doubt (c == "/" && (i + wah(ch)) == "/") {
+                ;!doubt (!skipped && (i - wah(ch)(isIdChar.text)) && (i + waah(ch)(isIdChar.text))) {
+                    ;warnings.diag, (i, "'//' starts a comment; Γ-- has no integer-division operator",
+                        "for integer division write ;a / b(\$floor)"(warn.diag))($push)
+                }
+                ;lurk (i < n && i[cs] != "\n") { ;++cheat i }
+                ;real cheat skipped
+            } anyway !doubt (c == "/" && (i + wah(ch)) == "*") {
+                ;"*/", i + waah(find) claim close
+                ;!doubt (close < wh) { ;i, "unterminated block comment"(fail.diag) }
+                ;close + waah cheat i
+                ;real cheat skipped
+            } anyway {
+                ;getaway skipped
+            }
+        }
+    }
+
+    ;scheme ()next {
+        ;i claim from
+        ;(,(skip)) || i == wh claim sp
+        ;fake cheat nlNow
+        ;from claim shifty q
+        ;lurk (q < i) {
+            ;!doubt (q[cs] == "\n") { ;real cheat nlNow }
+            ;++cheat q
+        }
+        ;i claim start
+        ;start(ch) claim c
+        ;!doubt (c == "") { ;getaway "eof", start, sp(plain) }
+        ;!doubt (c(isIdStart.text)) { ;getaway start, sp(word) }
+        ;!doubt (c == "\"") { ;getaway start, sp(string) }
+        ;!doubt (c == "$") { ;getaway start, sp(sigil) }
+        ;!doubt (c(isDigit.text)) {
+            ;start claim shifty j
+            ;lurk (j < start + wa[40]h && ((j(ch)) == "." || (j(ch)(isIdChar.text)))) { ;++cheat j }
+            ;start, j(cut) claim lit
+            ;start, "'{lit}': decimal digits are not Γ-- numerals", "write wa[{lit}]h"(failHint.diag)
+        }
+        ;wh claim shifty k
+        ;lurk (k < (cheatOps($length))) {
+            ;k[cheatOps] claim op
+            ;start + (op($length)) claim after
+            ;!doubt ((start, op(startsWith)) && (after, "cheat"(startsWith)) && !(after + wa[5]h(ch)(isIdChar.text))) {
+                ;after + wa[5]h cheat i
+                ;getaway "opcheat", start, sp, op, uninvited, uninvited(tok)
+            }
+            ;++cheat k
+        }
+        ;!doubt (c == "!") {
+            // Only the first 64 characters are examined, as in wahc0.
+            ;start + wa[64]h claim limit
+            ;start + wah claim shifty j
+            ;lurk (j < limit && (j(ch)(isJsSpace.text))) { ;++cheat j }
+            ;j claim wordStart
+            ;!doubt (j < limit && (j(ch)(isIdStart.text))) {
+                ;lurk (j < limit && (j(ch)(isIdChar.text))) { ;++cheat j }
+                ;wordStart, j(cut) claim w
+                ;!doubt (bangWords, w(contains.text)) {
+                    ;!doubt (wordStart > start + wah) {
+                        ;start, "no whitespace is allowed inside '!{w}'", "write '!{w}'"(failHint.diag)
+                    }
+                    ;j cheat i
+                    ;getaway "!" + w, start, sp(plain)
+                }
+            }
+        }
+        ;!doubt (start, ">>>"(startsWith)) {
+            ;start, "there is no '>>>' operator", "for an unsigned interpretation use ;x(\$toUint32)"(failHint.diag)
+        }
+        ;!doubt (start, "--"(startsWith)) {
+            ;start, "'--' is not an operator",
+                "write '- -x' or '-(-x)' for double negation, or ';--cheat x' to decrement"(failHint.diag)
+        }
+        ;!doubt (start, "++"(startsWith)) {
+            ;start, "'++' is not an operator", "write ';++cheat x' to increment"(failHint.diag)
+        }
+        ;wh cheat k
+        ;lurk (k < (ops($length))) {
+            ;k[ops] claim op
+            ;!doubt (start, op(startsWith)) {
+                ;start + (op($length)) cheat i
+                ;!doubt (op == ";" && prevT == ";") {
+                    ;warnings.diag, (start, "';;': likely a habitual trailing ';' from C-style languages",
+                        "Γ-- statements begin with ;, they are not terminated by it"(warn.diag))($push)
+                }
+                ;getaway op, start, sp(plain)
+            }
+            ;++cheat k
+        }
+        ;!doubt (c == "=") { ;start, "'=' is not an operator", "use 'claim' or 'cheat'"(failHint.diag) }
+        // Member access (§10.8): '.' must touch both sides.
+        ;!doubt (c == ".") {
+            ;start + wah(ch) claim after
+            ;!doubt (sp || after == "" || (after(isSpace.text)) || (start + wah, "//"(startsWith)) || (start + wah, "/*"(startsWith))) {
+                ;start, "no whitespace is allowed around '.'", "member access is written field.record, e.g. kind.node"(failHint.diag)
+            }
+            ;start + wah cheat i
+            ;getaway ".", start, sp(plain)
+        }
+        ;start, "unexpected character '{c}'"(fail.diag)
+    }
+
+    ;scheme (start, sp)word {
+        ;start claim shifty j
+        ;lurk (j(ch)(isIdChar.text)) { ;++cheat j }
+        ;start, j(cut) claim w
+        ;!doubt ((j(ch)) == "[" && (w($length)) == waah && (w(toUpper.text)) == "WA") { ;getaway start, j, sp(bracketNumeral) }
+        ;!doubt (w(isNumeralShape)) {
+            ;!doubt (!(w(isUpper)) && w != (w(toLower.text))) {
+                ;start, "mixed-case wah numeral '{w}'", "all lowercase is positive, all uppercase is negative"(failHint.diag)
+            }
+            ;j cheat i
+            ;getaway start, sp, (w(isUpper)), "int", w(numeral)
+        }
+        ;j cheat i
+        ;!doubt ((j(ch)) == "$") {
+            ;j, "'$' cannot appear in identifiers", "'$' is reserved for the standard library; user names have no sigil"(failHint.diag)
+        }
+        ;!doubt (keywords, w(contains.text)) { ;getaway w, start, sp(plain) }
+        ;wh claim shifty k
+        ;lurk (k < (reserved($length))) {
+            ;!doubt (word.k[reserved] == w) { ;start, message.k[reserved](fail.diag) }
+            ;++cheat k
+        }
+        "id", start, sp, w, uninvited, uninvited(tok)
+    }
+
+    ;scheme (start, open, sp)bracketNumeral {
+        ;start, open(cut) claim pre
+        ;!doubt (pre != "wa" && pre != "WA") {
+            ;start, "mixed-case wah numeral '{pre}[...'", "all lowercase is positive, all uppercase is negative"(failHint.diag)
+        }
+        ;pre == "WA" claim upper
+        ;"]", open(find) claim close
+        ;!doubt (close < wh) { ;start, "unterminated wah numeral: missing ']'"(fail.diag) }
+        ;upper ? "H" : "h" claim h
+        ;!doubt ((close + wah(ch)) != h) { ;close + wah, "expected '{h}' to close the wah numeral"(fail.diag) }
+        ;close + waah cheat i
+        ;!doubt (i(ch)(isIdChar.text)) { ;start, "invalid wah numeral"(fail.diag) }
+        ;open + wah, close(cut)(bracketLiteral) claim lit
+        ;!doubt (error.lit != uninvited) {
+            ;open + wah, error.lit, "only literals are allowed inside wa[...]h; for computed values use ;x(\$toInt)"(failHint.diag)
+        }
+        start, sp, upper, kind.lit, (start, i(cut))(numeral)
+    }
+
+    ;scheme (start, sp, upper, kind, spelling)numeral {
+        ;!doubt ((i(ch)) == "!" && (i + wah(ch)(isSigTerm.text))) {
+            ;!doubt (!upper) { ;start, "lowercase '{spelling}!' is not a signal", "write '{spelling(toUpper.text)}!'"(failHint.diag) }
+            ;!doubt (kind != "int" || (spelling($toInt)) > WAH) {
+                ;start, "a WAH! signal code must be an integer >= 1"(fail.diag)
+            }
+            ;++cheat i
+            ;getaway "sig", start, sp, wh - (spelling($toInt)), spelling + "!", uninvited(tok)
+        }
+        ;!doubt ((i(ch)) == "$") { ;i, "'$' must be immediately followed by a standard library name"(fail.diag) }
+        ;kind == "int" ? (spelling($toInt)) : (spelling($toFloat)) claim v
+        kind, start, sp, v, spelling, uninvited(tok)
+    }
+
+    ;scheme (start, sp)sigil {
+        ;!doubt (!(start + wah(ch)(isIdStart.text))) {
+            ;start, "'$' must be immediately followed by a standard library name",
+                "'$' is reserved for the standard library; user names have no sigil"(failHint.diag)
+        }
+        ;start + wah claim shifty j
+        ;lurk (j(ch)(isIdChar.text)) { ;++cheat j }
+        ;j cheat i
+        "std", start, sp, (start + wah, j(cut)), uninvited, uninvited(tok)
+    }
+
+    ;scheme (start, sp)string {
+        ;[] claim shifty parts
+        ;"" claim shifty buf
+        ;WAH claim shifty rawDollar
+        ;start + wah claim shifty k
+        ;lurk (real) {
+            ;k(ch) claim c
+            ;!doubt (c == "") { ;start, "unterminated string"(fail.diag) }
+            ;!doubt (c == "\n" || c == "\r") { ;k, "raw newline inside a string", "write '\\n'"(failHint.diag) }
+            ;!doubt (c == "\"") {
+                ;++cheat k
+                ;bail
+            }
+            ;!doubt (c == "\\") {
+                ;k + wah(ch) claim e
+                ;e(simpleEscape) claim simple
+                ;!doubt (simple != uninvited) {
+                    ;buf + simple cheat buf
+                    ;waah +cheat k
+                    ;loiter
+                }
+                ;!doubt (e == "u" && (k + waah(ch)) == "{{") {
+                    ;"}}", k + waaah(find) claim close
+                    ;close < wh ? "" : (k + waaah, close(cut)) claim hex
+                    ;hex(hexValue.text) claim cp
+                    ;!doubt (cp < wh || cp > wa[0x10FFFF]h || cp >= wa[0xD800]h && cp <= wa[0xDFFF]h) {
+                        ;k, "invalid \\u{{...}} escape",
+                            "write 1 to 6 hex digits naming a Unicode scalar value, e.g. \\u{{1F608}}"(failHint.diag)
+                    }
+                    ;buf + (cp($fromCode)) cheat buf
+                    ;close + wah cheat k
+                    ;loiter
+                }
+                ;k, "unknown escape '\\{e}'", "valid escapes are \\n \\r \\t \\\\ \\\" \\$ \\u{{...}}"(failHint.diag)
+            }
+            ;!doubt (c == "{{") {
+                ;!doubt ((k + wah(ch)) == "{{") {
+                    ;buf + "{{" cheat buf
+                    ;waah +cheat k
+                    ;loiter
+                }
+                ;!doubt (rawDollar == k - wah) {
+                    ;warnings.diag, (rawDollar, "Γ-- interpolation is {{x}}, not \${{x}}", uninvited(warn.diag))($push)
+                }
+                ;parts, buf($push)
+                ;"" cheat buf
+                ;k(interpolation) claim sub
+                ;parts, { tokens: tokens.sub, pos: k }($push)
+                ;end.sub cheat k
+                ;loiter
+            }
+            ;!doubt (c == "}}") {
+                ;!doubt ((k + wah(ch)) == "}}") {
+                    ;buf + "}}" cheat buf
+                    ;waah +cheat k
+                    ;loiter
+                }
+                ;k, "unmatched '}}' in string", "write '}}}}' for a literal brace"(failHint.diag)
+            }
+            ;!doubt (c == "$") {
+                ;k cheat rawDollar
+                ;!doubt (k + wah(ch)(isIdStart.text)) {
+                    ;k + wah claim shifty j
+                    ;lurk (j(ch)(isIdChar.text)) { ;++cheat j }
+                    ;k + wah, j(cut) claim name
+                    ;warnings.diag, (k, "did you mean {{{name}}}?", "Γ-- interpolation is {{x}}; write \\\$ for a literal \$"(warn.diag))($push)
+                }
+            }
+            ;buf + c cheat buf
+            ;++cheat k
+        }
+        ;parts, buf($push)
+        ;k cheat i
+        "str", start, sp, uninvited, uninvited, parts(tok)
+    }
+
+    // Lexes the expression inside "{...}" of a string; open is the '{'.
+    // Returns { tokens, end }, where the tokens end with an "eof" in place of the '}'.
+    ;scheme (open)interpolation {
+        ;i claim saveI
+        ;prevT claim savePrev
+        ;nlNow claim saveNl
+        ;open + wah cheat i
+        ;"" cheat prevT
+        ;[] claim shifty sub
+        ;wh claim shifty depth
+        ;lurk (real) {
+            ;,(next) claim tk
+            ;!doubt (t.tk == "eof") { ;open, "unterminated interpolation in string"(fail.diag) }
+            ;!doubt (t.tk == "}}") {
+                ;!doubt (depth == wh) {
+                    ;sub, { t: "eof", pos: pos.tk, end: end.tk, sp: sp.tk, nl: nl.tk, v: uninvited, text: uninvited, parts: uninvited }($push)
+                    ;bail
+                }
+                ;--cheat depth
+            } anyway !doubt (t.tk == "{{") {
+                ;++cheat depth
+            }
+            ;sub, tk($push)
+        }
+        ;i claim endI
+        ;saveI cheat i
+        ;savePrev cheat prevT
+        ;saveNl cheat nlNow
+        ;!doubt ((sub($length)) == wah) { ;open, "empty interpolation", "write '{{{{' for a literal brace"(failHint.diag) }
+        { tokens: sub, end: endI }
+    }
+
+    ;lurk (real) {
+        ;,(next) claim t0
+        ;toks, t0($push)
+        ;!doubt (t.t0 == "eof") { ;bail }
+    }
+    toks
+}
+
+;keywords, lex bribe

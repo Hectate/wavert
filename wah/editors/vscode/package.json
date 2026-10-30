@@ -1,0 +1,45 @@
+{
+  "name": "wah-language",
+  "displayName": "Γ-- (wah)",
+  "description": "Syntax highlighting, brackets and snippets for Γ-- (.wah)",
+  "version": "0.0.4",
+  "publisher": "wah",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Snippets"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "wah",
+        "aliases": [
+          "Γ--",
+          "gamma--",
+          "wah"
+        ],
+        "extensions": [
+          ".wah"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "wah",
+        "scopeName": "source.wah",
+        "path": "./syntaxes/wah.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "wah",
+        "path": "./snippets/wah.code-snippets"
+      }
+    ]
+  }
+}

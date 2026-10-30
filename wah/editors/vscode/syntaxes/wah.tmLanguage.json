@@ -1,0 +1,286 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Γ--",
+  "scopeName": "source.wah",
+  "fileTypes": ["wah"],
+  "patterns": [
+    { "include": "#expression" }
+  ],
+  "repository": {
+    "expression": {
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        { "include": "#scheme-definition" },
+        { "include": "#whine-handler" },
+        { "include": "#record-key" },
+        { "include": "#signal" },
+        { "include": "#bang-keywords" },
+        { "include": "#compound-cheat" },
+        { "include": "#steal-module" },
+        { "include": "#keywords" },
+        { "include": "#constants" },
+        { "include": "#numerals" },
+        { "include": "#stdlib" },
+        { "include": "#zero-argument-call" },
+        { "include": "#call" },
+        { "include": "#member-access" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.wah",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.begin.wah" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.end.wah" } }
+        },
+        {
+          "name": "comment.line.double-slash.wah",
+          "match": "(//).*$",
+          "captures": { "1": { "name": "punctuation.definition.comment.wah" } }
+        }
+      ]
+    },
+
+    "strings": {
+      "name": "string.quoted.double.wah",
+      "begin": "\"",
+      "end": "\"|$",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.wah" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.wah" } },
+      "patterns": [
+        {
+          "name": "constant.character.escape.wah",
+          "match": "\\\\(?:[nrt\\\\\"$]|u\\{[0-9A-Fa-f]{1,6}\\})"
+        },
+        {
+          "name": "invalid.illegal.unknown-escape.wah",
+          "match": "\\\\."
+        },
+        {
+          "name": "constant.character.escape.brace.wah",
+          "match": "\\{\\{|\\}\\}"
+        },
+        {
+          "name": "meta.interpolation.wah",
+          "contentName": "meta.embedded.line.wah",
+          "begin": "\\{",
+          "end": "\\}",
+          "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.wah" } },
+          "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.wah" } },
+          "patterns": [
+            { "include": "#nested-braces" },
+            { "include": "#expression" }
+          ]
+        },
+        {
+          "name": "invalid.illegal.lone-brace.wah",
+          "match": "\\}"
+        }
+      ]
+    },
+
+    "nested-braces": {
+      "begin": "\\{",
+      "end": "\\}",
+      "beginCaptures": { "0": { "name": "punctuation.section.braces.begin.wah" } },
+      "endCaptures": { "0": { "name": "punctuation.section.braces.end.wah" } },
+      "patterns": [
+        { "include": "#nested-braces" },
+        { "include": "#expression" }
+      ]
+    },
+
+    "scheme-definition": {
+      "comment": ";scheme (a, shifty b, fickle c)name { ... }",
+      "begin": "\\b(scheme)\\s*(\\()",
+      "end": "(\\))\\s*([A-Za-z_][A-Za-z0-9_]*)?",
+      "beginCaptures": {
+        "1": { "name": "storage.type.function.wah" },
+        "2": { "name": "punctuation.definition.parameters.begin.wah" }
+      },
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.parameters.end.wah" },
+        "2": { "name": "entity.name.function.wah" }
+      },
+      "patterns": [
+        { "include": "#comments" },
+        { "name": "storage.modifier.wah", "match": "\\b(?:shifty|fickle)\\b" },
+        { "name": "variable.parameter.wah", "match": "[A-Za-z_][A-Za-z0-9_]*" },
+        { "name": "punctuation.separator.parameter.wah", "match": "," }
+      ]
+    },
+
+    "whine-handler": {
+      "comment": "whine (c) { ... }: the code binding is a parameter, not a call",
+      "match": "\\b(whine)\\s*(\\()\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(\\))",
+      "captures": {
+        "1": { "name": "keyword.control.exception.wah" },
+        "2": { "name": "punctuation.definition.parameters.begin.wah" },
+        "3": { "name": "variable.parameter.wah" },
+        "4": { "name": "punctuation.definition.parameters.end.wah" }
+      }
+    },
+
+    "record-key": {
+      "comment": "{ key: value }. A key follows '{' or ',' (or starts a line), which keeps ternary branches out.",
+      "match": "(?:(?<=[{,])|^)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(:)",
+      "captures": {
+        "1": { "name": "variable.other.property.wah" },
+        "2": { "name": "punctuation.separator.key-value.wah" }
+      }
+    },
+
+    "signal": {
+      "comment": "WAH!, WAAAH!, WA[0x10]H!: only when '!' is followed by whitespace, ';', '}', ')' or the end (§2.5)",
+      "name": "keyword.control.signal.wah",
+      "match": "\\bW(?:A+|A\\[[^\\]\\s]*\\])H!(?=[\\s;})]|$)"
+    },
+
+    "bang-keywords": {
+      "patterns": [
+        { "name": "keyword.control.conditional.wah", "match": "!doubt\\b" },
+        { "name": "keyword.control.loop.wah", "match": "!lurk\\b" },
+        { "name": "keyword.control.exit.wah", "match": "!invited\\b" }
+      ]
+    },
+
+    "compound-cheat": {
+      "name": "keyword.operator.assignment.compound.wah",
+      "match": "(?:\\*\\*|<<|>>|\\+\\+|--|[-+*/%&|^])cheat\\b"
+    },
+
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.conditional.wah", "match": "\\b(?:doubt|anyway|suspect|alibi)\\b" },
+        { "name": "keyword.control.loop.wah", "match": "\\b(?:lurk|bail|loiter)\\b" },
+        { "name": "keyword.control.flow.wah", "match": "\\bgetaway\\b" },
+        { "name": "keyword.control.exception.wah", "match": "\\b(?:tantrum|whine|blame|sulk|regret)\\b" },
+        { "name": "keyword.control.import.wah", "match": "\\b(?:steal|bribe)\\b" },
+        { "name": "keyword.other.binding.wah", "match": "\\b(?:claim|cheat)\\b" },
+        { "name": "storage.type.function.wah", "match": "\\bscheme\\b" },
+        { "name": "storage.type.enum.wah", "match": "\\blineup\\b" },
+        { "name": "storage.modifier.wah", "match": "\\b(?:shifty|fickle|wails)\\b" },
+        { "name": "invalid.illegal.reserved.wah", "match": "\\binvited\\b" }
+      ]
+    },
+
+    "constants": {
+      "patterns": [
+        { "name": "constant.language.boolean.wah", "match": "\\b(?:real|fake)\\b" },
+        { "name": "constant.language.null.wah", "match": "\\buninvited\\b" },
+        { "name": "constant.language.numeric.wah", "match": "\\b(?:nobody|everybody)\\b" }
+      ]
+    },
+
+    "numerals": {
+      "patterns": [
+        { "name": "constant.numeric.wah", "match": "\\b(?:wa\\[[^\\]\\s]*\\]h|WA\\[[^\\]\\s]*\\]H)\\b" },
+        { "name": "constant.numeric.wah", "match": "\\b(?:wa*h|WA*H)\\b" },
+        { "name": "invalid.illegal.mixed-case-numeral.wah", "match": "\\b[wW][aA]*[hH]\\b|\\b[wW][aA]\\[[^\\]\\s]*\\][hH]" },
+        { "name": "invalid.illegal.decimal-digits.wah", "match": "\\b[0-9][0-9A-Za-z_.]*" }
+      ]
+    },
+
+    "stdlib": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.wah",
+          "match": "\\$(?:print|write|eprint|readLine|readFile|writeFile|appendFile|fileExists|listDir|deleteFile|env|run|length|at|slice|code|fromCode|split|join|toPurple|toWah|toInt|toFloat|push|pop|same|typeOf|fields|floor|ceil|round|trunc|toUint32|isNobody)\\b"
+        },
+        {
+          "name": "support.constant.builtin.wah",
+          "match": "\\$(?:args|programPath)\\b"
+        },
+        {
+          "name": "invalid.illegal.unknown-builtin.wah",
+          "match": "\\$[A-Za-z_][A-Za-z0-9_]*|\\$"
+        }
+      ]
+    },
+
+    "zero-argument-call": {
+      "comment": ",(f) at the start of an expression",
+      "match": "(?:(?<=[;(\\[{:?])|^)\\s*(,)\\s*(\\()\\s*(\\$?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)?)\\s*(\\))",
+      "captures": {
+        "1": { "name": "punctuation.separator.comma.wah" },
+        "2": { "name": "punctuation.definition.call.begin.wah" },
+        "3": { "patterns": [{ "include": "#callee" }] },
+        "4": { "name": "punctuation.definition.call.end.wah" }
+      }
+    },
+
+    "call": {
+      "comment": "x(f), x(f.module): a call is exactly (name) or (name.module) after an expression; after a keyword such as doubt or lurk it is a condition",
+      "match": "(?<=[A-Za-z0-9_\\])\"}])(?<!\\bdoubt|\\blurk|\\bwhine|\\bgetaway|\\btantrum|\\banyway)\\s*(\\()\\s*(\\$?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)?)\\s*(\\))",
+      "captures": {
+        "1": { "name": "punctuation.definition.call.begin.wah" },
+        "2": { "patterns": [{ "include": "#callee" }] },
+        "3": { "name": "punctuation.definition.call.end.wah" }
+      }
+    },
+
+    "steal-module": {
+      "comment": ";\"lib.wah\" steal lib: the name the module has in this file (§13.1)",
+      "match": "\\b(steal)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.control.import.wah" },
+        "2": { "name": "entity.name.namespace.wah" }
+      }
+    },
+
+    "callee": {
+      "patterns": [
+        { "include": "#stdlib" },
+        {
+          "comment": "f.module: a scheme a stolen module bribes (§13.1)",
+          "match": "([A-Za-z_][A-Za-z0-9_]*)(\\.)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "entity.name.function.call.wah" },
+            "2": { "name": "punctuation.accessor.wah" },
+            "3": { "name": "entity.name.namespace.wah" }
+          }
+        },
+        { "name": "entity.name.function.call.wah", "match": "[A-Za-z_][A-Za-z0-9_]*" }
+      ]
+    },
+
+    "member-access": {
+      "comment": "field.record: the label on the left is a field name, not a variable (§10.8)",
+      "patterns": [
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\.)(?=[A-Za-z_(\\[{\"$])",
+          "captures": {
+            "1": { "name": "variable.other.property.wah" },
+            "2": { "name": "punctuation.accessor.wah" }
+          }
+        },
+        { "name": "invalid.illegal.dot.wah", "match": "\\." }
+      ]
+    },
+
+    "operators": {
+      "patterns": [
+        { "name": "invalid.illegal.operator.wah", "match": ">>>|\\+\\+|--" },
+        { "name": "keyword.operator.wah", "match": "\\*\\*|==|!=|<=|>=|&&|\\|\\||<<|>>|[-+*/%<>&|^~!]" },
+        { "name": "keyword.operator.ternary.wah", "match": "[?:]" },
+        { "name": "invalid.illegal.assignment.wah", "match": "=" }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.terminator.statement.wah", "match": ";" },
+        { "name": "punctuation.separator.comma.wah", "match": "," },
+        { "name": "punctuation.section.braces.wah", "match": "[{}]" },
+        { "name": "punctuation.section.brackets.wah", "match": "[\\[\\]]" },
+        { "name": "punctuation.section.parens.wah", "match": "[()]" }
+      ]
+    }
+  }
+}

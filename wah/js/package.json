@@ -1,0 +1,17 @@
+{
+  "name": "wahc0",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Stage 0 compiler for Γ-- (gamma--/wah): compiles .wah to JavaScript",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "wahc0": "bin/wahc0.js"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22.3"
+  }
+}

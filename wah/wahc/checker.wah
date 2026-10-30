@@ -1,0 +1,872 @@
+// wahc: The checker (js/src/check.js, spec §5.1, §6, §7.2, §8.2, §12, §13).
+//
+// - names resolve; no shadowing; no use of a claim before it in the same function
+// - cheat only on shifty bindings (or fields/elements of them); schemes are not values; call arity
+// - lineup members exist; lineups are not values; suspects over members are exhaustive
+// - getaway / bail / loiter / WAH! only where they make sense
+// - conditional chains used as values end in a plain `anyway { ... }`
+// - the entry file ends with ;!invited
+//
+// Unlike the earlier phases, the checker reports every error it finds, not just the first.
+// A scope is { parent, names }, where names is a shifty array of declarations:
+// { kind, name, isShifty, isFickle, namePos, visibleAt, fnId, arity }. Functions are told
+// apart by number (fnId), since records are compared by reference.
+
+;"text.wah" steal text
+;"diag.wah" steal diag
+
+// The standard library (js/src/stdlib.js): name -> arity, or "const" for constants.
+;[
+    { name: "print", arity: wah }, { name: "write", arity: wah }, { name: "eprint", arity: wah },
+    { name: "readLine", arity: wh },
+    { name: "readFile", arity: wah }, { name: "writeFile", arity: waah }, { name: "appendFile", arity: waah },
+    { name: "fileExists", arity: wah }, { name: "listDir", arity: wah }, { name: "deleteFile", arity: wah },
+    { name: "args", arity: "const" }, { name: "env", arity: wah },
+    { name: "programPath", arity: "const" }, { name: "run", arity: waah },
+    { name: "length", arity: wah }, { name: "at", arity: waah }, { name: "slice", arity: waaah },
+    { name: "code", arity: wah }, { name: "fromCode", arity: wah }, { name: "split", arity: waah },
+    { name: "join", arity: waah }, { name: "toPurple", arity: wah }, { name: "toWah", arity: wah },
+    { name: "toInt", arity: wah }, { name: "toFloat", arity: wah },
+    { name: "push", arity: waah }, { name: "pop", arity: wah }, { name: "same", arity: waah },
+    { name: "typeOf", arity: wah },
+    { name: "fields", arity: wah },
+    { name: "floor", arity: wah }, { name: "ceil", arity: wah }, { name: "round", arity: wah },
+    { name: "trunc", arity: wah }, { name: "toUint32", arity: wah }, { name: "isNobody", arity: wah }
+] claim stdlib
+
+// The arity of a stdlib name, "const", or uninvited if there is no such name.
+;scheme (name)stdSig {
+    ;wh claim shifty k
+    ;lurk (k < (stdlib($length))) {
+        ;!doubt (name.k[stdlib] == name) { ;getaway arity.k[stdlib] }
+        ;++cheat k
+    }
+    uninvited
+}
+
+// How a claim or parameter binds its values (§10.4).
+;scheme (x)modeOf { isShifty.x ? "shifty" : isFickle.x ? "fickle" : "" }
+
+;scheme (n)plural { "{n} argument" + (n == wah ? "" : "s") }
+
+// Statements after which a block never reaches its end (§7.2).
+;["getaway", "tantrum", "exit", "signal", "bail", "loiter"] claim neverCompletes
+// Statements whose whine handler's value is used (§7.2).
+;["claim", "cheat", "getaway", "tantrum", "exit"] claim whineValueUsed
+
+// A lineup as written: Lineup, or Lineup.module for a stolen one (§4.1, §13.1).
+;scheme (x)lineupText { k.x == "name" ? name.x : "{field.x}.{name.rec.x}" }
+
+// An alibi value's identity for duplicate detection, and its text in messages (§7.5).
+;scheme (v)alibiKey {
+    ;!doubt (k.v == "str") { ;getaway "str:" + wh[parts.v] }
+    ;!doubt (k.v == "mem") { ;getaway "mem:{field.v}.{rec.v(lineupText)}" }
+    ;!doubt (k.v == "null") { ;getaway "null" }
+    "{k.v}:{v.v}"
+}
+;scheme (v)alibiText {
+    ;!doubt (k.v == "str") { ;getaway wh[parts.v](quote.text) }
+    ;!doubt (k.v == "mem") { ;getaway "{field.v}.{rec.v(lineupText)}" }
+    ;!doubt (k.v == "null") { ;getaway "uninvited" }
+    "{v.v}"
+}
+
+// Does a scheme body contain a ;getaway with a value, outside nested schemes?
+;scheme (fickle list)getsAwayWithValue {
+    ;wh claim shifty i
+    ;lurk (i < (list($length))) {
+        ;i[list] claim s
+        ;!doubt (handler.s != uninvited && (stmts.body.handler.s(getsAwayWithValue))) { ;getaway real }
+        ;!doubt (k.s == "getaway" && e.s != uninvited) { ;getaway real }
+        ;!doubt (k.s == "lurk" && (stmts.body.s(getsAwayWithValue))) { ;getaway real }
+        ;!doubt (k.s == "expr" && k.e.s == "chain") {
+            ;wh claim shifty b
+            ;lurk (b < (branches.e.s($length))) {
+                ;!doubt (stmts.body.b[branches.e.s](getsAwayWithValue)) { ;getaway real }
+                ;++cheat b
+            }
+            ;!doubt (els.e.s != uninvited && (stmts.els.e.s(getsAwayWithValue))) { ;getaway real }
+        }
+        ;!doubt (k.s == "expr" && k.e.s == "suspect") {
+            ;wh claim shifty a
+            ;lurk (a < (alibis.e.s($length))) {
+                ;!doubt (stmts.body.a[alibis.e.s](getsAwayWithValue)) { ;getaway real }
+                ;++cheat a
+            }
+            ;!doubt (els.e.s != uninvited && (stmts.els.e.s(getsAwayWithValue))) { ;getaway real }
+        }
+        ;++cheat i
+    }
+    fake
+}
+
+// The line of pos in chars.
+;scheme (chars, pos)lineIn {
+    ;wah claim shifty line
+    ;wh claim shifty k
+    ;lurk (k < pos) {
+        ;!doubt (k[chars] == "\n") { ;++cheat line }
+        ;++cheat k
+    }
+    line
+}
+;scheme (pos)lineOf { srcChars.diag, pos(lineIn) }
+
+// What a library's top level may contain (§13.1).
+;["empty", "steal", "scheme", "claim", "lineup", "bribe"] claim libraryTop
+
+// Checks the modules, in initialization order with the entry file last;
+// returns the errors (an empty array if there are none), and fills in each
+// module's exports and notLibrary. requireExit: the entry-file rule that the
+// last statement is ;!invited (§13).
+;scheme (modules, requireExit)check {
+    ;[] claim shifty errors
+    ;wah claim shifty nextFn
+    // The index of the module being checked.
+    ;wh claim shifty curMod
+    // For the explicit-value check (§7.2): scheme declarations in order, as
+    // { mod, name, namePos, body }, and the first use of each one's value, as
+    // { mod, namePos, pos, useMod }, where useMod is the module of the use.
+    ;[] claim shifty schemes
+    ;[] claim shifty uses
+    // Lineup declarations, as { mod, name, members }.
+    ;[] claim shifty lineups
+
+    ;scheme (pos, message, hint)error { ;errors, (pos, message, hint(err.diag))($push) }
+
+    // Makes module m the current one, for positions in errors.
+    ;scheme (m)enter {
+        ;m cheat curMod
+        ;file.m[modules], chars.m[modules](setSource.diag)
+    }
+
+    // The members of the lineup that d declares, as { name, pos }.
+    ;scheme (d)lineupMembers {
+        ;wh claim shifty k
+        ;lurk (k < (lineups($length))) {
+            ;!doubt (mod.k[lineups] == mod.d && name.k[lineups] == name.d) { ;getaway members.k[lineups] }
+            ;++cheat k
+        }
+        uninvited
+    }
+
+    // The first use of the value of the scheme declared at declPos in module mod, or uninvited.
+    ;scheme (mod, declPos)firstUse {
+        ;wh claim shifty k
+        ;lurk (k < (uses($length))) {
+            ;!doubt (mod.k[uses] == mod && namePos.k[uses] == declPos) { ;getaway k[uses] }
+            ;++cheat k
+        }
+        uninvited
+    }
+
+    // A block whose value is used must end with one, unless it never completes (§7.2).
+    ;scheme (b)requireValue {
+        ;!doubt (value.b != uninvited) { ;getaway }
+        ;uninvited claim shifty last
+        ;wh claim shifty k
+        ;lurk (k < (stmts.b($length))) {
+            ;!doubt (k.k[stmts.b] != "empty") { ;k[stmts.b] cheat last }
+            ;++cheat k
+        }
+        ;!doubt (last != uninvited && ((neverCompletes, k.last(contains.text)) || k.last == "expr" && k.e.last == "sigcall")) {
+            ;getaway
+        }
+        ;close.b, "this block's value is used, but it does not produce one",
+            "end the block with its value, or with uninvited if that is intended"(error)
+    }
+
+    ;scheme (parent)newScope {
+        ;[] claim shifty names
+        { parent: parent, names: names }
+    }
+
+    // A declaration in the current module, mod. A module name's declaration
+    // (kind "module") has lib, the stolen module's index; lib is uninvited
+    // otherwise, and for a module whose steal was in error, so that its uses
+    // are not reported again.
+    // mode: "shifty", "fickle" or "", how a binding binds its values (§10.4).
+    ;scheme (kind, name, mode, namePos, visibleAt, fnId, arity)decl {
+        {
+            kind: kind, name: name, isShifty: mode == "shifty", isFickle: mode == "fickle", namePos: namePos, visibleAt: visibleAt, fnId: fnId, arity: arity,
+            mod: curMod, lib: uninvited
+        }
+    }
+
+    // The declaration of name in scope itself, or uninvited.
+    ;scheme (fickle scope, name)own {
+        ;wh claim shifty k
+        ;lurk (k < (names.scope($length))) {
+            ;!doubt (name.k[names.scope] == name) { ;getaway k[names.scope] }
+            ;++cheat k
+        }
+        uninvited
+    }
+
+    // Claims become visible at their position; schemes, parameters and whine
+    // codes are visible throughout their scope. A declaration may not reuse a
+    // name that is visible from an enclosing scope (§5.1).
+    ;scheme (fickle scope, name, d)declare {
+        ;scope, name(own) claim dup
+        ;!doubt (dup != uninvited) {
+            ;namePos.d, "'{name}' is already declared in this scope (line {namePos.dup(lineOf)})", uninvited(error)
+            ;getaway
+        }
+        ;parent.scope claim fickle s
+        ;lurk (s != uninvited) {
+            ;s, name(own) claim outer
+            ;!doubt (outer != uninvited && (kind.outer != "claim" || namePos.outer < namePos.d)) {
+                ;namePos.d, "'{name}' shadows '{name}' from an enclosing scope (line {namePos.outer(lineOf)})",
+                    "Γ-- forbids shadowing; choose another name"(error)
+                ;bail
+            }
+            ;parent.s cheat s
+        }
+        ;names.scope, d($push)
+    }
+
+    ;scheme (fickle scope, name)lookup {
+        ;scope claim fickle s
+        ;lurk (s != uninvited) {
+            ;s, name(own) claim d
+            ;!doubt (d != uninvited) { ;getaway d }
+            ;parent.s cheat s
+        }
+        uninvited
+    }
+
+    ;scheme (name, pos, scope, ctx)ref {
+        ;scope, name(lookup) claim d
+        ;!doubt (d == uninvited) {
+            ;pos, "unknown name '{name}'", uninvited(error)
+            ;getaway uninvited
+        }
+        // Inside a nested scheme an outer claim may be read before it runs; that is
+        // checked at runtime (temporal dead zone).
+        ;!doubt (kind.d == "claim" && fnId.d == id.fn.ctx && pos < visibleAt.d) {
+            ;pos, "'{name}' is used before its claim (line {namePos.d(lineOf)})", uninvited(error)
+        }
+        d
+    }
+
+    ;scheme (fickle b, scope, ctx)block {
+        ;wh claim shifty k
+        ;lurk (k < (stmts.b($length))) {
+            ;k[stmts.b] claim s
+            ;!doubt (k.s == "scheme") {
+                ;("scheme", name.s, "", namePos.s, uninvited, id.fn.ctx, (params.s($length))(decl)) claim d
+                ;scope, name.s, d(declare)
+                ;!doubt ((scope, name.s(own)) == d) {
+                    ;schemes, { mod: curMod, name: name.s, namePos: namePos.s, body: body.s }($push)
+                }
+            } anyway !doubt (k.s == "lineup") {
+                ;("lineup", name.s, "", namePos.s, uninvited, id.fn.ctx, uninvited(decl)) claim d
+                ;scope, name.s, d(declare)
+                ;!doubt ((scope, name.s(own)) == d) { ;lineups, { mod: curMod, name: name.s, members: members.s }($push) }
+            } anyway !doubt (k.s == "claim") {
+                ;scope, name.s, ("claim", name.s, (s(modeOf)), namePos.s, end.s, id.fn.ctx, uninvited(decl))(declare)
+            }
+            ;++cheat k
+        }
+        ;wh cheat k
+        ;lurk (k < (stmts.b($length))) {
+            ;k[stmts.b], scope, ctx(stmt)
+            ;++cheat k
+        }
+        ;!doubt (value.b != uninvited) { ;value.b, scope, ctx(expr) }
+    }
+
+    ;scheme (fickle s, scope, ctx)stmt {
+        ;k.s claim kind
+        ;!doubt (kind == "empty" || kind == "lineup" || kind == "steal" || kind == "bribe") { ;getaway }
+        ;!doubt (kind == "scheme") {
+            ;{ id: nextFn, top: fake } claim fn
+            ;++cheat nextFn
+            ;scope(newScope) claim ps
+            ;wh claim shifty k
+            ;lurk (k < (params.s($length))) {
+                ;k[params.s] claim p
+                ;ps, name.p, ("param", name.p, (p(modeOf)), pos.p, uninvited, id.fn, uninvited(decl))(declare)
+                ;++cheat k
+            }
+            ;body.s, (ps(newScope)), { fn: fn, loops: wh }(block)
+            ;getaway
+        }
+        ;!doubt (kind == "getaway") {
+            ;!doubt (top.fn.ctx) { ;pos.s, "'getaway' outside a scheme", uninvited(error) }
+            ;!doubt (e.s != uninvited) { ;e.s, scope, ctx(expr) }
+        } anyway !doubt (kind == "tantrum") {
+            ;e.s, scope, ctx(expr)
+        } anyway !doubt (kind == "bail" || kind == "loiter") {
+            ;!doubt (loops.ctx == wh) { ;pos.s, "'{kind}' outside a loop", uninvited(error) }
+            ;getaway
+        } anyway !doubt (kind == "lurk") {
+            ;cond.s, scope, ctx(expr)
+            ;body.s, (scope(newScope)), { fn: fn.ctx, loops: loops.ctx + wah }(block)
+            ;getaway
+        } anyway !doubt (kind == "signal") {
+            ;!doubt (top.fn.ctx) { ;pos.s, "WAH! outside a scheme: there is no caller to signal", uninvited(error) }
+            ;getaway
+        } anyway !doubt (kind == "exit") {
+            ;!doubt (e.s != uninvited) { ;e.s, scope, ctx(expr) }
+        } anyway !doubt (kind == "expr") {
+            ;!doubt (k.e.s == "sigcall") {
+                ;!doubt (top.fn.ctx) { ;pos.e.s, "WAH! outside a scheme: there is no caller to signal", uninvited(error) }
+                ;arg.e.s, scope, ctx(expr)
+            } anyway !doubt (k.e.s == "chain") {
+                ;e.s, scope, ctx, real(chain)
+            } anyway !doubt (k.e.s == "suspect") {
+                ;e.s, scope, ctx, real(checkSuspect)
+            } anyway !doubt (k.e.s == "call") {
+                // The whole statement is a call, so its value is discarded.
+                ;wh claim shifty k
+                ;lurk (k < (args.e.s($length))) {
+                    ;k[args.e.s], scope, ctx(expr)
+                    ;++cheat k
+                }
+                ;e.s, scope, fake(callee)
+            } anyway {
+                ;e.s, scope, ctx(expr)
+            }
+        } anyway !doubt (kind == "claim") {
+            ;e.s, scope, ctx(expr)
+        } anyway !doubt (kind == "cheat") {
+            ;e.s, scope, ctx(expr)
+            ;target.s, scope, ctx(lvalue)
+        }
+        ;!doubt (handler.s != uninvited) { ;s, scope, ctx(whineHandler) }
+    }
+
+    // `whine` handles the outermost call of its statement (§8.2).
+    ;scheme (s, scope, ctx)whineHandler {
+        ;handler.s claim h
+        ;!doubt (e.s == uninvited || k.e.s != "call") {
+            ;pos.h, "'whine' handles a call, but this statement's value is not a call",
+                "the call must be the outermost expression, e.g. ;s(parse) claim n whine (c) {{ ... }}"(error)
+        }
+        ;scope(newScope) claim hs
+        ;!doubt (param.h != uninvited) {
+            ;hs, param.h, ("whine", param.h, "", paramPos.h, uninvited, id.fn.ctx, uninvited(decl))(declare)
+        }
+        ;body.h, (hs(newScope)), ctx(block)
+        ;!doubt (whineValueUsed, k.s(contains.text)) { ;body.h(requireValue) }
+    }
+
+    // A multi-way branch (§7.5). The parser has checked that each value is a
+    // literal or has the shape member.Lineup or member.Lineup.module; members
+    // are resolved here.
+    ;scheme (e, scope, ctx, stmtLevel)checkSuspect {
+        ;subject.e, scope, ctx(expr)
+        // Alibi values seen so far, as { key, pos }.
+        ;[] claim shifty seen
+        // The sort of the values: "" for literals, else the lineup as written
+        // (Kind, or Kind.module); uninvited until one is known.
+        ;uninvited claim shifty sort
+        // The sort's declaration, for a lineup.
+        ;uninvited claim shifty sortLineup
+        ;wh claim shifty a
+        ;lurk (a < (alibis.e($length))) {
+            ;a[alibis.e] claim al
+            ;wh claim shifty j
+            ;lurk (j < (values.al($length))) {
+                ;j[values.al] claim v
+                ;"" claim shifty vs
+                ;!doubt (k.v == "mem") {
+                    ;v, scope(alibiLineup) claim d
+                    ;d != uninvited ? (rec.v(lineupText)) : uninvited cheat vs
+                    ;!doubt (sort == uninvited) { ;d cheat sortLineup }
+                }
+                ;!doubt (sort == uninvited) {
+                    ;vs cheat sort
+                } anyway !doubt (vs != uninvited && vs != sort) {
+                    ;sort == "" || vs == "" ? "a suspect cannot mix literals and lineup members"
+                        : "a suspect cannot mix members of '{sort}' and '{vs}'" claim message
+                    ;pos.v, message, uninvited(error)
+                }
+                ;v(alibiKey) claim key
+                ;uninvited claim shifty first
+                ;wh claim shifty q
+                ;lurk (q < (seen($length))) {
+                    ;!doubt (key.q[seen] == key) { ;pos.q[seen] cheat first }
+                    ;++cheat q
+                }
+                ;!doubt (first != uninvited) {
+                    ;pos.v, "duplicate alibi value {v(alibiText)} (line {first(lineOf)})", uninvited(error)
+                } anyway {
+                    ;seen, { key: key, pos: pos.v }($push)
+                }
+                ;++cheat j
+            }
+            ;body.al, (scope(newScope)), ctx(block)
+            ;!doubt (!stmtLevel) { ;body.al(requireValue) }
+            ;++cheat a
+        }
+        ;!doubt (els.e != uninvited) {
+            ;els.e, (scope(newScope)), ctx(block)
+            ;!doubt (!stmtLevel) { ;els.e(requireValue) }
+        } anyway !doubt (sort != uninvited && sort != "") {
+            // Without anyway, a lineup suspect must handle every member.
+            ;sortLineup(lineupMembers) claim ms
+            ;[] claim shifty missing
+            ;wh claim shifty m
+            ;lurk (m < (ms($length))) {
+                ;"mem:{name.m[ms]}.{sort}" claim key
+                ;fake claim shifty handled
+                ;wh claim shifty q
+                ;lurk (q < (seen($length))) {
+                    ;!doubt (key.q[seen] == key) { ;real cheat handled }
+                    ;++cheat q
+                }
+                ;!doubt (!handled) { ;missing, "'{name.m[ms]}.{sort}'"($push) }
+                ;++cheat m
+            }
+            ;!doubt ((missing($length)) > wh) {
+                ;pos.e, "suspect does not handle {missing, ", "($join)}",
+                    "add an alibi for each, or end the suspect with 'anyway {{ ... }}'"(error)
+            }
+        } anyway !doubt (!stmtLevel) {
+            ;pos.e, "a suspect used as a value must end with 'anyway {{ ... }}'", uninvited(error)
+        }
+    }
+
+    // The module declaration that x names, or uninvited.
+    ;scheme (fickle x, scope)moduleNamed {
+        ;!doubt (k.x != "name") { ;getaway uninvited }
+        ;scope, name.x(lookup) claim d
+        d != uninvited && kind.d == "module" ? d : uninvited
+    }
+
+    // The declaration that module lib bribes as name, or uninvited.
+    ;scheme (lib, name)exported {
+        ;exports.lib[modules] claim xs
+        ;wh claim shifty k
+        ;lurk (k < (xs($length))) {
+            ;!doubt (name.k[xs] == name) { ;getaway k[xs] }
+            ;++cheat k
+        }
+        uninvited
+    }
+
+    // The lineup that x names, written Lineup or Lineup.module, or uninvited. Reports nothing.
+    ;scheme (fickle x, scope)lineupNamed {
+        ;!doubt (k.x == "name") {
+            ;scope, name.x(lookup) claim d
+            ;getaway d != uninvited && kind.d == "lineup" ? d : uninvited
+        }
+        ;!doubt (k.x != "mem") { ;getaway uninvited }
+        ;rec.x, scope(moduleNamed) claim m
+        ;!doubt (m == uninvited || lib.m == uninvited) { ;getaway uninvited }
+        ;lib.m, field.x(exported) claim d
+        d != uninvited && kind.d == "lineup" ? d : uninvited
+    }
+
+    // The declaration that name.module refers to, or uninvited after an error
+    // (or when the module's steal was already reported).
+    ;scheme (e, m)bribed {
+        ;!doubt (lib.m == uninvited) { ;getaway uninvited }
+        ;lib.m, field.e(exported) claim d
+        ;!doubt (d == uninvited) { ;pos.e, "'{path.(lib.m)[modules]}' does not bribe '{field.e}'", uninvited(error) }
+        d
+    }
+
+    ;scheme (x, scope)unknownModule {
+        ;(scope, name.x(lookup)) != uninvited ? "'{name.x}' is not a module" : "unknown module '{name.x}'" claim message
+        ;pos.x, message, uninvited(error)
+    }
+
+    // name.module used as a value: a bribed claim (§13.1).
+    ;scheme (e, m)qualified {
+        ;e, m(bribed) claim d
+        ;"{field.e}.{name.rec.e}" claim label
+        ;!doubt (d != uninvited && kind.d == "scheme") {
+            ;pos.e, "'{label}' is a scheme; functions are not values in stage 0", "to call it, write ;args({label})"(error)
+        } anyway !doubt (d != uninvited && kind.d == "lineup") {
+            ;pos.e, "'{label}' is a lineup, not a value", "its members are written member.{label}"(error)
+        }
+    }
+
+    // The lineup that an alibi value member.Lineup or member.Lineup.module
+    // belongs to, or uninvited after an error.
+    ;scheme (v, scope)alibiLineup {
+        ;rec.v claim x
+        ;x, scope(lineupNamed) claim d
+        ;!doubt (d != uninvited) {
+            ;v, d(member)
+            ;getaway d
+        }
+        ;"alibi values are literals or lineup members (member.Lineup)" claim hint
+        ;!doubt (k.x == "name") {
+            ;(scope, name.x(lookup)) != uninvited ? "'{name.x}' is not a lineup" : "unknown lineup '{name.x}'" claim message
+            ;pos.x, message, hint(error)
+            ;getaway uninvited
+        }
+        ;rec.x, scope(moduleNamed) claim m
+        ;!doubt (m == uninvited) {
+            ;rec.x, scope(unknownModule)
+        } anyway !doubt ((x, m(bribed)) != uninvited) {
+            ;pos.x, "'{x(lineupText)}' is not a lineup", hint(error)
+        }
+        uninvited
+    }
+
+    // member.Name, where Name is a lineup (§4.1).
+    ;scheme (e, d)member {
+        ;d(lineupMembers) claim ms
+        ;[] claim shifty names
+        ;fake claim shifty found
+        ;wh claim shifty k
+        ;lurk (k < (ms($length))) {
+            ;names, name.k[ms]($push)
+            ;!doubt (name.k[ms] == field.e) { ;real cheat found }
+            ;++cheat k
+        }
+        ;!doubt (!found) {
+            ;pos.e, "no member '{field.e}' in lineup '{name.d}'", "its members are {names, ", "($join)}"(error)
+        }
+    }
+
+    ;scheme (e, scope, ctx, stmtLevel)chain {
+        ;wh claim shifty k
+        ;lurk (k < (branches.e($length))) {
+            ;k[branches.e] claim b
+            ;cond.b, scope, ctx(expr)
+            ;body.b, (scope(newScope)), ctx(block)
+            ;!doubt (!stmtLevel) { ;body.b(requireValue) }
+            ;++cheat k
+        }
+        ;!doubt (els.e != uninvited) {
+            ;els.e, (scope(newScope)), ctx(block)
+            ;!doubt (!stmtLevel) { ;els.e(requireValue) }
+        } anyway !doubt (!stmtLevel) {
+            ;pos.e, "a conditional used as a value must end with a plain 'anyway {{ ... }}'", uninvited(error)
+        }
+    }
+
+    ;scheme (fickle t, scope, ctx)lvalue {
+        ;!doubt (k.t == "name") {
+            ;name.t, pos.t, scope, ctx(ref) claim d
+            ;!doubt (d != uninvited) {
+                ;d, name.t, pos.t, "cannot cheat on '{name.t}': it is not shifty or fickle", real(mustBeShifty)
+                // The code generator binds the new value by the target's column of the copy table (§10.4).
+                ;!doubt (isFickle.d) { ;fickleTargets.curMod[modules], pos.t($push) }
+            }
+            ;getaway
+        }
+        // The container that directly holds the target must be shifty (§10.9);
+        // nested containers are checked at runtime.
+        ;k.t == "mem" claim isMem
+        ;isMem ? rec.t : arr.t claim box
+        ;isMem ? "a field" : "an element" claim what
+        ;!doubt (k.t == "idx") { ;index.t, scope, ctx(expr) }
+        ;!doubt (isMem) {
+            ;!doubt ((box, scope(lineupNamed)) != uninvited) {
+                ;pos.t, "cannot cheat on '{field.t}.{box(lineupText)}': lineup members are constants", uninvited(error)
+                ;getaway
+            }
+            // Only the module that declares a binding may cheat it (§13.1).
+            ;box, scope(moduleNamed) claim m
+            ;!doubt (m != uninvited) {
+                ;!doubt ((t, m(bribed)) != uninvited) {
+                    ;pos.t, "cannot cheat on '{field.t}.{name.box}': only '{path.(lib.m)[modules]}' may cheat it", uninvited(error)
+                }
+                ;getaway
+            }
+        }
+        ;!doubt (k.box == "name") {
+            ;name.box, pos.box, scope, ctx(ref) claim d
+            ;!doubt (d != uninvited) {
+                ;d, name.box, pos.box, "cannot modify {what} of '{name.box}': it is not shifty", fake(mustBeShifty)
+            }
+        } anyway {
+            ;box, scope, ctx(expr)
+        }
+    }
+
+    // A cheat's binding must be shifty or fickle. Through a fickle binding, the
+    // value's own mutability is checked at runtime (§10.3). rebind: the cheat
+    // rebinds the name itself, rather than changing what it holds.
+    ;scheme (d, name, pos, message, rebind)mustBeShifty {
+        ;!doubt (kind.d == "scheme" || kind.d == "lineup" || kind.d == "module") {
+            ;pos, "'{name}' is a {kind.d}, not a binding", uninvited(error)
+        } anyway !doubt (!isShifty.d && !isFickle.d) {
+            ;uninvited claim shifty hint
+            ;!doubt (kind.d == "param") {
+                ;(rebind ? "mark the parameter (fickle {name}) to rebind it, or (shifty {name}) for a mutable copy"
+                    : "mark the parameter shifty: (shifty {name})") cheat hint
+            } anyway !doubt (kind.d == "claim") {
+                ;(rebind ? "declare it with ';... claim fickle {name}' to rebind it, or ';... claim shifty {name}' for a mutable copy"
+                    : "declare it with ';... claim shifty {name}'") cheat hint
+            }
+            ;pos, message, hint(error)
+        }
+    }
+
+    ;scheme (node)unknownStd {
+        ;pos.node, "unknown standard library name '\${name.node}'",
+            "'$' is reserved for the standard library; user names have no sigil"(error)
+    }
+
+    ;scheme (fickle e, scope, ctx)expr {
+        ;k.e claim kind
+        ;!doubt (kind == "int" || kind == "float" || kind == "bool" || kind == "null" || kind == "nan" || kind == "inf") {
+            ;getaway
+        }
+        ;!doubt (kind == "str") {
+            ;wh claim shifty k
+            ;lurk (k < (parts.e($length))) {
+                ;!doubt ((k[parts.e]($typeOf)) != "purple") { ;k[parts.e], scope, ctx(expr) }
+                ;++cheat k
+            }
+            ;getaway
+        }
+        ;!doubt (kind == "name") {
+            ;name.e, pos.e, scope, ctx(ref) claim d
+            ;!doubt (d != uninvited && kind.d == "scheme") {
+                ;pos.e, "'{name.e}' is a scheme; functions are not values in stage 0", "to call it, write ;args({name.e})"(error)
+            } anyway !doubt (d != uninvited && kind.d == "lineup") {
+                ;pos.e, "'{name.e}' is a lineup, not a value", "its members are written member.{name.e}"(error)
+            } anyway !doubt (d != uninvited && kind.d == "module") {
+                ;pos.e, "'{name.e}' is a module, not a value", "what it bribes is written name.{name.e}"(error)
+            }
+            ;getaway
+        }
+        ;!doubt (kind == "std") {
+            ;name.e(stdSig) claim sig
+            ;!doubt (sig == uninvited) {
+                ;e(unknownStd)
+            } anyway !doubt (sig != "const") {
+                ;pos.e, "'\${name.e}' is a function; call it with (\${name.e})", uninvited(error)
+            }
+            ;getaway
+        }
+        ;!doubt (kind == "arr") {
+            ;wh claim shifty k
+            ;lurk (k < (items.e($length))) {
+                ;k[items.e], scope, ctx(expr)
+                ;++cheat k
+            }
+            ;getaway
+        }
+        ;!doubt (kind == "rec") {
+            ;wh claim shifty k
+            ;lurk (k < (fields.e($length))) {
+                ;e.k[fields.e], scope, ctx(expr)
+                ;++cheat k
+            }
+            ;getaway
+        }
+        ;!doubt (kind == "idx") {
+            ;index.e, scope, ctx(expr)
+            ;arr.e, scope, ctx(expr)
+            ;getaway
+        }
+        // A field label is not a binding, so only the record side is resolved
+        // (§10.8), unless that side names a lineup (§4.1) or a module (§13.1).
+        ;!doubt (kind == "mem") {
+            ;rec.e, scope(lineupNamed) claim lin
+            ;!doubt (lin != uninvited) {
+                ;e, lin(member)
+                ;getaway
+            }
+            ;rec.e, scope(moduleNamed) claim m
+            ;!doubt (m != uninvited) { ;e, m(qualified) } anyway { ;rec.e, scope, ctx(expr) }
+            ;getaway
+        }
+        ;!doubt (kind == "un") {
+            ;e.e, scope, ctx(expr)
+            ;getaway
+        }
+        ;!doubt (kind == "bin") {
+            ;l.e, scope, ctx(expr)
+            ;r.e, scope, ctx(expr)
+            ;getaway
+        }
+        ;!doubt (kind == "tern") {
+            ;c.e, scope, ctx(expr)
+            ;a.e, scope, ctx(expr)
+            ;b.e, scope, ctx(expr)
+            ;getaway
+        }
+        ;!doubt (kind == "call") {
+            ;wh claim shifty k
+            ;lurk (k < (args.e($length))) {
+                ;k[args.e], scope, ctx(expr)
+                ;++cheat k
+            }
+            ;e, scope, real(callee)
+            ;getaway
+        }
+        ;!doubt (kind == "sigcall") {
+            ;pos.e, "c(WAH!) is only valid as a whole statement: ;c(WAH!)", uninvited(error)
+            ;getaway
+        }
+        ;!doubt (kind == "suspect") {
+            ;e, scope, ctx, fake(checkSuspect)
+            ;getaway
+        }
+        ;!doubt (kind == "chain") {
+            ;e, scope, ctx, fake(chain)
+            ;getaway
+        }
+        ;tantrum "checker: unhandled node {kind}"
+    }
+
+    // used: whether the call's value is used (it is unless the call is a whole statement).
+    ;scheme (e, scope, used)callee {
+        ;callee.e claim c
+        ;args.e($length) claim n
+        ;!doubt (k.c == "std") {
+            ;name.c(stdSig) claim sig
+            ;!doubt (sig == uninvited) { ;c(unknownStd) ;getaway }
+            ;!doubt (sig == "const") { ;pos.c, "'\${name.c}' is a constant, not a function", uninvited(error) ;getaway }
+            ;!doubt (sig != n) { ;pos.c, "'\${name.c}' takes {sig(plural)}, got {n}", uninvited(error) }
+            ;getaway
+        }
+        ;uninvited claim fickle d
+        ;"" claim shifty label
+        ;!doubt (k.c == "mem") {
+            // (name.module): a scheme a stolen module bribes (§13.1)
+            ;"{field.c}.{name.rec.c}" cheat label
+            ;rec.c, scope(moduleNamed) claim m
+            ;!doubt (m == uninvited) { ;rec.c, scope(unknownModule) ;getaway }
+            ;c, m(bribed) cheat d
+            ;!doubt (d == uninvited) { ;getaway }
+        } anyway {
+            ;name.c cheat label
+            ;scope, name.c(lookup) cheat d
+            ;!doubt (d == uninvited) { ;pos.c, "unknown scheme '{name.c}'", uninvited(error) ;getaway }
+        }
+        ;!doubt (kind.d != "scheme") {
+            ;pos.c, "'{label}' is not a scheme", "calls are postfix: arguments come first, e.g. ;x(f)"(error)
+            ;getaway
+        }
+        ;!doubt (arity.d != n) { ;pos.c, "'{label}' takes {arity.d(plural)}, got {n}", uninvited(error) }
+        // A stolen scheme's uses are recorded under its library's declaration.
+        ;!doubt (used && (mod.d, namePos.d(firstUse)) == uninvited) {
+            ;uses, { mod: mod.d, namePos: namePos.d, pos: pos.c, useMod: curMod }($push)
+        }
+    }
+
+    // Each steal declares a module name, visible throughout the file like a
+    // scheme name (§13.1).
+    ;scheme (m, scope)stealNames {
+        ;steals.m[modules] claim steals
+        ;[] claim shifty seen
+        ;wh claim shifty k
+        ;lurk (k < (steals($length))) {
+            ;node.k[steals] claim node
+            ;lib.k[steals] claim lib
+            ;++cheat k
+            ;path.lib[modules] claim path
+            ;lib claim shifty usable
+            ;!doubt (seen, lib(contains.text)) {
+                ;pathPos.node, "'{path}' is already stolen", uninvited(error)
+                ;uninvited cheat usable
+            } anyway !doubt (notLibrary.lib[modules]) {
+                ;pathPos.node, "'{path}' is not a library: it ends with ;!invited", uninvited(error)
+                ;uninvited cheat usable
+            }
+            ;seen, lib($push)
+            ;{
+                kind: "module", name: name.node, isShifty: fake, isFickle: fake, namePos: namePos.node, visibleAt: uninvited,
+                fnId: uninvited, arity: uninvited, mod: curMod, lib: usable
+            } claim d
+            ;scope, name.node, d(declare)
+        }
+    }
+
+    // A library's top level and its bribe; bribe anywhere else (§13.1).
+    ;scheme (m, scope, isEntry, last)libraryRules {
+        ;program.m[modules] claim program
+        ;wh claim shifty k
+        ;lurk (k < (stmts.program($length))) {
+            ;k[stmts.program] claim s
+            ;++cheat k
+            // last is a copy (claim shifty copies a record), so statements are compared by position.
+            ;!doubt (k.s == "bribe" && (isEntry || pos.s != pos.last)) {
+                ;pos.s, "'bribe' must be the last statement of a library", uninvited(error)
+            } anyway !doubt (!isEntry && !(libraryTop, k.s(contains.text))) {
+                ;pos.s, "a library's top level may contain only steal, scheme, claim and lineup statements",
+                    "move other statements into a scheme"(error)
+            }
+        }
+        ;!doubt (isEntry) { ;getaway }
+        ;!doubt (last == uninvited || k.last != "bribe") {
+            ;end.program, "a library must end with the names it exports", ";a, b bribe"(error)
+            ;getaway
+        }
+        ;[] claim shifty exports
+        ;wh cheat k
+        ;lurk (k < (names.last($length))) {
+            ;k[names.last] claim n
+            ;++cheat k
+            ;scope, name.n(own) claim d
+            ;!doubt (d == uninvited) {
+                ;pos.n, "cannot bribe '{name.n}': it is not declared at the top level", uninvited(error)
+            } anyway !doubt (kind.d == "module") {
+                ;pos.n, "cannot bribe '{name.n}': it is a module", uninvited(error)
+            } anyway {
+                ;exports, d($push)
+            }
+        }
+        ;exports cheat exports.m[modules]
+    }
+
+    ;scheme (m, isEntry)checkModule {
+        ;m(enter)
+        ;program.m[modules] claim program
+        ;uninvited claim shifty last
+        ;wh claim shifty k
+        ;lurk (k < (stmts.program($length))) {
+            ;!doubt (k.k[stmts.program] != "empty") { ;k[stmts.program] cheat last }
+            ;++cheat k
+        }
+        // A stolen file that is not a library is reported where it is stolen.
+        ;!doubt (!isEntry && last != uninvited && k.last == "exit") {
+            ;real cheat notLibrary.m[modules]
+            ;getaway
+        }
+        ;uninvited(newScope) claim scope
+        ;m, scope(stealNames)
+        ;{ stmts: stmts.program, value: uninvited }, scope, { fn: topFn, loops: wh }(block)
+        ;m, scope, isEntry, last(libraryRules)
+    }
+
+    ;{ id: wh, top: real } claim topFn
+    ;(modules($length)) - wah claim entry
+    ;wh claim shifty mi
+    ;lurk (mi < (modules($length))) {
+        ;mi, mi == entry(checkModule)
+        ;++cheat mi
+    }
+    // A scheme whose value is used must be able to produce one (§7.2).
+    ;wh claim shifty si
+    ;lurk (si < (schemes($length))) {
+        ;si[schemes] claim sc
+        ;mod.sc, namePos.sc(firstUse) claim use
+        ;!doubt (use != uninvited && value.body.sc == uninvited && !(stmts.body.sc(getsAwayWithValue))) {
+            ;mod.sc(enter)
+            ;useMod.use claim um
+            ;um == mod.sc ? "line {pos.use(lineOf)}" : "{file.um[modules]} line {chars.um[modules], pos.use(lineIn)}" claim where
+            ;namePos.sc, "'{name.sc}' never produces a value, but its value is used ({where})",
+                "end the scheme with its value, or with uninvited if that is intended"(error)
+        }
+        ;++cheat si
+    }
+    ;entry(enter)
+    ;program.entry[modules] claim program
+    ;!doubt (requireExit) {
+        ;uninvited claim shifty last
+        ;wh claim shifty k
+        ;lurk (k < (stmts.program($length))) {
+            ;!doubt (k.k[stmts.program] != "empty") { ;k[stmts.program] cheat last }
+            ;++cheat k
+        }
+        ;!doubt (last == uninvited || k.last != "exit") {
+            ;end.program, "program ended, but Waluigi was never told he wasn't invited", "end the entry file with ;!invited"(error)
+        }
+    }
+    errors
+}
+
+;check bribe

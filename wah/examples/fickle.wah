@@ -1,0 +1,55 @@
+// fickle bindings (spec §5, §10.4): rebound with cheat, but each value is kept
+// as it is, frozen or shifty, and never copied.
+//
+// Builds a list out of frozen records, walks it with a fickle parameter, and
+// compares fickle with shifty.
+//
+// Usage: wahc0 run examples/fickle.wah
+
+// ---- Building ----
+// Each step rebinds the head of the list to a new frozen record. A shifty
+// binding would copy every record to make it mutable; a fickle one does not.
+;uninvited claim fickle list
+;wah claim shifty i
+;lurk (i <= waaaah) {
+    ;{ value: i, next: list } cheat list
+    ;++cheat i
+}
+
+// ---- Walking ----
+// A fickle parameter takes the argument as it is and can be rebound, so the
+// scheme steps through the list without copying any of it.
+;scheme (fickle node)total {
+    ;wh claim shifty sum
+    ;lurk (node != uninvited) {
+        ;value.node +cheat sum
+        ;next.node cheat node
+    }
+    sum
+}
+;"total: {list(total)}"($print)
+
+;scheme (fickle node)describe {
+    ;[] claim shifty values
+    ;lurk (node != uninvited) {
+        ;values, value.node($push)
+        ;next.node cheat node
+    }
+    values, " -> "($join)
+}
+;list(describe)($print)
+
+// ---- fickle vs shifty ----
+// A fickle binding keeps the value's identity; a shifty binding copies a
+// frozen value to make it mutable.
+;[wah, waah] claim frozen
+;frozen claim fickle same
+;frozen claim shifty copy
+;"fickle keeps it: {same == frozen}, shifty copies it: {copy == frozen}"($print)
+
+// A frozen value stays frozen through a fickle binding: its contents cannot
+// change. A shifty value is shared, so changes show through both names.
+;copy claim fickle alias
+;waaah cheat wh[alias]
+;"through the alias: {wh[copy]}"($print)
+;!invited

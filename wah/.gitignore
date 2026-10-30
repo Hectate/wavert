@@ -1,0 +1,4 @@
+# Native builds of wahc (zig cc -O2 -o wahc/wahc.exe wahc/wahc.c)
+/wahc/wahc
+/wahc/wahc.exe
+/wahc/wahc.pdb

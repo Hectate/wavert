@@ -1,0 +1,18 @@
+;wa[0]h claim fickle i
+;lurk (i < wa[11]h) {
+    ;i >= waah claim fickle prime
+    ;waah claim fickle d
+    ;lurk (prime && d * d <= i) {
+        ;!doubt (i % d == wa[0]h) { ;fake cheat prime }
+        ;d + wah cheat d
+    }
+    ;!doubt (prime) {
+        ;"PRIME ("($write)
+        ;i($write)
+        ;")"($print)
+    } anyway {
+        ;i($print)
+    }
+    ;i + wah cheat i
+}
+;!invited

@@ -1,0 +1,85 @@
+// wahc: The --tokens and --ast dumps.
+// One token per line: type, start, end, sp, then the name or the numeral's text and value.
+// A string's parts follow on their own lines: | "text", or { pos, the tokens, }.
+
+;"text.wah" steal text
+
+;scheme (toks, indent)dumpTokens {
+    ;wh claim shifty k
+    ;lurk (k < (toks($length))) {
+        ;k[toks] claim tk
+        ;"{indent}{t.tk} {pos.tk} {end.tk} {sp.tk}" claim shifty line
+        ;!doubt (t.tk == "id" || t.tk == "std" || t.tk == "opcheat") {
+            ;line + " {v.tk}" cheat line
+        } anyway !doubt (t.tk == "int" || t.tk == "float" || t.tk == "sig") {
+            ;line + " {text.tk} {v.tk}" cheat line
+        }
+        ;line($print)
+        ;!doubt (t.tk == "str") {
+            ;wh claim shifty p
+            ;lurk (p < (parts.tk($length))) {
+                ;p[parts.tk] claim part
+                ;!doubt ((part($typeOf)) == "purple") {
+                    ;"{indent}  | {part(quote.text)}"($print)
+                } anyway {
+                    ;"{indent}  {{ {pos.part}"($print)
+                    ;tokens.part, indent + "    "(dumpTokens)
+                    ;"{indent}  }}"($print)
+                }
+                ;++cheat p
+            }
+        }
+        ;++cheat k
+    }
+}
+
+// ---- AST dump (wahc --ast) ----
+// Any value as indented text. Record fields are sorted, so the output does not
+// depend on field order.
+
+;scheme (xs)sorted {
+    ;[] claim shifty out
+    ;wh claim shifty k
+    ;lurk (k < (xs($length))) {
+        ;out, k[xs]($push)
+        ;(out($length)) - wah claim shifty j
+        ;lurk (j > wh && (j - wah)[out] > j[out]) {
+            ;j[out] claim swap
+            ;(j - wah)[out] cheat j[out]
+            ;swap cheat (j - wah)[out]
+            ;--cheat j
+        }
+        ;++cheat k
+    }
+    out
+}
+
+;scheme (x, indent)dumpValue {
+    ;x($typeOf) claim type
+    ;!doubt (type == "purple") { ;getaway x(quote.text) }
+    ;indent + "  " claim inner
+    ;!doubt (type == "array") {
+        ;!doubt ((x($length)) == wh) { ;getaway "[]" }
+        ;"[" claim shifty out
+        ;wh claim shifty k
+        ;lurk (k < (x($length))) {
+            ;out + "\n" + inner + (k[x], inner(dumpValue)) cheat out
+            ;++cheat k
+        }
+        ;getaway out + "\n" + indent + "]"
+    }
+    ;!doubt (type == "record") {
+        ;x($fields)(sorted) claim keys
+        ;"{{" claim shifty out
+        ;wh claim shifty k
+        ;lurk (k < (keys($length))) {
+            ;k[keys] claim key
+            ;out + "\n{inner}{key}: " + (key[x], inner(dumpValue)) cheat out
+            ;++cheat k
+        }
+        ;getaway out + "\n{indent}}}"
+    }
+    x($toPurple)
+}
+
+;dumpTokens, dumpValue bribe

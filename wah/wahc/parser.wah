@@ -1,0 +1,781 @@
+// wahc: The parser (js/src/parser.js, spec §5-§8, §11.4).
+//
+// Statements begin with ';'. Expressions use precedence climbing; the comma
+// list and the postfix call `(f)` sit below the ternary, and a call consumes
+// every comma-separated expression to its left at the current nesting level.
+//
+// Expression nodes (k): int float str bool null nan inf name std arr rec idx mem
+//   un bin tern call sigcall chain suspect. Each has pos and paren (real when parenthesized).
+// Statement nodes (k): empty scheme lineup steal bribe getaway tantrum bail loiter
+//   lurk signal exit expr claim cheat. Each has pos, end and handler: uninvited, or the statement's
+//   whine as { pos, param, paramPos, body }.
+// The shapes match parser.js, except that keywords cannot be field names (§10.7):
+// parser.js's `shifty` and `fickle` are `isShifty` and `isFickle` here, and its `whine` is `handler`.
+
+;"text.wah" steal text
+;"diag.wah" steal diag
+;"lexer.wah" steal lexer
+
+;["int", "float", "str", "real", "fake", "uninvited", "nobody", "everybody", "id", "std",
+  "(", "[", "{{", "doubt", "!doubt", "suspect", "-", "!", "~", ","] claim exprStart
+;["expr", "claim", "cheat", "getaway", "tantrum", "exit"] claim whineOk
+;["id", "std", "sig"] claim callees
+;"calls are postfix (arguments first, then one function name): ;x, y(f)" claim postfixHint
+
+// Binding power of a binary operator, or wh if t is not one.
+;scheme (t)precedence {
+    ;!doubt (t == "||") { ;getaway wah }
+    ;!doubt (t == "&&") { ;getaway waah }
+    ;!doubt (t == "==" || t == "!=") { ;getaway waaah }
+    ;!doubt (t == "<" || t == ">" || t == "<=" || t == ">=") { ;getaway waaaah }
+    ;!doubt (t == "|") { ;getaway waaaaah }
+    ;!doubt (t == "^") { ;getaway waaaaaah }
+    ;!doubt (t == "&") { ;getaway waaaaaaah }
+    ;!doubt (t == "<<" || t == ">>") { ;getaway waaaaaaaah }
+    ;!doubt (t == "+" || t == "-") { ;getaway waaaaaaaaah }
+    ;!doubt (t == "*" || t == "/" || t == "%") { ;getaway waaaaaaaaaah }
+    wh
+}
+
+;scheme (s)isIdent {
+    ;s, ""($split) claim cs
+    ;!doubt ((cs($length)) == wh || !(wh[cs](isIdStart.text))) { ;getaway fake }
+    ;wah claim shifty k
+    ;lurk (k < (cs($length))) {
+        ;!doubt (!(k[cs](isIdChar.text))) { ;getaway fake }
+        ;++cheat k
+    }
+    real
+}
+
+;scheme (tk)describe {
+    ;!doubt (t.tk == "eof") { ;getaway "end of input" }
+    ;!doubt (t.tk == "id") { ;getaway "'{v.tk}'" }
+    ;!doubt (t.tk == "std") { ;getaway "'\${v.tk}'" }
+    ;!doubt (t.tk == "int" || t.tk == "float" || t.tk == "sig") { ;getaway "'{text.tk}'" }
+    ;!doubt (t.tk == "str") { ;getaway "a string" }
+    ;!doubt (t.tk == "opcheat") { ;getaway "'{v.tk}cheat'" }
+    "'{t.tk}'"
+}
+
+;scheme (tk, message, hint)failAtHint { ;pos.tk, message, hint(failHint.diag) }
+;scheme (tk, message)failAt { ;pos.tk, message, uninvited(failHint.diag) }
+
+;scheme (k, e)simpleStatement { { k: k, e: e, pos: uninvited, end: uninvited, handler: uninvited } }
+
+;scheme (fickle toks)parse { toks, fake(parser) }
+
+// Does evaluating e call anything? An expression statement that does not has no effect (§2.8).
+// Conditional chains count as having an effect.
+;scheme (e)hasEffect {
+    ;k.e claim kind
+    ;!doubt (kind == "call" || kind == "sigcall" || kind == "chain" || kind == "suspect") { ;getaway real }
+    ;!doubt (kind == "str") {
+        ;wh claim shifty i
+        ;lurk (i < (parts.e($length))) {
+            ;!doubt ((i[parts.e]($typeOf)) != "purple" && (i[parts.e](hasEffect))) { ;getaway real }
+            ;++cheat i
+        }
+        ;getaway fake
+    }
+    ;!doubt (kind == "arr") {
+        ;wh claim shifty i
+        ;lurk (i < (items.e($length))) {
+            ;!doubt (i[items.e](hasEffect)) { ;getaway real }
+            ;++cheat i
+        }
+        ;getaway fake
+    }
+    ;!doubt (kind == "rec") {
+        ;wh claim shifty i
+        ;lurk (i < (fields.e($length))) {
+            ;!doubt (e.i[fields.e](hasEffect)) { ;getaway real }
+            ;++cheat i
+        }
+        ;getaway fake
+    }
+    ;!doubt (kind == "idx") { ;getaway (index.e(hasEffect)) || (arr.e(hasEffect)) }
+    ;!doubt (kind == "mem") { ;getaway rec.e(hasEffect) }
+    ;!doubt (kind == "un") { ;getaway e.e(hasEffect) }
+    ;!doubt (kind == "bin") { ;getaway (l.e(hasEffect)) || (r.e(hasEffect)) }
+    ;!doubt (kind == "tern") { ;getaway (c.e(hasEffect)) || (a.e(hasEffect)) || (b.e(hasEffect)) }
+    fake
+}
+
+// Parses toks as a program, or as the expression of a string interpolation when inner is real.
+;scheme (fickle toks, inner)parser {
+    ;wh claim shifty p
+    // Blocks entered; hints about block values apply only inside one.
+    ;wh claim shifty depth
+
+    ;scheme ()peek { p[toks] }
+    ;scheme (type)at { t.p[toks] == type }
+    // A call is exactly `(name)` after an expression. Any other '(' ends the
+    // expression, so a block value like `(a + b) / c` may follow a statement.
+    ;scheme ()atCall {
+        ;!doubt (p + waah >= (toks($length)) || t.p[toks] != "(") { ;getaway fake }
+        ;!doubt (t.(p + waah)[toks] == ")" && (callees, t.(p + wah)[toks](contains.text))) { ;getaway real }
+        // (name.module): a scheme a stolen module bribes (§13.1)
+        p + waaaah < (toks($length)) && t.(p + wah)[toks] == "id" && t.(p + waah)[toks] == "."
+            && t.(p + waaah)[toks] == "id" && t.(p + waaaah)[toks] == ")"
+    }
+    ;scheme ()next {
+        ;p[toks] claim tk
+        ;!doubt (t.tk != "eof") { ;++cheat p }
+        tk
+    }
+    ;scheme (type)accept { (type(at)) ? (,(next)) : uninvited }
+    // msg uninvited means "expected '<type>'".
+    ;scheme (type, msg, hint)expect {
+        ;!doubt (type(at)) { ;getaway ,(next) }
+        ;,(peek) claim found
+        ;msg == uninvited ? "expected '{type}'" : msg claim m
+        ;found, "{m}, found {found(describe)}", hint(failAtHint)
+    }
+    ;scheme (op)lintSpace {
+        ;!doubt (!sp.op || !sp.(,(peek))) {
+            ;warnings.diag, (pos.op, "missing whitespace around '{t.op}'", uninvited(warn.diag))($push)
+        }
+    }
+
+    // ---- statements ----
+
+    ;scheme ()program {
+        ;[] claim shifty stmts
+        // Has a statement other than steal or empty been seen?
+        ;fake claim shifty started
+        ;lurk (!("eof"(at))) {
+            ;!doubt (!(";"(at))) {
+                ;,(peek) claim tk
+                ;("("(at)) ? postfixHint : "every Γ-- statement begins with ;" claim hint
+                ;tk, "expected ';' to start a statement, found {tk(describe)}", hint(failAtHint)
+            }
+            ;,(statement) claim s
+            ;!doubt (k.s == "steal" && started) { ;pos.s, "'steal' must come before every other statement"(fail.diag) }
+            ;!doubt (k.s != "steal" && k.s != "empty") { ;real cheat started }
+            ;stmts, s($push)
+        }
+        { stmts: stmts, end: pos.(,(peek)) }
+    }
+
+    ;scheme ()statement {
+        ;,(next) claim semi
+        ;,(peek) claim tk
+        ;!doubt (t.tk == ";" || t.tk == "}}" || t.tk == "eof") {
+            ;getaway { k: "empty", pos: pos.semi, end: pos.tk, handler: uninvited }
+        }
+        ;tk(statementBody) claim shifty s
+        ;pos.tk cheat pos.s
+        ;!doubt ("whine"(at)) {
+            ;,(next) claim w
+            ;!doubt (!(whineOk, k.s(contains.text))) {
+                ;w, "'whine' must follow a statement whose value comes from a call"(failAt)
+            }
+            ;uninvited claim shifty param
+            ;!doubt (("("(accept)) != uninvited) {
+                ;"id", "expected a name for the signal code", uninvited(expect) cheat param
+                ;")", uninvited, uninvited(expect)
+            }
+            ;param == uninvited claim noParam
+            ;{
+                pos: pos.w,
+                param: noParam ? uninvited : v.param,
+                paramPos: noParam ? uninvited : pos.param,
+                body: ,(block)
+            } cheat handler.s
+        }
+        ;pos.(,(peek)) cheat end.s
+        s
+    }
+
+    // The statement starting at tk, without its pos, end and handler.
+    ;scheme (tk)statementBody {
+        ;t.tk claim kind
+        ;!doubt (kind == "scheme") { ;getaway ,(schemeStatement) }
+        ;!doubt (kind == "lineup") { ;getaway ,(lineupStatement) }
+        ;!doubt (kind == "getaway") {
+            ;,(next)
+            ;(exprStart, t.(,(peek))(contains.text)) ? (,(expr)) : uninvited claim e
+            ;getaway "getaway", e(simpleStatement)
+        }
+        ;!doubt (kind == "tantrum") {
+            ;,(next)
+            ;getaway "tantrum", (,(expr))(simpleStatement)
+        }
+        ;!doubt (kind == "bail" || kind == "loiter") {
+            ;,(next)
+            ;getaway { k: kind, pos: uninvited, end: uninvited, handler: uninvited }
+        }
+        ;!doubt (kind == "lurk" || kind == "!lurk") {
+            ;,(next)
+            ;getaway {
+                k: "lurk", neg: kind == "!lurk", cond: kind(cond), body: ,(block),
+                pos: uninvited, end: uninvited, handler: uninvited
+            }
+        }
+        ;!doubt (kind == "sig") {
+            ;,(next)
+            ;getaway { k: "signal", code: v.tk, pos: uninvited, end: uninvited, handler: uninvited }
+        }
+        ;!doubt (kind == "!invited") {
+            ;,(next)
+            ;getaway "exit", uninvited(simpleStatement)
+        }
+        ;!doubt (kind == "opcheat") {
+            ;!doubt (v.tk == "++" || v.tk == "--") {
+                ;,(next)
+                ;getaway {
+                    k: "cheat", op: (v.tk, wh($at)), e: { k: "int", v: wah, pos: pos.tk, paren: fake },
+                    target: ,(lvalue), pos: uninvited, end: uninvited, handler: uninvited
+                }
+            }
+            ;tk, "'{v.tk}cheat' needs a value before it", ";value {v.tk}cheat name"(failAtHint)
+        }
+        ;!doubt (kind == "whine") { ;tk, "'whine' must follow a statement whose value comes from a call"(failAt) }
+        ;!doubt (kind == "anyway") { ;tk, "'anyway' without a preceding doubt or !doubt"(failAt) }
+        ;!doubt (kind == "bribe") { ;tk, "'bribe' needs the names it exports before it", ";a, b bribe"(failAtHint) }
+        ;!doubt (,(atBribe)) { ;getaway ,(bribeStatement) }
+        ;,(exprStatement) claim s
+        ;!doubt (k.s == "expr" && !(e.s(hasEffect))) {
+            ;depth > wh ? "to make it the block's value, remove the ';' before it" : uninvited claim hint
+            ;warnings.diag, (pos.tk, "this statement has no effect", hint(warn.diag))($push)
+        }
+        s
+    }
+
+    ;scheme ()exprStatement {
+        ;,(expr) claim e
+        ;,(peek) claim tk
+        ;!doubt (t.tk == "claim") {
+            ;,(next)
+            // At most one modifier: shifty or fickle (§5).
+            ;("shifty"(accept)) != uninvited claim isShifty
+            ;!isShifty && (("fickle"(accept)) != uninvited) claim isFickle
+            ;"id", "expected a name after 'claim'", uninvited(expect) claim name
+            ;getaway {
+                k: "claim", e: e, isShifty: isShifty, isFickle: isFickle, name: v.name, namePos: pos.name,
+                pos: uninvited, end: uninvited, handler: uninvited
+            }
+        }
+        ;!doubt (t.tk == "cheat") {
+            ;,(next)
+            ;getaway { k: "cheat", e: e, op: uninvited, target: ,(lvalue), pos: uninvited, end: uninvited, handler: uninvited }
+        }
+        ;!doubt (t.tk == "opcheat") {
+            ;!doubt (v.tk == "++" || v.tk == "--") {
+                ;tk, "'{v.tk}cheat' takes no value", "write ;{v.tk}cheat name"(failAtHint)
+            }
+            ;,(next)
+            ;getaway { k: "cheat", e: e, op: v.tk, target: ,(lvalue), pos: uninvited, end: uninvited, handler: uninvited }
+        }
+        ;!doubt (t.tk == "!invited") {
+            ;,(next)
+            ;getaway "exit", e(simpleStatement)
+        }
+        ;!doubt (t.tk == "shifty" || t.tk == "fickle") { ;tk, "'{t.tk}' goes after 'claim'", ";value claim {t.tk} name"(failAtHint) }
+        ;!doubt (t.tk == "steal") {
+            ;,(next)
+            ;getaway tk, e(stealStatement)
+        }
+        ;!doubt (t.tk == "bribe") { ;tk, "only names can be bribed", ";a, b bribe"(failAtHint) }
+        "expr", e(simpleStatement)
+    }
+
+    // ;"path" steal name (§13.1). The path is a plain string literal; name is the module's name here.
+    ;scheme (kw, e)stealStatement {
+        ;!doubt (depth > wh) { ;kw, "'steal' is only allowed at the top level of a file"(failAt) }
+        ;!doubt (k.e != "str" || paren.e || (parts.e($length)) > wah
+            || (parts.e($length)) == wah && (wh[parts.e]($typeOf)) != "purple") {
+            ;e, "a steal path must be a plain string literal", ";\"lib.wah\" steal"(failAtHint)
+        }
+        ;(parts.e($length)) == wh ? "" : wh[parts.e] claim path
+        ;!doubt ((path, ""($split)), "\\"(contains.text)) { ;e, "steal paths use '/' as the separator"(failAt) }
+        ;!doubt (!((path($length)) >= waaaah && (path, WAAAAH, (path($length))($slice)) == ".wah")) {
+            ;e, "a steal path includes the .wah extension"(failAt)
+        }
+        ;"id", "expected a name for the module after 'steal'", ";\"lib.wah\" steal lib"(expect) claim name
+        { k: "steal", path: path, pathPos: pos.e, name: v.name, namePos: pos.name, pos: uninvited, end: uninvited, handler: uninvited }
+    }
+
+    // Is this statement `name, name, ... bribe`?
+    ;scheme ()atBribe {
+        ;p claim shifty i
+        ;lurk (real) {
+            ;!doubt (t.i[toks] != "id") { ;getaway fake }
+            ;!doubt (t.(i + wah)[toks] == "bribe") { ;getaway real }
+            ;!doubt (t.(i + wah)[toks] != ",") { ;getaway fake }
+            ;waah +cheat i
+        }
+        fake
+    }
+
+    // ;name, name, ... bribe (§13.1), when atBribe holds.
+    ;scheme ()bribeStatement {
+        ;[] claim shifty names
+        ;lurk (real) {
+            ;,(next) claim n
+            ;wh claim shifty k
+            ;lurk (k < (names($length))) {
+                ;!doubt (name.k[names] == v.n) { ;n, "'{v.n}' is already bribed"(failAt) }
+                ;++cheat k
+            }
+            ;names, { name: v.n, pos: pos.n }($push)
+            ;!doubt ((","(accept)) == uninvited) { ;bail }
+        }
+        ;,(next) claim kw
+        ;!doubt (depth > wh) { ;kw, "'bribe' is only allowed at the top level of a library"(failAt) }
+        { k: "bribe", names: names, pos: uninvited, end: uninvited, handler: uninvited }
+    }
+
+    ;scheme ()schemeStatement {
+        ;,(next)
+        ;!doubt ("id"(at)) {
+            ;,(peek), "parameters come before the scheme name", ";scheme (a, b)name {{ ... }}"(failAtHint)
+        }
+        ;"(", "expected '(' to open the parameter list", uninvited(expect)
+        ;[] claim shifty params
+        ;!doubt (!(")"(at))) {
+            ;lurk (real) {
+                ;("shifty"(accept)) != uninvited claim isShifty
+                ;!isShifty && (("fickle"(accept)) != uninvited) claim isFickle
+                ;"id", "expected a parameter name", uninvited(expect) claim name
+                ;params, { name: v.name, isShifty: isShifty, isFickle: isFickle, pos: pos.name }($push)
+                ;!doubt ((","(accept)) == uninvited) { ;bail }
+            }
+        }
+        ;")", "expected ')' to close the parameter list", uninvited(expect)
+        ;"id", "expected the scheme name after its parameters", ";scheme (a, b)name {{ ... }}"(expect) claim name
+        {
+            k: "scheme", name: v.name, namePos: pos.name, params: params, body: ,(block),
+            pos: uninvited, end: uninvited, handler: uninvited
+        }
+    }
+
+    // ;lineup (member, ...)Name (§4.1), only at the top level.
+    ;scheme ()lineupStatement {
+        ;,(next) claim kw
+        ;!doubt (depth > wh) { ;kw, "a lineup can only be declared at the top level"(failAt) }
+        ;!doubt ("id"(at)) {
+            ;,(peek), "members come before the lineup name", ";lineup (a, b)Name"(failAtHint)
+        }
+        ;"(", "expected '(' to open the member list", uninvited(expect)
+        ;!doubt (")"(at)) {
+            ;,(peek), "a lineup needs at least one member", ";lineup (a, b)Name"(failAtHint)
+        }
+        ;[] claim shifty members
+        ;lurk (real) {
+            ;,(peek) claim m
+            ;!doubt (t.m != "id") {
+                ;(keywords.lexer, t.m(contains.text)) ? "'{t.m}' is a keyword and cannot be a member name"
+                    : "expected a member name, found {m(describe)}" claim message
+                ;m, message(failAt)
+            }
+            ;,(next)
+            ;wh claim shifty k
+            ;lurk (k < (members($length))) {
+                ;!doubt (name.k[members] == v.m) { ;m, "duplicate member '{v.m}' in lineup"(failAt) }
+                ;++cheat k
+            }
+            ;members, { name: v.m, pos: pos.m }($push)
+            ;!doubt ((","(accept)) == uninvited) { ;bail }
+        }
+        ;")", "expected ',' or ')' in the member list", uninvited(expect)
+        ;"id", "expected the lineup name after its members", ";lineup (a, b)Name"(expect) claim name
+        {
+            k: "lineup", name: v.name, namePos: pos.name, members: members,
+            pos: uninvited, end: uninvited, handler: uninvited
+        }
+    }
+
+    ;scheme (kw)cond {
+        ;"(", "expected '(' after '{kw}'", "conditions are parenthesized: {kw} (x) {{ ... }}"(expect)
+        ;,(expr) claim e
+        ;")", "expected ')' to close the condition", uninvited(expect)
+        e
+    }
+
+    ;scheme ()block {
+        ;"{{", "expected '{{'", uninvited(expect)
+        ;++cheat depth
+        ;[] claim shifty stmts
+        ;lurk ((";"(at))) { ;stmts, (,(statement))($push) }
+        ;!doubt ("}}"(at)) {
+            ;,(next) claim close
+            ;--cheat depth
+            ;getaway { stmts: stmts, value: uninvited, close: pos.close }
+        }
+        ;!doubt ("eof"(at)) { ;,(peek), "unterminated block: expected '}}'"(failAt) }
+        ;,(expr) claim value
+        ;!doubt (!("}}"(at))) {
+            ;("("(at)) ? postfixHint
+                : (":"(at)) ? "a record as a block's value needs its own braces: {{ {{ key: value }} }}"
+                : "an expression without a leading ';' is the block's value and must come last" claim hint
+            ;,(peek) claim found
+            ;found, "expected '}}' after the block's value, found {found(describe)}", hint(failAtHint)
+        }
+        ;,(next) claim close
+        ;--cheat depth
+        { stmts: stmts, value: value, close: pos.close }
+    }
+
+    ;scheme ()lvalue {
+        ;,(peek) claim tk
+        ;,(postfix) claim e
+        ;!doubt (k.e != "name" && k.e != "idx" && k.e != "mem") {
+            ;tk, "expected a name, an indexed element or a field to cheat on"(failAt)
+        }
+        e
+    }
+
+    // ---- expressions ----
+
+    ;scheme ()expr { fake(seq) }
+
+    // A comma-separated sequence at one nesting level. Each `(f)` consumes every
+    // pending expression to its left. In list mode (array literals) the leftovers
+    // are the items; otherwise exactly one must remain.
+    ;scheme (list)seq {
+        ;[] claim shifty pending
+        ;uninvited claim fickle firstComma
+        ;(","(at)) ? (,(zeroCall)) : (,(ternary)) claim fickle cur
+        ;lurk (real) {
+            ;!doubt (,(atCall)) {
+                ;pending, cur($push)
+                ;pending(call)(continueOps) cheat cur
+                ;[] cheat pending
+                ;uninvited cheat firstComma
+                ;loiter
+            }
+            ;!doubt (","(at)) {
+                ;,(next) claim comma
+                ;!doubt (firstComma == uninvited) { ;comma cheat firstComma }
+                ;pending, cur($push)
+                ;!doubt (","(at)) {
+                    ;,(peek), "a zero-argument call inside an argument list must be parenthesized",
+                        "write (,(f)) so the call does not capture its neighbours"(failAtHint)
+                }
+                ;!doubt (list && ("]"(at))) { ;comma, "trailing comma in array literal"(failAt) }
+                ;,(ternary) cheat cur
+                ;loiter
+            }
+            ;bail
+        }
+        ;pending, cur($push)
+        ;!doubt (list) { ;getaway pending }
+        ;!doubt ((pending($length)) > wah) {
+            ;!doubt ("bribe"(at)) { ;,(peek), "only names can be bribed", ";a, b bribe"(failAtHint) }
+            // A block's value on a new line that starts with ',' continues the statement before it (§7.2).
+            ;nl.firstComma && depth > wh
+                ? "a block's value that starts with ',' continues the statement before it; wrap the value in parentheses: (,(f))"
+                : ";a, b(f) calls f with a and b" claim hint
+            ;firstComma, "comma-separated values must be consumed by a call", hint(failAtHint)
+        }
+        cur
+    }
+
+    ;scheme ()zeroCall {
+        ;,(next) claim comma
+        ;!doubt (!(,(atCall))) {
+            ;comma, "a leading ',' must be followed by a call", "zero-argument calls are written ,(f)"(failAtHint)
+        }
+        ([])(call)(continueOps)
+    }
+
+    // Called only when atCall() holds: '(' name ')'.
+    ;scheme (fickle args)call {
+        ;,(next)
+        ;,(next) claim c
+        ;!doubt (("."(accept)) != uninvited) {
+            ;,(next) claim m
+            ;,(next)
+            ;{ k: "name", name: v.m, pos: pos.m, paren: fake } claim rec
+            ;getaway {
+                k: "call", callee: { k: "mem", field: v.c, rec: rec, pos: pos.c, paren: fake },
+                args: args, pos: pos.c, paren: fake
+            }
+        }
+        ;,(next)
+        ;!doubt (t.c != "sig") {
+            ;getaway {
+                k: "call", callee: { k: t.c == "id" ? "name" : "std", name: v.c, pos: pos.c, paren: fake },
+                args: args, pos: pos.c, paren: fake
+            }
+        }
+        ;!doubt (text.c != "WAH!") {
+            ;c, "only the exact spelling WAH! is allowed in call position, not {text.c}",
+                ";c(WAH!) sends code c; any other spelling would make the code ambiguous"(failAtHint)
+        }
+        ;!doubt ((args($length)) != wah) { ;c, "WAH! in call position takes exactly one argument: the code"(failAt) }
+        { k: "sigcall", arg: wh[args], pos: pos.c, paren: fake }
+    }
+
+    // After a call, operators may continue with the call's result as left operand.
+    ;scheme (left)continueOps {
+        ;t.(,(peek)) claim op
+        ;!doubt (op == "**" || op == "?" || (op(precedence)) > wh) {
+            ;getaway (left(powerTail)), wah(binaryFrom)(ternaryTail)
+        }
+        left
+    }
+
+    ;scheme ()ternary { wah(binary)(ternaryTail) }
+
+    ;scheme (fickle c)ternaryTail {
+        ;!doubt (!("?"(at))) { ;getaway c }
+        ;,(next) claim q
+        ;q(lintSpace)
+        ;,(ternary) claim a
+        ;":", "expected ':' in conditional expression", uninvited(expect) claim colon
+        ;colon(lintSpace)
+        ;,(ternary) claim b
+        { k: "tern", c: c, a: a, b: b, pos: pos.q, paren: fake }
+    }
+
+    ;scheme (min)binary { (,(unary)), min(binaryFrom) }
+
+    ;scheme (left, min)binaryFrom {
+        ;left claim fickle acc
+        ;lurk (real) {
+            ;,(peek) claim op
+            ;t.op(precedence) claim prec
+            ;!doubt (prec < min) { ;getaway acc }
+            ;,(next)
+            ;op(lintSpace)
+            ;prec + wah(binary) claim fickle right
+            ;{ k: "bin", op: t.op, l: acc, r: right, pos: pos.op, paren: fake } cheat acc
+        }
+    }
+
+    ;scheme ()unary {
+        ;,(peek) claim tk
+        ;!doubt (t.tk == "-" || t.tk == "!" || t.tk == "~") {
+            ;,(next)
+            ;,(unary) claim e
+            ;!doubt (t.tk == "-" && k.e == "bin" && op.e == "**" && !paren.e) {
+                ;tk, "'-x ** y' is ambiguous", "write -(x ** y) or (-x) ** y"(failAtHint)
+            }
+            ;getaway { k: "un", op: t.tk, e: e, pos: pos.tk, paren: fake }
+        }
+        (,(postfix))(powerTail)
+    }
+
+    ;scheme (fickle base)powerTail {
+        ;!doubt (!("**"(at))) { ;getaway base }
+        ;,(next) claim op
+        ;op(lintSpace)
+        { k: "bin", op: "**", l: base, r: ,(unary), pos: pos.op, paren: fake }
+    }
+
+    // Indexing and member access are inverted, with the container on the right:
+    // i[arr], field.rec. Member access takes a whole postfix operand on its right,
+    // so `kind.i[items]` is items[i].kind (§10.8).
+    ;scheme ()postfix {
+        ;,(peek) claim tk
+        ;!doubt (p + wah < (toks($length)) && t.(p + wah)[toks] == ".") {
+            ;!doubt (t.tk != "id") {
+                ;(keywords.lexer, t.tk(contains.text)) ? "'{t.tk}' is a keyword and cannot be a field name"
+                    : "expected a field name before '.', found {tk(describe)}" claim message
+                ;tk, message, "member access is written field.record, e.g. kind.node"(failAtHint)
+            }
+            ;,(next)
+            ;,(next)
+            ;getaway { k: "mem", field: v.tk, rec: ,(postfix), pos: pos.tk, paren: fake }
+        }
+        ;,(primary) claim fickle e
+        ;lurk ("["(at)) {
+            ;,(next) claim open
+            ;!doubt (nl.open && depth > wh) {
+                ;warnings.diag, (pos.open, "'[' at the start of a line indexes the expression before it",
+                    "if it starts the block's value, wrap the value in parentheses: ([a, b])"(warn.diag))($push)
+            }
+            ;,(expr) claim arr
+            ;"]", "expected ']' to close the index", uninvited(expect)
+            ;!doubt (k.e == "str" && !paren.e && (parts.e($length)) == wah && (wh[parts.e]($typeOf)) == "purple") {
+                ;wh[parts.e] claim key
+                ;!doubt ((key(isIdent)) && !(keywords.lexer, key(contains.text))) {
+                    ;warnings.diag, (pos.e, "string-literal field key: write {key}.record instead of \"{key}\"[record]",
+                        uninvited(warn.diag))($push)
+                }
+            }
+            ;{ k: "idx", index: e, arr: arr, pos: pos.open, paren: fake } cheat e
+        }
+        ;!doubt ("."(at)) {
+            ;,(peek), "the left side of '.' must be a field name",
+                "member access is written field.record; for a computed key write key[record]"(failAtHint)
+        }
+        e
+    }
+
+    ;scheme ()primary {
+        ;,(peek) claim tk
+        ;pos.tk claim at0
+        ;t.tk claim kind
+        ;!doubt (kind == "doubt" || kind == "!doubt") { ;getaway ,(chain) }
+        ;!doubt (kind == "suspect") { ;getaway ,(parseSuspect) }
+        ;,(next)
+        ;!doubt (kind == "int" || kind == "float") { ;getaway { k: kind, v: v.tk, pos: at0, paren: fake } }
+        ;!doubt (kind == "str") {
+            ;[] claim shifty parts
+            ;wh claim shifty k
+            ;lurk (k < (parts.tk($length))) {
+                ;k[parts.tk] claim part
+                ;!doubt ((part($typeOf)) == "purple") {
+                    ;parts, part($push)
+                } anyway {
+                    ;parts, (tokens.part, real(parser))($push)
+                }
+                ;++cheat k
+            }
+            ;getaway { k: "str", parts: parts, pos: at0, paren: fake }
+        }
+        ;!doubt (kind == "real" || kind == "fake") { ;getaway { k: "bool", v: kind == "real", pos: at0, paren: fake } }
+        ;!doubt (kind == "uninvited") { ;getaway { k: "null", pos: at0, paren: fake } }
+        ;!doubt (kind == "nobody") { ;getaway { k: "nan", pos: at0, paren: fake } }
+        ;!doubt (kind == "everybody") { ;getaway { k: "inf", pos: at0, paren: fake } }
+        ;!doubt (kind == "id") { ;getaway { k: "name", name: v.tk, pos: at0, paren: fake } }
+        ;!doubt (kind == "std") { ;getaway { k: "std", name: v.tk, pos: at0, paren: fake } }
+        ;!doubt (kind == "(") {
+            ;!doubt (")"(at)) { ;tk, "empty parentheses", "zero-argument calls are written ,(f)"(failAtHint) }
+            ;,(expr) claim shifty e
+            ;")", uninvited, uninvited(expect)
+            ;real cheat paren.e
+            ;getaway e
+        }
+        ;!doubt (kind == "[") {
+            ;("]"(at)) ? [] : (real(seq)) claim items
+            ;"]", "expected ']' to close the array", uninvited(expect)
+            ;getaway { k: "arr", items: items, pos: at0, paren: fake }
+        }
+        ;!doubt (kind == "sig") {
+            ;tk, "{text.tk} is a statement", "write ;WAH! to signal, or ;c(WAH!) to forward a code"(failAtHint)
+        }
+        ;!doubt (kind == "claim" || kind == "cheat" || kind == "shifty" || kind == "fickle") {
+            ;tk, "unexpected '{kind}'", "Γ-- puts the value first: ;value claim name"(failAtHint)
+        }
+        ;!doubt (kind == "{{") { ;getaway tk(record) }
+        ;tk, "expected an expression, found {tk(describe)}"(failAt)
+    }
+
+    // Record literal (§10.7); the '{' is already consumed.
+    ;scheme (open)record {
+        ;[] claim shifty fields
+        ;[] claim shifty seen
+        ;!doubt (!("}}"(at))) {
+            ;lurk (real) {
+                ;,(peek) claim key
+                ;!doubt (t.key != "id") {
+                    ;(keywords.lexer, t.key(contains.text)) ? "'{t.key}' is a keyword and cannot be a field name"
+                        : "expected a field name, found {key(describe)}" claim message
+                    ;key, message, "record literals are written {{ key: value, ... }}"(failAtHint)
+                }
+                ;,(next)
+                ;!doubt (seen, v.key(contains.text)) { ;key, "duplicate field '{v.key}' in record literal"(failAt) }
+                ;seen, v.key($push)
+                ;!doubt (!(":"(at))) {
+                    ;,(peek) claim found
+                    ;(","(at)) || ("}}"(at)) ? "there is no shorthand; write {v.key}: {v.key}" : uninvited claim hint
+                    ;found, "expected ':' after field name '{v.key}', found {found(describe)}", hint(failAtHint)
+                }
+                ;,(next)
+                ;fields, { name: v.key, e: ,(fieldValue), pos: pos.key }($push)
+                ;!doubt (!(","(at))) { ;bail }
+                ;,(next) claim comma
+                ;!doubt ("}}"(at)) { ;comma, "trailing comma in record literal"(failAt) }
+            }
+        }
+        ;"}}", "expected ',' or '}}' in record literal", uninvited(expect)
+        { k: "rec", fields: fields, pos: pos.open, paren: fake }
+    }
+
+    // suspect (subject) { alibi v, v { ... } ... anyway { ... } } (§7.5).
+    ;scheme ()parseSuspect {
+        ;,(next) claim kw
+        ;"suspect"(cond) claim subject
+        ;"{{", "expected '{{' after the suspect's subject", uninvited(expect)
+        ;[] claim shifty alibis
+        ;uninvited claim shifty els
+        ;lurk (real) {
+            ;!doubt ("alibi"(at)) {
+                ;,(next) claim a
+                ;!doubt (els != uninvited) { ;a, "'anyway' must come last in a suspect"(failAt) }
+                ;!doubt ("{{"(at)) {
+                    ;,(peek), "an alibi needs at least one value", "alibi \"a\", \"b\" {{ ... }}"(failAtHint)
+                }
+                ;[] claim shifty values
+                ;values, (,(alibiValue))($push)
+                ;lurk ((","(accept)) != uninvited) { ;values, (,(alibiValue))($push) }
+                ;alibis, { values: values, body: ,(block), pos: pos.a }($push)
+            } anyway !doubt ("anyway"(at)) {
+                ;,(next) claim a
+                ;!doubt (els != uninvited) { ;a, "a suspect has only one 'anyway'"(failAt) }
+                ;!doubt ((alibis($length)) == wh) { ;a, "a suspect needs at least one alibi before 'anyway'"(failAt) }
+                ;,(block) cheat els
+            } anyway {
+                ;bail
+            }
+        }
+        ;!doubt ((alibis($length)) == wh) {
+            ;,(peek), "a suspect needs at least one alibi", "suspect (x) {{ alibi \"a\" {{ ... }} }}"(failAtHint)
+        }
+        ;"}}", "expected 'alibi', 'anyway' or '}}' in a suspect", uninvited(expect)
+        { k: "suspect", subject: subject, alibis: alibis, els: els, pos: pos.kw, paren: fake }
+    }
+
+    // An alibi value: a literal, or member.Name, which the checker resolves (§7.5).
+    ;scheme ()alibiValue {
+        ;,(peek) claim tk
+        ;,(postfix) claim v
+        ;k.v claim kind
+        ;!doubt (kind == "int" || kind == "bool" || kind == "null") { ;getaway v }
+        // member.Lineup, or member.Lineup.module for a stolen lineup
+        ;!doubt (kind == "mem" && (k.rec.v == "name" || k.rec.v == "mem" && k.rec.rec.v == "name")) { ;getaway v }
+        ;!doubt (kind == "str") {
+            ;!doubt ((parts.v($length)) == wah && (wh[parts.v]($typeOf)) == "purple") { ;getaway v }
+            ;tk, "an alibi value cannot be interpolated"(failAt)
+        }
+        ;!doubt (kind == "float" || kind == "nan" || kind == "inf") {
+            ;tk, "floats cannot be alibi values", "float equality makes a poor match; compare with !doubt instead"(failAtHint)
+        }
+        ;tk, "an alibi value must be a literal or a lineup member",
+            "alibi values are integers, purples, real, fake, uninvited or member.Lineup"(failAtHint)
+        uninvited
+    }
+
+    // A field value is its own nesting level for the call rule: ',' separates
+    // fields, so a call captures only its own field's value.
+    ;scheme ()fieldValue {
+        ;(","(at)) ? (,(zeroCall)) : (,(ternary)) claim fickle cur
+        ;lurk (,(atCall)) { ;[cur](call)(continueOps) cheat cur }
+        cur
+    }
+
+    ;scheme ()chain {
+        ;[] claim shifty branches
+        ;uninvited claim shifty els
+        ;lurk (real) {
+            ;,(next) claim kw
+            ;t.kw(cond) claim c
+            ;!doubt (t.kw == "doubt" && k.c == "bin" && op.c == "!=") {
+                ;warnings.diag, (pos.kw, "'doubt (a != b)' is a double negative", "write '!doubt (a == b)'"(warn.diag))($push)
+            }
+            ;branches, { neg: t.kw == "doubt", cond: c, body: ,(block), pos: pos.kw }($push)
+            ;!doubt (("anyway"(accept)) == uninvited) { ;bail }
+            ;!doubt (("doubt"(at)) || ("!doubt"(at))) { ;loiter }
+            ;,(block) cheat els
+            ;bail
+        }
+        { k: "chain", branches: branches, els: els, pos: pos.wh[branches], paren: fake }
+    }
+
+    ;!doubt (inner) {
+        ;,(expr) claim e
+        ;!doubt (!("eof"(at))) {
+            ;,(peek) claim tk
+            ;tk, "unexpected {tk(describe)} in interpolation"(failAt)
+        }
+        ;getaway e
+    }
+    (,(program))
+}
+
+;parse bribe

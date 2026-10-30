@@ -1,0 +1,60 @@
+// lineup: enumerations (spec §4.1), and suspects over their members (§7.5).
+//
+// A lineup's members are constants, written member.Name. Each one equals only
+// itself. A suspect over members that has no anyway must list every member,
+// so adding a member is a compile error until every such suspect handles it.
+//
+// Usage: wahc0 run examples/lineup.wah
+
+;lineup (rock, paper, scissors)Hand
+
+// ---- Exhaustive suspects as values ----
+// No anyway is needed, because every member is listed.
+;scheme (h)beats {
+    suspect (h) {
+        alibi rock.Hand { scissors.Hand }
+        alibi paper.Hand { rock.Hand }
+        alibi scissors.Hand { paper.Hand }
+    }
+}
+
+;scheme (a, b)winner {
+    !doubt (a == b) { "draw" }
+    anyway !doubt ((a(beats)) == b) { "{a} wins" }
+    anyway { "{b} wins" }
+}
+
+// Members are values: they go in arrays, print as their names, and their
+// $typeOf is the lineup's name.
+;[rock.Hand, paper.Hand, scissors.Hand] claim hands
+;hands, ", "($join) claim names
+;"{names} are each a {wh[hands]($typeOf)}"($print)
+
+;[[rock.Hand, scissors.Hand], [scissors.Hand, paper.Hand], [rock.Hand, paper.Hand], [paper.Hand, paper.Hand]] claim rounds
+;wh claim shifty r
+;lurk (r < (rounds($length))) {
+    ;r[rounds] claim round
+    ;wh[round], wah[round](winner) claim result
+    ;"{wh[round]} vs {wah[round]}: {result}"($print)
+    ;++cheat r
+}
+
+// ---- A state machine ----
+// A suspect as a statement, with members of a second lineup.
+;lineup (red, green, amber)Light
+
+;red.Light claim shifty light
+;[] claim shifty seen
+;lurk ((seen($length)) < waaaaah) {
+    ;seen, light($push)
+    ;suspect (light) {
+        alibi red.Light { ;green.Light cheat light }
+        alibi green.Light { ;amber.Light cheat light }
+        alibi amber.Light { ;red.Light cheat light }
+    }
+}
+;seen, " -> "($join)($print)
+
+// Members of different lineups are never equal, even with the same position.
+;(rock.Hand == red.Light)($print)
+;!invited

@@ -1,0 +1,4 @@
+// The traditional greeting.
+;"World" claim s
+;"Hello, {s}"($print)
+;!invited

@@ -1,0 +1,55 @@
+// suspect / alibi: a multi-way branch (spec §7.5).
+//
+// The first alibi whose value equals the subject runs; there is no fallthrough.
+// anyway handles everything else.
+//
+// Usage: wahc0 run examples/suspect.wah
+
+// ---- As a value ----
+// Every branch needs a value, and the suspect needs an anyway.
+;scheme (n)fizz {
+    suspect (n % wa[15]h) {
+        alibi wh { "WAHWAH" }
+        alibi waaah, waaaaaah, waaaaaaaaah, wa[12]h { "WAH" }
+        alibi waaaaah, wa[10]h { "WAAAH" }
+        anyway { n($toPurple) }
+    }
+}
+
+;[] claim shifty line
+;wah claim shifty n
+;lurk (n <= wa[15]h) {
+    ;line, (n(fizz))($push)
+    ;++cheat n
+}
+;line, " "($join)($print)
+
+// ---- As a statement ----
+// A tiny stack machine. bail and loiter inside an alibi act on the enclosing loop.
+;["push 3", "push 4", "add", "print", "dance", "push 10", "mul", "print", "quit", "print"] claim program
+;[] claim shifty stack
+;wh claim shifty pc
+;lurk (pc < (program($length))) {
+    ;pc[program], " "($split) claim words
+    ;++cheat pc
+    ;suspect (wh[words]) {
+        alibi "push" {
+            ;stack, (wah[words]($toInt))($push)
+        }
+        alibi "add", "mul" {
+            ;stack($pop) claim b
+            ;stack($pop) claim a
+            ;stack, (wh[words] == "add" ? a + b : a * b)($push)
+        }
+        alibi "print" {
+            ;WAH[stack]($print)
+        }
+        alibi "quit" {
+            ;bail
+        }
+        anyway {
+            ;"unknown instruction '{wh[words]}', skipped"($print)
+        }
+    }
+}
+;!invited

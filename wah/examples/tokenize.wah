@@ -1,0 +1,166 @@
+// A tokenizer for Γ--, written in Γ--.
+//
+// This is the stage 0 stress test: it uses the same subset of the language
+// that the stage 1 compiler will be written in (records and arrays, no maps).
+//
+// Usage: wahc0 run examples/tokenize.wah <file.wah>
+// Prints one token per line as "<kind> <text>", then the token count.
+
+;["scheme", "getaway", "claim", "shifty", "fickle", "cheat", "doubt", "anyway", "lurk", "bail",
+  "loiter", "tantrum", "whine", "real", "fake", "uninvited", "nobody", "everybody", "suspect", "alibi",
+  "lineup", "steal", "bribe"] claim keywords
+;["doubt", "lurk", "invited"] claim bangWords
+;["**", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>"] claim twoCharOps
+;["**", "<<", ">>", "++", "--", "+", "-", "*", "/", "%", "&", "|", "^"] claim cheatOps
+
+;scheme (xs, x)contains {
+    ;wh claim shifty k
+    ;lurk (k < (xs($length))) {
+        ;!doubt (k[xs] == x) { ;getaway real }
+        ;++cheat k
+    }
+    fake
+}
+
+;scheme (c)isSpace { c == " " || c == "\t" || c == "\n" || c == "\r" }
+;scheme (c)isDigit { c >= "0" && c <= "9" }
+;scheme (c)isIdStart { c >= "a" && c <= "z" || c >= "A" && c <= "Z" || c == "_" }
+;scheme (c)isIdChar { (c(isIdStart)) || (c(isDigit)) }
+
+// The character at i, or "" past the end.
+;scheme (cs, i)charAt { i < (cs($length)) ? i[cs] : "" }
+
+// Does the text s occur in cs at position i?
+;scheme (cs, i, s)lookingAt {
+    ;s($length) claim len
+    ;!doubt (i + len > (cs($length))) { ;getaway fake }
+    (cs, i, i + len($slice)), ""($join) == s
+}
+
+// w a* h, W A* H, or the bracket forms wa[...]h / WA[...]H.
+;scheme (w)isNumeral {
+    ;w($length) claim len
+    ;!doubt (len < waah) { ;getaway fake }
+    ;w, wh($at) claim first
+    ;w, WAH($at) claim last
+    ;!doubt (first == "w" && last == "h") { ;getaway w, "a"(middleIs) }
+    ;!doubt (first == "W" && last == "H") { ;getaway w, "A"(middleIs) }
+    fake
+}
+
+;scheme (w, a)middleIs {
+    ;!doubt (w($length) > waah && (w, waah($at)) == "[") { ;getaway real }
+    ;wah claim shifty k
+    ;lurk (k < (w($length)) - wah) {
+        ;!doubt (w, k($at) != a) { ;getaway fake }
+        ;++cheat k
+    }
+    real
+}
+
+// A signal's '!' must be followed by whitespace, ';', '}', ')' or the end.
+;scheme (c)endsSignal { c == "" || (c(isSpace)) || c == ";" || c == "}}" || c == ")" }
+
+// Length of the operator or punctuation at i; a compound cheat counts as one token.
+;scheme (cs, i)opLength {
+    ;wh claim shifty k
+    ;lurk (k < (cheatOps($length))) {
+        ;k[cheatOps] + "cheat" claim op
+        ;op($length) claim len
+        ;!doubt ((cs, i, op(lookingAt)) && !(cs, i + len(charAt)(isIdChar))) { ;getaway len }
+        ;++cheat k
+    }
+    ;wh cheat k
+    ;lurk (k < (twoCharOps($length))) {
+        ;!doubt (cs, i, k[twoCharOps](lookingAt)) { ;getaway waah }
+        ;++cheat k
+    }
+    wah
+}
+
+;scheme (src)tokenize {
+    ;src, ""($split) claim cs
+    ;cs($length) claim n
+    ;[] claim shifty toks
+    ;wh claim shifty i
+    ;lurk (i < n) {
+        ;i claim start
+        ;i[cs] claim c
+        ;cs, i + wah(charAt) claim next
+        ;"" claim shifty kind
+        ;!doubt (c(isSpace)) {
+            ;++cheat i
+        } anyway !doubt (c == "/" && next == "/") {
+            ;lurk (i < n && i[cs] != "\n") { ;++cheat i }
+        } anyway !doubt (c == "/" && next == "*") {
+            ;waah +cheat i
+            ;lurk (!(cs, i, "*/"(lookingAt))) {
+                ;!doubt (i >= n) { ;tantrum "unterminated block comment" }
+                ;++cheat i
+            }
+            ;waah +cheat i
+        } anyway !doubt (c == "\"") {
+            ;++cheat i
+            ;lurk (i < n && i[cs] != "\"") {
+                ;!doubt (i[cs] == "\\") { ;++cheat i }
+                ;++cheat i
+            }
+            ;++cheat i
+            ;"string" cheat kind
+        } anyway !doubt (c == "$") {
+            ;++cheat i
+            ;lurk (cs, i(charAt)(isIdChar)) { ;++cheat i }
+            ;"stdlib" cheat kind
+        } anyway !doubt (c(isIdStart)) {
+            ;lurk (cs, i(charAt)(isIdChar)) { ;++cheat i }
+            ;src, start, i($slice) claim word
+            ;!doubt ((word == "wa" || word == "WA") && next != "" && (cs, i(charAt)) == "[") {
+                ;lurk (i < n && i[cs] != "]") { ;++cheat i }
+                ;waah +cheat i
+            }
+            ;src, start, i($slice) claim text
+            ;!doubt (text(isNumeral)) {
+                ;"numeral" cheat kind
+                ;!doubt ((cs, i(charAt)) == "!" && (cs, i + wah(charAt)(endsSignal))) {
+                    ;++cheat i
+                    ;"signal" cheat kind
+                }
+            } anyway !doubt (keywords, text(contains)) {
+                ;"keyword" cheat kind
+            } anyway {
+                ;"name" cheat kind
+            }
+        } anyway !doubt (c == "!" && (next(isIdStart))) {
+            ;++cheat i
+            ;lurk (cs, i(charAt)(isIdChar)) { ;++cheat i }
+            ;!doubt (bangWords, (src, start + wah, i($slice))(contains)) {
+                ;"bang" cheat kind
+            } anyway {
+                ;start + wah cheat i
+                ;"operator" cheat kind
+            }
+        } anyway {
+            ;cs, i(opLength) +cheat i
+            ;"operator" cheat kind
+        }
+        ;!doubt (kind != "") { ;toks, { kind: kind, text: (src, start, i($slice)) }($push) }
+    }
+    toks
+}
+
+;doubt ($args($length) == wah) {
+    ;"usage: wahc0 run examples/tokenize.wah <file.wah>"($eprint)
+    ;waah !invited
+}
+;wh[$args]($readFile) claim src
+    whine { ;"cannot read {wh[$args]}"($eprint) ;waah !invited }
+
+;src(tokenize) claim tokens
+;wh claim shifty t
+;lurk (t < (tokens($length))) {
+    ;t[tokens] claim tok
+    ;"{kind.tok} {text.tok}"($print)
+    ;++cheat t
+}
+;"{tokens($length)} tokens"($print)
+;!invited

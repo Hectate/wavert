@@ -1,0 +1,10 @@
+// Echoes standard input to standard output, line by line, until 'quit' or end of input.
+// $readLine signals WAH! at end of input; the whine handler leaves the loop.
+;"Simple input/output echo test. Type 'quit' to end."($print)
+;lurk (real) {
+    ;,($readLine) claim line
+        whine { ;bail }
+    ;!doubt (line == "quit") { ;bail }
+    ;"ECHO: {line}"($print)
+}
+;!invited

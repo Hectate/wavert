@@ -1,0 +1,23 @@
+// A library (spec §13.1). Its top level holds only steal, scheme, claim and
+// lineup statements, and it ends by bribing the names it exports.
+;"text.wah" steal text
+
+;lineup (circle, triangle, square)Shape
+
+// Not bribed, so private: text.wah has its own 'ready', and they never conflict.
+;"shapes.wah: initialized"($print) claim ready
+
+;scheme (shape)corners {
+    suspect (shape) {
+        alibi circle.Shape { wh }
+        alibi triangle.Shape { waaah }
+        alibi square.Shape { waaaah }
+    }
+}
+
+;scheme (shape)describe {
+    ;shape(corners), "corner"(count.text) claim n
+    "a {shape} has {n}"
+}
+
+;Shape, corners, describe bribe

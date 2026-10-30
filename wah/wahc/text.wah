@@ -1,0 +1,99 @@
+// wahc: Characters and text helpers.
+
+;scheme (c)isSpace { c == " " || c == "\t" || c == "\n" || c == "\r" }
+;scheme (c)isDigit { c >= "0" && c <= "9" }
+;scheme (c)isHexDigit { (c(isDigit)) || c >= "a" && c <= "f" || c >= "A" && c <= "F" }
+;scheme (c)isIdStart { c >= "a" && c <= "z" || c >= "A" && c <= "Z" || c == "_" }
+;scheme (c)isIdChar { (c(isIdStart)) || (c(isDigit)) }
+
+// JS's \s, which wahc0 uses to find whitespace inside a bang token such as '! doubt'.
+;scheme (c)isJsSpace {
+    ;!doubt (c == "") { ;getaway fake }
+    ;c($code) claim k
+    k >= wa[9]h && k <= wa[13]h || k == wa[32]h || k == wa[0xA0]h || k == wa[0x1680]h
+        || k >= wa[0x2000]h && k <= wa[0x200A]h || k == wa[0x2028]h || k == wa[0x2029]h
+        || k == wa[0x202F]h || k == wa[0x205F]h || k == wa[0x3000]h || k == wa[0xFEFF]h
+}
+
+// A signal's '!' must be followed by whitespace, ';', '}', ')' or the end (§2.5).
+;scheme (c)isSigTerm { c == "" || (c(isSpace)) || c == ";" || c == "}}" || c == ")" }
+
+;scheme (fickle xs, x)contains {
+    ;wh claim shifty k
+    ;lurk (k < (xs($length))) {
+        ;!doubt (k[xs] == x) { ;getaway real }
+        ;++cheat k
+    }
+    fake
+}
+
+// ASCII case changes: shift is -32 for upper, 32 for lower.
+;scheme (s, from, shift)shiftCase {
+    ;s, ""($split) claim cs
+    ;"" claim shifty out
+    ;wh claim shifty k
+    ;lurk (k < (cs($length))) {
+        ;k[cs] claim c
+        ;!doubt (c >= from && c <= (from($code) + wa[25]h($fromCode))) {
+            ;out + (c($code) + shift($fromCode)) cheat out
+        } anyway {
+            ;out + c cheat out
+        }
+        ;++cheat k
+    }
+    out
+}
+;scheme (s)toUpper { s, "a", WA[32]H(shiftCase) }
+;scheme (s)toLower { s, "A", wa[32]h(shiftCase) }
+
+// The value of 1 to 6 hex digits, or WAH if s is not that.
+;scheme (s)hexValue {
+    ;s, ""($split) claim cs
+    ;!doubt ((cs($length)) < wah || (cs($length)) > wa[6]h) { ;getaway WAH }
+    ;wh claim shifty v
+    ;wh claim shifty k
+    ;lurk (k < (cs($length))) {
+        ;k[cs] claim c
+        ;!doubt (!(c(isHexDigit))) { ;getaway WAH }
+        ;"0123456789abcdef", ""($split) claim digits
+        ;wh claim shifty d
+        ;lurk ((d[digits](toUpper)) != (c(toUpper))) { ;++cheat d }
+        ;v * wa[16]h + d cheat v
+        ;++cheat k
+    }
+    v
+}
+
+// JS's JSON.stringify for a string.
+;scheme (s)quote {
+    ;s, ""($split) claim cs
+    ;"\"" claim shifty out
+    ;wh claim shifty k
+    ;lurk (k < (cs($length))) {
+        ;k[cs] claim c
+        ;c($code) claim code
+        ;!doubt (c == "\"" || c == "\\") {
+            ;out + "\\" + c cheat out
+        } anyway !doubt (c == "\n") {
+            ;out + "\\n" cheat out
+        } anyway !doubt (c == "\r") {
+            ;out + "\\r" cheat out
+        } anyway !doubt (c == "\t") {
+            ;out + "\\t" cheat out
+        } anyway !doubt (code == wa[8]h) {
+            ;out + "\\b" cheat out
+        } anyway !doubt (code == wa[12]h) {
+            ;out + "\\f" cheat out
+        } anyway !doubt (code < wa[32]h) {
+            ;"0123456789abcdef", ""($split) claim hex
+            ;out + "\\u00" + (code / wa[16]h($floor))[hex] + (code % wa[16]h)[hex] cheat out
+        } anyway {
+            ;out + c cheat out
+        }
+        ;++cheat k
+    }
+    out + "\""
+}
+
+;isSpace, isDigit, isHexDigit, isIdStart, isIdChar, isJsSpace, isSigTerm, contains, toUpper,
+    toLower, hexValue, quote bribe

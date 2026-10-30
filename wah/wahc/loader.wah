@@ -1,0 +1,113 @@
+// wahc: Loading modules (js/src/compile.js, spec §13.1).
+// A module is { file, chars, path, program, steals, exports, notLibrary, fickleTargets },
+// where steals is [{ node, lib }] and lib is the stolen module's index in the
+// module list. The checker fills in exports (the declarations it bribes),
+// notLibrary, and fickleTargets (the positions of cheat targets that are
+// fickle bindings, which the code generator binds without copying, §10.4).
+
+;"diag.wah" steal diag
+;"lexer.wah" steal lexer
+;"parser.wah" steal parser
+
+// The directory part of a path, with its trailing '/'.
+;scheme (path)dirOf {
+    ;path, ""($split) claim cs
+    ;(cs($length)) - wah claim shifty k
+    ;lurk (k >= wh && k[cs] != "/") { ;--cheat k }
+    (cs, wh, k + wah($slice)), ""($join)
+}
+
+// Removes '.' segments, empty segments and 'dir/..' pairs.
+;scheme (path)normalize {
+    ;path, "/"($split) claim segs
+    ;[] claim shifty out
+    ;wh claim shifty k
+    ;lurk (k < (segs($length))) {
+        ;k[segs] claim seg
+        ;++cheat k
+        ;!doubt (seg == "." || seg == "" && (out($length)) > wh) { ;loiter }
+        ;!doubt (seg == ".." && (out($length)) > wh && WAH[out] != ".." && WAH[out] != "") {
+            ;out($pop)
+        } anyway {
+            ;out, seg($push)
+        }
+    }
+    out, "/"($join)
+}
+
+// A copy of xs with x added.
+;scheme (xs, x)with {
+    ;[] claim shifty out
+    ;wh claim shifty k
+    ;lurk (k < (xs($length))) {
+        ;out, k[xs]($push)
+        ;++cheat k
+    }
+    ;out, x($push)
+    out
+}
+
+// Fails with an error in another file than the current one.
+;scheme (file, chars, pos, message)failIn {
+    ;file, chars(setSource.diag)
+    ;pos, message(fail.diag)
+}
+
+// Loads the entry file and every library it steals, directly or indirectly.
+// Returns the modules in initialization order: libraries depth first, in steal
+// order, each before any file that steals it; the entry file last.
+;scheme (entryFile, fickle entryChars)loadProgram {
+    ;[] claim shifty modules
+
+    ;scheme (path)loaded {
+        ;wh claim shifty k
+        ;lurk (k < (modules($length))) {
+            ;!doubt (path.k[modules] == path) { ;getaway k }
+            ;++cheat k
+        }
+        uninvited
+    }
+
+    // Loads one file and what it steals; returns its index. chain: the paths
+    // from the entry file to this one, for finding cycles.
+    ;scheme (file, chars, path, chain)visit {
+        ;file, chars(setSource.diag)
+        ;chars(lex.lexer)(parse.parser) claim program
+        ;[] claim shifty steals
+        ;wh claim shifty k
+        ;lurk (k < (stmts.program($length))) {
+            ;k[stmts.program] claim s
+            ;++cheat k
+            ;!doubt (k.s != "steal") { ;loiter }
+            ;(path(dirOf)) + path.s(normalize) claim libPath
+            ;wh claim shifty at
+            ;lurk (at < (chain($length)) && at[chain] != libPath) { ;++cheat at }
+            ;!doubt (at < (chain($length))) {
+                ;(chain, at, (chain($length))($slice)), libPath(with) claim cycle
+                ;file, chars, pathPos.s, "import cycle: {cycle, " -> "($join)}"(failIn)
+            }
+            ;libPath(loaded) claim shifty lib
+            ;!doubt (lib == uninvited) {
+                ;libPath($readFile) claim text
+                    whine { ;file, chars, pathPos.s, "cannot read '{libPath}'"(failIn) uninvited }
+                ;text, ""($split) claim cs
+                ;(cs($length)) > wh && wh[cs] == "\u{FEFF}" ? wah : wh claim bom
+                ;libPath, (cs, bom, (cs($length))($slice)), libPath, (chain, libPath(with))(visit) cheat lib
+            }
+            ;steals, { node: s, lib: lib }($push)
+        }
+        ;[] claim shifty fickleTargets
+        ;{
+            file: file, chars: chars, path: path, program: program, steals: steals, exports: [], notLibrary: fake,
+            fickleTargets: fickleTargets
+        } claim shifty mod
+        ;modules, mod($push)
+        (modules($length)) - wah
+    }
+
+    ;(entryFile, "\\"($split)), "/"($join)(normalize) claim path
+    ;entryFile, entryChars, path, [path](visit)
+    modules
+}
+
+;loadProgram bribe

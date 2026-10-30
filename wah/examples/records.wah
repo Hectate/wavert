@@ -1,0 +1,73 @@
+// Records and member access (spec §10.7-§10.10).
+//
+// Builds an expression tree out of records and evaluates it, then shows
+// mutation, copying, computed field access and equality.
+//
+// Usage: wahc0 run examples/records.wah
+
+// ---- Literals ----
+// A record as a block's value needs its own braces: the outer pair is the block.
+;scheme (n)num { { kind: "num", value: n } }
+;scheme (op, l, r)bin { { kind: "bin", op: op, left: l, right: r } }
+
+// (2 + 3) * 7. Each call is parenthesized so it does not capture its neighbours.
+;"+", (waah(num)), (waaah(num))(bin) claim sum
+;"*", sum, (wa[7]h(num))(bin) claim expr
+
+// ---- Member access ----
+// field.record reads inside-out, like i[arr]: left.e is e.left.
+;scheme (e)eval {
+    ;!doubt (kind.e == "num") { ;getaway value.e }
+    ;left.e(eval) claim l
+    ;right.e(eval) claim r
+    ;!doubt (op.e == "+") { ;getaway l + r }
+    ;!doubt (op.e == "*") { ;getaway l * r }
+    ;tantrum "unknown operator {op.e}"
+}
+
+;scheme (e)show {
+    ;!doubt (kind.e == "num") { ;getaway value.e($toPurple) }
+    "({left.e(show)} {op.e} {right.e(show)})"
+}
+
+;"{expr(show)} = {expr(eval)}"($print)     // ((2 + 3) * 7) = 35
+;value.left.left.expr($print)              // expr.left.left.value: 2
+
+// Records inside arrays: kind.i[xs] is xs[i].kind.
+;[{ name: "Wario", coins: wa[50]h }, { name: "Waluigi", coins: waaah }] claim players
+;wh claim shifty i
+;lurk (i < (players($length))) {
+    ;"{name.i[players]}: {coins.i[players]}"($print)
+    ;++cheat i
+}
+
+// ---- Mutation ----
+// Only shifty records can change, and only fields that already exist.
+;{ name: "Waluigi", coins: wh, wins: wh } claim shifty me
+;wa[10]h +cheat coins.me
+;++cheat wins.me
+;"{name.me}: {coins.me} coins, {wins.me} win"($print)
+
+// Claiming a shifty record without shifty takes a frozen snapshot (§10.4).
+;me claim snapshot
+;wa[5]h +cheat coins.me
+;"now {coins.me}, snapshot {coins.snapshot}"($print)
+
+// ---- Computed access ----
+// key[record] reads or writes the field named by a purple.
+;"wins" claim stat
+;wah +cheat stat[me]
+;me($fields) claim keys
+;wh claim shifty k
+;lurk (k < (keys($length))) {
+    ;k[keys] claim key
+    ;"{key} = {key[me]}"($print)
+    ;++cheat k
+}
+
+// ---- Equality ----
+// == compares references; $same compares fields and values.
+;waah(num) claim two
+;two == (waah(num))($print)                // fake
+;two, (waah(num))($same)($print)           // real
+;!invited

@@ -1,0 +1,1109 @@
+// wahc: The C code generator (js/src/codegen_c.js), for --target c. The
+// output must match wahc0's byte for byte, so this follows codegen_c.js step
+// by step: see there for the design.
+//
+// Syntax tree records have fixed shapes, so what the analysis finds is kept
+// beside them: bindings and functions are numbered (decls, fns), and each
+// module's slot array maps a source position to the binding declared or used
+// there. Every name, claim, parameter and whine code is its own token, so
+// positions tell them apart.
+
+;"text.wah" steal text
+;"diag.wah" steal diag
+
+;["+", "-", "*", "/", "%", "**", "==", "!=", "<", ">", "<=", ">=", "&", "|", "^", "<<", ">>"] claim binOps
+;["add", "sub", "mul", "div", "mod", "pow", "eq", "ne", "lt", "gt", "le", "ge", "band", "bor", "bxor", "shl", "shr"] claim binFns
+// Node kinds whose value can never be an array or record (so binding needs no copy check).
+;["int", "float", "str", "bool", "null", "nan", "inf", "bin", "un"] claim scalarKinds
+// Node kinds that evaluate without calling anything.
+;["int", "float", "bool", "null", "nan", "inf", "name", "std"] claim plainKinds
+// Stdlib functions that can signal WAH! (§12.1).
+;["readLine", "readFile", "writeFile", "appendFile", "listDir", "deleteFile", "env", "run", "toInt", "toFloat"] claim signalers
+
+// How an expression's evaluation interacts with others (see seq).
+;wh claim constK  // a constant: nothing can change it
+;wah claim pureK  // reads a binding, so another argument's effects could change it
+;waah claim effectK // may have effects or raise a tantrum
+
+;scheme (op)binFn {
+    ;wh claim shifty k
+    ;lurk (k[binOps] != op) { ;++cheat k }
+    k[binFns]
+}
+// How a claim or parameter binds its values (§10.4): "shifty", "fickle" or "const".
+;scheme (x)modeOf { isShifty.x ? "shifty" : isFickle.x ? "fickle" : "const" }
+
+;scheme (op)unFn { op == "-" ? "neg" : op == "!" ? "not" : "bnot" }
+
+;scheme (s, count)repeat {
+    ;"" claim shifty out
+    ;wh claim shifty k
+    ;lurk (k < count) {
+        ;out + s cheat out
+        ;++cheat k
+    }
+    out
+}
+
+// The UTF-8 length of s.
+;scheme (s)utf8Length {
+    ;s, ""($split) claim cs
+    ;wh claim shifty n
+    ;wh claim shifty k
+    ;lurk (k < (cs($length))) {
+        ;k[cs]($code) claim c
+        ;(c < wa[0x80]h ? wah : c < wa[0x800]h ? waah : c < wa[0x10000]h ? waaah : waaaah) +cheat n
+        ;++cheat k
+    }
+    n
+}
+
+// A C string literal for s: printable characters as they are (the C file is
+// UTF-8), other control characters as three-digit octal escapes.
+;scheme (s)cString {
+    ;s, ""($split) claim cs
+    ;"\"" claim shifty out
+    ;wh claim shifty k
+    ;lurk (k < (cs($length))) {
+        ;k[cs] claim ch
+        ;ch($code) claim c
+        ;!doubt (ch == "\"") {
+            ;out + "\\\"" cheat out
+        } anyway !doubt (ch == "\\") {
+            ;out + "\\\\" cheat out
+        } anyway !doubt (ch == "\n") {
+            ;out + "\\n" cheat out
+        } anyway !doubt (ch == "\t") {
+            ;out + "\\t" cheat out
+        } anyway !doubt (ch == "\r") {
+            ;out + "\\r" cheat out
+        } anyway !doubt (c < wa[32]h || c == wa[127]h) {
+            ;out + "\\{(c / wa[64]h($floor))}{(c / wa[8]h($floor)) % wa[8]h}{c % wa[8]h}" cheat out
+        } anyway {
+            ;out + ch cheat out
+        }
+        ;++cheat k
+    }
+    out + "\""
+}
+
+// A static wstr initializer: { bytes, code points, ascii, sym, data }.
+;scheme (s)wstrInit {
+    ;s(utf8Length) claim bytes
+    ;s($length) claim cps
+    "{{ {bytes}, {cps}, {bytes == cps ? wah : wh}, 0, {s(cString)} }}"
+}
+
+// A C array of values: (wv[]){ ... }, or NULL when empty.
+;scheme (fickle cs)values { (cs($length)) == wh ? "NULL" : "(wv[]){{ {cs, ", "($join)} }}" }
+
+// modules: checked, in initialization order, the entry file last.
+;scheme (modules, runtime)generateC {
+    ;wh claim shifty n
+    ;wh claim shifty tmps
+    ;[] claim shifty strings
+    ;[] claim shifty fields
+    ;[] claim shifty shapes
+    ;[] claim shifty lineupDefs
+    ;[] claim shifty globals
+    ;[] claim shifty frames
+    ;[] claim shifty functions
+    ;[] claim shifty out
+    ;wah claim shifty indent
+    // loops: enclosing loops reachable by bail/loiter; iife: inside a conditional used as a value
+    ;wh claim shifty loops
+    ;fake claim shifty iife
+
+    // Bindings: { kind, name, fn, cname, isFickle, captured, schemeFn }, where fn
+    // is the index of the function that owns it, and schemeFn, for a scheme, its
+    // own function. Functions: { name, parent, depth, top, children, cname },
+    // where parent is uninvited for a module's top level.
+    ;[] claim shifty decls
+    ;[] claim shifty fns
+    // Per module: its top-level function, and its positions -> binding index.
+    ;[] claim shifty tops
+    ;[] claim shifty slots
+
+    // The current module: its index and id, its positions, its module names as
+    // { name, lib }, its lineup statements, and the current function.
+    ;wh claim shifty curMod
+    ;"" claim shifty mod
+    ;[] claim shifty curSlot
+    ;[] claim shifty stolen
+    ;[] claim shifty ownLineups
+    ;wh claim shifty cur
+
+    // The id of module m: its place in initialization order for a library, "" for the entry file.
+    ;scheme (m)modId { m == (modules($length)) - wah ? "" : "{m + wah}" }
+
+    ;scheme (f)hasFrame { !(top.f[fns]) && children.f[fns] > wh }
+
+    // ---- analysis: resolve names, find what nested schemes use ----
+
+    ;scheme (parent)newScope {
+        ;[] claim shifty names
+        { parent: parent, names: names }
+    }
+    ;scheme (scope, name, kind, d)put { ;names.scope, { name: name, kind: kind, d: d }($push) }
+    // The entry for name in scope or around it, or uninvited.
+    ;scheme (fickle scope, name)find {
+        ;scope claim fickle s
+        ;lurk (s != uninvited) {
+            ;names.s claim fickle ns
+            ;wh claim shifty k
+            ;lurk (k < (ns($length))) {
+                ;!doubt (name.k[ns] == name) { ;getaway k[ns] }
+                ;++cheat k
+            }
+            ;parent.s cheat s
+        }
+        uninvited
+    }
+    ;scheme (scope, name)kindOf {
+        ;scope, name(find) claim entry
+        entry == uninvited ? uninvited : kind.entry
+    }
+
+    ;scheme (name, parent)newFn {
+        ;{
+            name: name, parent: parent, depth: parent == uninvited ? wh : depth.parent[fns] + wah,
+            top: parent == uninvited, children: wh, cname: ""
+        } claim shifty f
+        ;fns, f($push)
+        (fns($length)) - wah
+    }
+
+    // A binding of function f. At a module's top scope, claims and schemes keep
+    // their names (other modules use them); everything else is numbered.
+    ;scheme (kind, name, f, atTop, mode)bind {
+        ;"w{mod}_{name}" claim shifty cname
+        ;!doubt (!atTop) {
+            ;(kind == "scheme" ? "s" : "v") + "{n}_{name}" cheat cname
+            ;++cheat n
+        }
+        ;{ kind: kind, name: name, fn: f, cname: cname, isFickle: mode == "fickle", captured: fake, schemeFn: uninvited } claim shifty d
+        ;decls, d($push)
+        ;!doubt (top.f[fns] && kind != "scheme") { ;globals, cname($push) }
+        (decls($length)) - wah
+    }
+
+    ;scheme (fickle b, scope, f, topScope)ablock {
+        ;scope == topScope claim atTop
+        ;stmts.b claim list
+        ;wh claim shifty k
+        ;lurk (k < (list($length))) {
+            ;k[list] claim s
+            ;!doubt (k.s == "scheme") {
+                ;"scheme", name.s, f, atTop, ""(bind) claim d
+                ;name.s, f(newFn) claim child
+                ;cname.d[decls] cheat cname.child[fns]
+                ;child cheat schemeFn.d[decls]
+                ;++cheat children.f[fns]
+                ;d cheat (namePos.s)[curSlot]
+                ;scope, name.s, "scheme", d(put)
+            } anyway !doubt (k.s == "lineup") {
+                ;scope, name.s, "lineup", uninvited(put)
+            } anyway !doubt (k.s == "claim") {
+                ;"claim", name.s, f, atTop, (s(modeOf))(bind) claim d
+                ;d cheat (namePos.s)[curSlot]
+                ;scope, name.s, "claim", d(put)
+            }
+            ;++cheat k
+        }
+        ;wh cheat k
+        ;lurk (k < (list($length))) {
+            ;k[list], scope, f, topScope(astmt)
+            ;++cheat k
+        }
+        ;!doubt (value.b != uninvited) { ;value.b, scope, f(aexpr) }
+    }
+
+    ;scheme (fickle s, scope, f, topScope)astmt {
+        ;k.s claim kind
+        ;!doubt (kind == "scheme") {
+            ;(namePos.s)[curSlot] claim d
+            ;schemeFn.d[decls] claim child
+            ;scope(newScope) claim ps
+            ;wh claim shifty k
+            ;lurk (k < (params.s($length))) {
+                ;k[params.s] claim p
+                ;"param", name.p, child, fake, (p(modeOf))(bind) claim pd
+                ;pd cheat (pos.p)[curSlot]
+                ;ps, name.p, "param", pd(put)
+                ;++cheat k
+            }
+            ;body.s, (ps(newScope)), child, topScope(ablock)
+        } anyway !doubt (kind == "lurk") {
+            ;cond.s, scope, f(aexpr)
+            ;body.s, (scope(newScope)), f, topScope(ablock)
+        } anyway !doubt (kind == "getaway" || kind == "tantrum" || kind == "exit" || kind == "claim") {
+            ;!doubt (e.s != uninvited) { ;e.s, scope, f(aexpr) }
+        } anyway !doubt (kind == "expr") {
+            ;!doubt (k.e.s == "sigcall") { ;arg.e.s, scope, f(aexpr) } anyway { ;e.s, scope, f(aexpr) }
+        } anyway !doubt (kind == "cheat") {
+            ;e.s, scope, f(aexpr)
+            ;target.s, scope, f(atarget)
+        }
+        ;!doubt (handler.s != uninvited) {
+            ;handler.s claim h
+            ;scope(newScope) claim hs
+            ;!doubt (param.h != uninvited) {
+                ;"whine", param.h, f, fake, ""(bind) claim wd
+                ;wd cheat (paramPos.h)[curSlot]
+                ;hs, param.h, "whine", wd(put)
+            }
+            ;body.h, (hs(newScope)), f, topScope(ablock)
+        }
+    }
+
+    // A name used in function f: a binding of another function is captured.
+    ;scheme (x, scope, f)use {
+        ;d.(scope, name.x(find)) claim d
+        ;d cheat (pos.x)[curSlot]
+        ;!doubt (fn.d[decls] != f) { ;real cheat captured.d[decls] }
+    }
+
+    ;scheme (t, scope, f)atarget {
+        ;!doubt (k.t == "name") { ;t, scope, f(use) ;getaway }
+        ;!doubt (k.t == "idx") { ;index.t, scope, f(aexpr) }
+        ;(k.t == "mem" ? rec.t : arr.t), scope, f(aexpr)
+    }
+
+    // Is x (the right of '.') a lineup or module name, rather than a value?
+    ;scheme (fickle x, scope)notValue {
+        ;!doubt (k.x == "mem") { ;getaway k.rec.x == "name" && (scope, name.rec.x(kindOf)) == "module" }
+        ;!doubt (k.x != "name") { ;getaway fake }
+        ;scope, name.x(kindOf) claim kind
+        kind == "lineup" || kind == "module"
+    }
+
+    ;scheme (fickle e, scope, f)aexpr {
+        ;k.e claim kind
+        ;!doubt (kind == "str") {
+            ;wh claim shifty k
+            ;lurk (k < (parts.e($length))) {
+                ;!doubt ((k[parts.e]($typeOf)) != "purple") { ;k[parts.e], scope, f(aexpr) }
+                ;++cheat k
+            }
+        } anyway !doubt (kind == "name") {
+            ;e, scope, f(use)
+        } anyway !doubt (kind == "arr") {
+            ;wh claim shifty k
+            ;lurk (k < (items.e($length))) { ;k[items.e], scope, f(aexpr) ;++cheat k }
+        } anyway !doubt (kind == "rec") {
+            ;wh claim shifty k
+            ;lurk (k < (fields.e($length))) { ;e.k[fields.e], scope, f(aexpr) ;++cheat k }
+        } anyway !doubt (kind == "idx") {
+            ;index.e, scope, f(aexpr)
+            ;arr.e, scope, f(aexpr)
+        } anyway !doubt (kind == "mem") {
+            ;!doubt (!(rec.e, scope(notValue))) { ;rec.e, scope, f(aexpr) }
+        } anyway !doubt (kind == "un") {
+            ;e.e, scope, f(aexpr)
+        } anyway !doubt (kind == "bin") {
+            ;l.e, scope, f(aexpr)
+            ;r.e, scope, f(aexpr)
+        } anyway !doubt (kind == "tern") {
+            ;c.e, scope, f(aexpr)
+            ;a.e, scope, f(aexpr)
+            ;b.e, scope, f(aexpr)
+        } anyway !doubt (kind == "call") {
+            ;wh claim shifty k
+            ;lurk (k < (args.e($length))) { ;k[args.e], scope, f(aexpr) ;++cheat k }
+            ;!doubt (k.callee.e == "name") { ;d.(scope, name.callee.e(find)) cheat (pos.callee.e)[curSlot] }
+        } anyway !doubt (kind == "chain") {
+            ;wh claim shifty k
+            ;lurk (k < (branches.e($length))) {
+                ;cond.k[branches.e], scope, f(aexpr)
+                ;body.k[branches.e], (scope(newScope)), f, uninvited(ablock)
+                ;++cheat k
+            }
+            ;!doubt (els.e != uninvited) { ;els.e, (scope(newScope)), f, uninvited(ablock) }
+        } anyway !doubt (kind == "suspect") {
+            ;subject.e, scope, f(aexpr)
+            ;wh claim shifty k
+            ;lurk (k < (alibis.e($length))) {
+                ;body.k[alibis.e], (scope(newScope)), f, uninvited(ablock)
+                ;++cheat k
+            }
+            ;!doubt (els.e != uninvited) { ;els.e, (scope(newScope)), f, uninvited(ablock) }
+        }
+    }
+
+    ;scheme (m)analyze {
+        ;m cheat curMod
+        ;m(modId) cheat mod
+        ;uninvited, uninvited(newFn) claim top
+        ;tops, top($push)
+        ;[] claim shifty slot
+        ;wh claim shifty i
+        ;lurk (i <= (chars.m[modules]($length))) {
+            ;slot, uninvited($push)
+            ;++cheat i
+        }
+        ;slots, slot($push)
+        ;slot cheat curSlot
+        ;uninvited(newScope) claim scope
+        ;steals.m[modules] claim steals
+        ;wh claim shifty k
+        ;lurk (k < (steals($length))) {
+            ;scope, name.node.k[steals], "module", uninvited(put)
+            ;++cheat k
+        }
+        ;{ stmts: stmts.program.m[modules], value: uninvited }, scope, top, scope(ablock)
+    }
+
+    // ---- emission ----
+
+    // Starts module m: name.module means the stolen module's name (§13.1).
+    ;scheme (m)enter {
+        ;file.m[modules], chars.m[modules](setSource.diag)
+        ;m cheat curMod
+        ;m(modId) cheat mod
+        ;m[slots] cheat curSlot
+        ;m[tops] cheat cur
+        ;[] cheat stolen
+        ;[] cheat ownLineups
+        ;stmts.program.m[modules] claim list
+        ;wh claim shifty k
+        ;lurk (k < (list($length))) {
+            ;!doubt (k.k[list] == "lineup") { ;ownLineups, k[list]($push) }
+            ;++cheat k
+        }
+        ;steals.m[modules] claim steals
+        ;wh cheat k
+        ;lurk (k < (steals($length))) {
+            ;stolen, { name: name.node.k[steals], lib: lib.k[steals] }($push)
+            ;++cheat k
+        }
+    }
+
+    ;scheme (line)emit { ;out, ("  ", indent(repeat)) + line($push) }
+    ;scheme ()tmp {
+        ;"t{tmps}" claim name
+        ;++cheat tmps
+        name
+    }
+
+    ;scheme (s)str {
+        ;wh claim shifty k
+        ;lurk (k < (strings($length)) && k[strings] != s) { ;++cheat k }
+        ;!doubt (k == (strings($length))) { ;strings, s($push) }
+        "&S{k}"
+    }
+    ;scheme (name)fieldRef {
+        ;!doubt (!(fields, name(contains.text))) { ;fields, name($push) }
+        "&F_{name}"
+    }
+
+    // A lineup is a static array of its members (§4.1).
+    ;scheme (s, m)lineupDef {
+        ;name.s(str) claim nm
+        ;[] claim shifty members
+        ;wh claim shifty k
+        ;lurk (k < (members.s($length))) {
+            ;members, "{{ {nm}, {name.k[members.s](str)} }}"($push)
+            ;++cheat k
+        }
+        ;lineupDefs, "static const wmem l{m}_{name.s}[] = {{ {members, ", "($join)} }};"($push)
+    }
+
+    // The index of the module that x names, or uninvited. The checker forbids shadowing a module name.
+    ;scheme (fickle x)stolenFrom {
+        ;!doubt (k.x != "name") { ;getaway uninvited }
+        ;wh claim shifty k
+        ;lurk (k < (stolen($length))) {
+            ;!doubt (name.k[stolen] == name.x) { ;getaway lib.k[stolen] }
+            ;++cheat k
+        }
+        uninvited
+    }
+
+    // The lineup statement named name in a list of statements, or uninvited.
+    ;scheme (fickle list, name)lineupIn {
+        ;wh claim shifty k
+        ;lurk (k < (list($length))) {
+            ;!doubt (k.k[list] == "lineup" && name.k[list] == name) { ;getaway k[list] }
+            ;++cheat k
+        }
+        uninvited
+    }
+
+    // The C name and statement of the lineup x names (Lineup or Lineup.module), as { c, node }, or uninvited.
+    ;scheme (fickle x)lineupOf {
+        ;!doubt (k.x == "name") {
+            ;ownLineups, name.x(lineupIn) claim s
+            ;getaway s == uninvited ? uninvited : { c: "l{mod}_{name.x}", node: s }
+        }
+        ;!doubt (k.x != "mem") { ;getaway uninvited }
+        ;rec.x(stolenFrom) claim lib
+        ;!doubt (lib == uninvited) { ;getaway uninvited }
+        ;exports.lib[modules] claim xs
+        ;wh claim shifty k
+        ;lurk (k < (xs($length)) && name.k[xs] != field.x) { ;++cheat k }
+        ;!doubt (k == (xs($length)) || kind.k[xs] != "lineup") { ;getaway uninvited }
+        { c: "l{lib(modId)}_{field.x}", node: (stmts.program.lib[modules], field.x(lineupIn)) }
+    }
+
+    // Where binding d lives, seen from the current function.
+    ;scheme (d)place {
+        ;fn.d[decls] claim owner
+        ;!doubt (top.owner[fns]) { ;getaway cname.d[decls] }
+        ;!doubt (owner == cur) { ;getaway captured.d[decls] ? "fr.{cname.d[decls]}" : cname.d[decls] }
+        "up{("->up", (depth.cur[fns] - depth.owner[fns] - wah)(repeat))}->{cname.d[decls]}"
+    }
+    // Does reading d need the temporal dead zone check (§5.1)?
+    ;scheme (d)tdz { kind.d[decls] == "claim" && fn.d[decls] != cur }
+    ;scheme (d)read {
+        d(tdz) ? { c: "rt_def({d(place)}, {name.d[decls](quote.text)})", k: effectK } : { c: d(place), k: pureK }
+    }
+
+    // Arguments evaluated left to right (codegen_c.js call()), as { pre, cs }:
+    // the temporaries to declare first, and the arguments' code. A direct C call
+    // is safe when at most one argument has effects and the others are constants.
+    ;scheme (args)seq {
+        ;wh claim shifty effects
+        ;fake claim shifty anyPure
+        ;wh claim shifty k
+        ;lurk (k < (args($length))) {
+            ;!doubt (k.k[args] == effectK) { ;++cheat effects }
+            ;!doubt (k.k[args] == pureK) { ;real cheat anyPure }
+            ;++cheat k
+        }
+        ;[] claim shifty cs
+        ;!doubt (effects == wh || effects == wah && !anyPure) {
+            ;wh cheat k
+            ;lurk (k < (args($length))) { ;cs, c.k[args]($push) ;++cheat k }
+            ;getaway { pre: "", cs: cs }
+        }
+        ;[] claim shifty pre
+        ;wh cheat k
+        ;lurk (k < (args($length))) {
+            ;!doubt (k.k[args] == constK) {
+                ;cs, c.k[args]($push)
+            } anyway {
+                ;,(tmp) claim temp
+                ;pre, "wv {temp} = {c.k[args]};"($push)
+                ;cs, temp($push)
+            }
+            ;++cheat k
+        }
+        { pre: (pre, " "($join)), cs: cs }
+    }
+    ;scheme (sq, inner)wrap { { c: pre.sq == "" ? inner : "({{ {pre.sq} {inner}; }})", k: effectK } }
+
+    ;scheme (list)stmts {
+        ;wh claim shifty k
+        ;lurk (k < (list($length))) {
+            ;k[list](stmt)
+            ;++cheat k
+        }
+    }
+
+    // A block's captured claims start unset each time it runs, as a fresh scope
+    // would (temporal dead zone, §5.1).
+    ;scheme (fickle b)resets {
+        ;wh claim shifty k
+        ;lurk (k < (stmts.b($length))) {
+            ;k[stmts.b] claim fickle s
+            ;!doubt (k.s == "claim") {
+                ;(namePos.s)[curSlot] claim d
+                ;!doubt (captured.d[decls]) { ;"{d(place)} = RT_UNSET;"(emit) }
+            }
+            ;++cheat k
+        }
+    }
+
+    // A block whose value is discarded.
+    ;scheme (b)blockBody {
+        ;b(resets)
+        ;stmts.b(stmts)
+        ;!doubt (value.b != uninvited) { ;"(void){c.(value.b(expr))};"(emit) }
+    }
+
+    ;scheme (b)valueOf { value.b == uninvited ? "RT_NULL" : c.(value.b(expr)) }
+
+    ;scheme (fickle s)stmt {
+        ;!doubt (handler.s != uninvited) { ;s(whineStmt) ;getaway }
+        ;k.s claim kind
+        ;!doubt (kind == "empty" || kind == "lineup" || kind == "steal" || kind == "bribe") { ;getaway }
+        ;!doubt (kind == "scheme") { ;s(schemeDef) ;getaway }
+        ;!doubt (kind == "getaway") {
+            ;!doubt (iife) { ;pos.s, "'getaway' inside a conditional used as a value is not supported in stage 0"(fail.diag) }
+            ;"RT_RET({e.s == uninvited ? "RT_NULL" : c.(e.s(expr))});"(emit)
+            ;getaway
+        }
+        ;!doubt (kind == "tantrum") { ;"rt_tantrum({c.(e.s(expr))});"(emit) ;getaway }
+        ;!doubt (kind == "bail" || kind == "loiter") {
+            ;!doubt (loops == wh) { ;pos.s, "'{kind}' cannot leave a conditional used as a value in stage 0"(fail.diag) }
+            ;(kind == "bail" ? "break;" : "continue;")(emit)
+            ;getaway
+        }
+        ;!doubt (kind == "lurk") {
+            ;"while ({neg.s ? "!" : ""}rt_cond({c.(cond.s(expr))})) {{"(emit)
+            ;++cheat indent
+            ;++cheat loops
+            ;body.s(blockBody)
+            ;--cheat loops
+            ;--cheat indent
+            ;"}}"(emit)
+            ;getaway
+        }
+        ;!doubt (kind == "signal") { ;"rt_i({code.s})"(signal) ;getaway }
+        ;!doubt (kind == "exit") { ;"rt_exit({e.s == uninvited ? "rt_i(0)" : c.(e.s(expr))});"(emit) ;getaway }
+        ;!doubt (kind == "expr") {
+            ;!doubt (k.e.s == "chain") { ;e.s(chainStmt) ;getaway }
+            ;!doubt (k.e.s == "suspect") { ;e.s(suspectStmt) ;getaway }
+            ;!doubt (k.e.s == "sigcall") { ;c.(arg.e.s(expr))(signal) ;getaway }
+            ;"(void){c.(e.s(expr))};"(emit)
+            ;getaway
+        }
+        ;!doubt (kind == "claim") { ;(namePos.s)[curSlot], (e.s, (s(modeOf))(bindRhs))(claimDecl) ;getaway }
+        ;!doubt (kind == "cheat") { ;s(cheatStmt) ;getaway }
+        ;tantrum "codegen: unhandled statement {kind}"
+    }
+
+    // A signal leaves the scheme at once; the caller sees the code (§8.2).
+    ;scheme (code)signal {
+        ;"rt_signal({code});"(emit)
+        ;"RT_RET(RT_NULL);"(emit)
+    }
+
+    // Sets binding d for the first time: a new C local, or its frame slot or global.
+    ;scheme (d, value)claimDecl {
+        ;fn.d[decls] claim owner
+        ;!doubt (!(top.owner[fns]) && owner == cur && !(captured.d[decls])) {
+            ;"wv {cname.d[decls]} = {value};"(emit)
+        } anyway {
+            ;"{d(place)} = {value};"(emit)
+        }
+    }
+
+    ;scheme (s)schemeDef {
+        ;(namePos.s)[curSlot] claim d
+        ;schemeFn.d[decls] claim f
+        ;parent.f[fns] claim pf
+        ;!(top.pf[fns]) claim hasUp
+        ;[] claim shifty params
+        ;!doubt (hasUp) { ;params, "struct fr{pf} *up"($push) }
+        ;wh claim shifty k
+        ;lurk (k < (params.s($length))) {
+            ;(pos.k[params.s])[curSlot] claim pd
+            ;params, "wv {captured.pd[decls] ? "p_" : ""}{cname.pd[decls]}"($push)
+            ;++cheat k
+        }
+        ;"static wv {cname.f[fns]}({(params($length)) == wh ? "void" : (params, ", "($join))})" claim proto
+        ;{ proto: proto, lines: [] } claim shifty entry
+        ;functions, entry($push)
+        ;!doubt (f(hasFrame)) { ;frames, f($push) }
+        ;out($length) claim start
+        ;indent claim savedIndent
+        ;loops claim savedLoops
+        ;iife claim savedIife
+        ;cur claim savedCur
+        ;wah cheat indent
+        ;wh cheat loops
+        ;fake cheat iife
+        ;f cheat cur
+        ;"rt_enter({name.s(quote.text)});"(emit)
+        ;!doubt (f(hasFrame)) { ;"struct fr{f} fr = {{ {hasUp ? ".up = up" : "0"} }};"(emit) }
+        ;wh cheat k
+        ;lurk (k < (params.s($length))) {
+            ;k[params.s] claim p
+            ;(pos.p)[curSlot] claim pd
+            ;cname.pd[decls] claim cn
+            // A fickle parameter takes the argument as it is (§6.1).
+            ;captured.pd[decls] ? "p_{cn}" : cn claim arg
+            ;isFickle.p ? arg : "rt_bind({arg}, {isShifty.p ? wah : wh})" claim v
+            ;!doubt (captured.pd[decls]) { ;"fr.{cn} = {v};"(emit) } anyway !doubt (!isFickle.p) { ;"{cn} = {v};"(emit) }
+            ;++cheat k
+        }
+        ;stmts.body.s(stmts)
+        ;"RT_RET({body.s(valueOf)});"(emit)
+        ;out, start, (out($length))($slice) cheat lines.entry
+        ;lurk ((out($length)) > start) { ;out($pop) }
+        ;savedIndent cheat indent
+        ;savedLoops cheat loops
+        ;savedIife cheat iife
+        ;savedCur cheat cur
+    }
+
+    // The value bound by claim/cheat, applying the copy table (§10.4, §10.9).
+    // mode: the column of the copy table, "const", "shifty" or "fickle". A
+    // literal is frozen unless bound shifty; fickle keeps any other value as it is.
+    ;scheme (e, mode)bindRhs {
+        ;mode == "shifty" claim mutable
+        ;!doubt (k.e == "arr") { ;getaway c.(e, mutable(array)) }
+        ;!doubt (k.e == "rec") { ;getaway c.(e, mutable(record)) }
+        ;!doubt ((scalarKinds, k.e(contains.text)) || mode == "fickle") { ;getaway c.(e(expr)) }
+        "rt_bind({c.(e(expr))}, {mutable ? wah : wh})"
+    }
+
+    ;scheme (s)cheatStmt {
+        ;target.s claim t
+        ;!doubt (k.t == "name") {
+            ;(pos.t)[curSlot] claim d
+            ;d(place) claim at
+            ;!doubt (op.s == uninvited) {
+                ;e.s, (isFickle.d[decls] ? "fickle" : "shifty")(bindRhs) claim v
+                ;!doubt (!(d(tdz))) { ;"{at} = {v};"(emit) ;getaway }
+                // The value is evaluated first; then the binding must exist (§5.1).
+                ;,(tmp) claim temp
+                ;"wv {temp} = {v};"(emit)
+                ;"(void)rt_def({at}, {name.d[decls](quote.text)});"(emit)
+                ;"{at} = {temp};"(emit)
+                ;getaway
+            }
+            // The value is evaluated before the target is read (source order).
+            ;e.s(expr) claim shifty v
+            ;!doubt (k.e.s != "int" && k.e.s != "name") {
+                ;,(tmp) claim temp
+                ;"wv {temp} = {c.v};"(emit)
+                ;{ c: temp, k: constK } cheat v
+            }
+            ;[(d(read)), v](seq) claim sq
+            ;"{at} = {c.(sq, "rt_{op.s(binFn)}({wh[cs.sq]}, {wah[cs.sq]})"(wrap))};"(emit)
+            ;getaway
+        }
+        ;uninvited claim shifty key
+        ;!doubt (k.t == "mem") { ;{ c: field.t(fieldRef), k: constK } cheat key }
+        ;e.s(expr) claim v
+        ;(k.t == "mem" ? key : (index.t(expr))) claim i
+        ;(k.t == "mem" ? rec.t : arr.t)(expr) claim box
+        ;[v, i, box](seq) claim sq
+        ;k.t == "mem" ? "mem" : "idx" claim which
+        ;!doubt (op.s == uninvited) {
+            ;"{c.(sq, "rt_set_{which}({cs.sq, ", "($join)})"(wrap))};"(emit)
+            ;getaway
+        }
+        ;"{c.(sq, "rt_upd_{which}({cs.sq, ", "($join)}, rt_{op.s(binFn)})"(wrap))};"(emit)
+    }
+
+    ;scheme (list)exprs {
+        ;[] claim shifty xs
+        ;wh claim shifty k
+        ;lurk (k < (list($length))) {
+            ;xs, (k[list](expr))($push)
+            ;++cheat k
+        }
+        xs
+    }
+
+    ;scheme (e, mutable)array {
+        ;items.e(exprs)(seq) claim sq
+        sq, "rt_arr({cs.sq($length)}, {cs.sq(values)}, {mutable ? wah : wh})"(wrap)
+    }
+
+    // Records of one literal share their keys: a static shape K<n>.
+    ;scheme (e, mutable)record {
+        ;"NULL" claim shifty shape
+        ;!doubt ((fields.e($length)) > wh) {
+            ;[] claim shifty names
+            ;wh claim shifty k
+            ;lurk (k < (fields.e($length))) {
+                ;names, name.k[fields.e]($push)
+                ;++cheat k
+            }
+            ;names, ","($join) claim key
+            ;wh cheat k
+            ;lurk (k < (names($length))) {
+                ;k[names](fieldRef)
+                ;++cheat k
+            }
+            ;wh cheat k
+            ;lurk (k < (shapes($length)) && k[shapes] != key) { ;++cheat k }
+            ;!doubt (k == (shapes($length))) { ;shapes, key($push) }
+            ;"K{k}" cheat shape
+        }
+        ;[] claim shifty vals
+        ;wh claim shifty k
+        ;lurk (k < (fields.e($length))) {
+            ;vals, (e.k[fields.e](expr))($push)
+            ;++cheat k
+        }
+        ;vals(seq) claim sq
+        sq, "rt_rec({mutable ? wah : wh}, {cs.sq($length)}, {shape}, {cs.sq(values)})"(wrap)
+    }
+
+    // `whine` catches a signal from the statement's outermost call only, so the
+    // call's arguments are evaluated before it.
+    ;scheme (s)whineStmt {
+        ;e.s claim call
+        ;[] claim shifty args
+        ;wh claim shifty k
+        ;lurk (k < (args.call($length))) {
+            ;k[args.call] claim a
+            ;!doubt (plainKinds, k.a(contains.text)) {
+                ;args, c.(a(expr))($push)
+            } anyway {
+                ;,(tmp) claim temp
+                ;"wv {temp} = {c.(a(expr))};"(emit)
+                ;args, temp($push)
+            }
+            ;++cheat k
+        }
+        ;,(tmp) claim r
+        ;"wv {r} = {(callee.call, args, fake(callC))};"(emit)
+        ;"if (rt_sigcode) {{"(emit)
+        ;++cheat indent
+        ;handler.s claim h
+        ;!doubt (param.h != uninvited) { ;(paramPos.h)[curSlot], "rt_i(rt_sigcode)"(claimDecl) }
+        ;"rt_sigcode = 0;"(emit)
+        ;"{{"(emit)
+        ;++cheat indent
+        ;body.h(resets)
+        ;stmts.body.h(stmts)
+        ;"{r} = {body.h(valueOf)};"(emit)
+        ;--cheat indent
+        ;"}}"(emit)
+        ;--cheat indent
+        ;"}}"(emit)
+        ;s claim shifty rest
+        ;uninvited cheat handler.rest
+        ;{ k: "raw", js: r, pos: pos.s, paren: fake } cheat e.rest
+        ;rest(stmt)
+    }
+
+    ;scheme (e)chainStmt {
+        ;wh claim shifty k
+        ;lurk (k < (branches.e($length))) {
+            ;k[branches.e] claim b
+            ;"{k > wh ? "}} else " : ""}if ({b(test)}) {{"(emit)
+            ;++cheat indent
+            ;body.b(blockBody)
+            ;--cheat indent
+            ;++cheat k
+        }
+        ;!doubt (els.e != uninvited) {
+            ;"}} else {{"(emit)
+            ;++cheat indent
+            ;els.e(blockBody)
+            ;--cheat indent
+        }
+        ;"}}"(emit)
+    }
+
+    ;scheme (b)test { "{neg.b ? "!" : ""}rt_cond({c.(cond.b(expr))})" }
+
+    // Branches used as values, shared by conditional chains and suspects. For a
+    // chain, branch i is its i-th branch; for a suspect, its i-th alibi, tested
+    // against the temporary t that holds the subject.
+    ;scheme (e)branchCount { k.e == "chain" ? (branches.e($length)) : (alibis.e($length)) }
+    ;scheme (e, i)branchBody { k.e == "chain" ? body.i[branches.e] : body.i[alibis.e] }
+    ;scheme (e, t, i)branchTest { k.e == "chain" ? (i[branches.e](test)) : (t, i[alibis.e](alibiTest)) }
+
+    // Is every block, the anyway included, just a value?
+    ;scheme (e)isPlain {
+        ;wh claim shifty k
+        ;lurk (k <= (e(branchCount))) {
+            ;k < (e(branchCount)) ? (e, k(branchBody)) : els.e claim b
+            ;wh claim shifty j
+            ;lurk (j < (stmts.b($length))) {
+                ;!doubt (k.j[stmts.b] != "empty") { ;getaway fake }
+                ;++cheat j
+            }
+            ;++cheat k
+        }
+        real
+    }
+
+    // A ternary chain over the branches, ending in the anyway block's value.
+    ;scheme (e, t)ternaryChain {
+        ;els.e(valueOf) claim shifty code
+        ;(e(branchCount)) - wah claim shifty k
+        ;lurk (k >= wh) {
+            ;"({(e, t, k(branchTest))} ? {(e, k(branchBody))(valueOf)} : {code})" cheat code
+            ;--cheat k
+        }
+        code
+    }
+
+    // A statement expression ({ ... }) that runs the first block whose test
+    // holds and has its value. subject, if not uninvited, is the code that sets
+    // the temporary t first. Its lines are emitted into out, then taken back off.
+    ;scheme (e, t, subject)branchValue {
+        ;out($length) claim start
+        ;indent claim savedIndent
+        ;loops claim savedLoops
+        ;iife claim savedIife
+        ;savedIndent + wah cheat indent
+        ;wh cheat loops
+        ;real cheat iife
+        ;!doubt (subject != uninvited) { ;"wv {t} = {subject};"(emit) }
+        ;,(tmp) claim r
+        ;"wv {r};"(emit)
+        ;wh claim shifty k
+        ;lurk (k < (e(branchCount))) {
+            ;e, k(branchBody) claim b
+            ;"{k > wh ? "}} else " : ""}if ({(e, t, k(branchTest))}) {{"(emit)
+            ;++cheat indent
+            ;b(resets)
+            ;stmts.b(stmts)
+            ;"{r} = {b(valueOf)};"(emit)
+            ;--cheat indent
+            ;++cheat k
+        }
+        ;"}} else {{"(emit)
+        ;++cheat indent
+        ;els.e(resets)
+        ;stmts.els.e(stmts)
+        ;"{r} = {els.e(valueOf)};"(emit)
+        ;--cheat indent
+        ;"}}"(emit)
+        ;"{r};"(emit)
+        ;(out, start, (out($length))($slice)), "\n"($join) claim body
+        ;lurk ((out($length)) > start) { ;out($pop) }
+        ;savedIndent cheat indent
+        ;savedLoops cheat loops
+        ;savedIife cheat iife
+        "({{\n{body}\n{("  ", indent(repeat))}}})"
+    }
+
+    // A conditional used as a value: a ternary chain when every branch is just a
+    // value, otherwise a statement expression.
+    ;scheme (e)chainExpr {
+        ;!doubt (e(isPlain)) { ;getaway e, uninvited(ternaryChain) }
+        e, uninvited, uninvited(branchValue)
+    }
+
+    // suspect (§7.5): the subject is evaluated once into a temporary, then
+    // compared with each alibi value by ==.
+    ;scheme (t, a)alibiTest {
+        ;[] claim shifty tests
+        ;wh claim shifty k
+        ;lurk (k < (values.a($length))) {
+            ;tests, "eq({t}, {c.(k[values.a](expr))})"($push)
+            ;++cheat k
+        }
+        tests, " || "($join)
+    }
+
+    // The anyway block, or for an exhaustive lineup suspect (which has none), a
+    // block that raises a tantrum for a subject that is not one of the members.
+    ;scheme (e, t)suspectElse {
+        ;!doubt (els.e != uninvited || k.wh[values.wh[alibis.e]] != "mem") { ;getaway els.e }
+        { stmts: [], value: { k: "raw", js: "(rt_no_alibi({t}), RT_NULL)", pos: uninvited, paren: fake }, close: uninvited }
+    }
+
+    ;scheme (e)suspectStmt {
+        ;,(tmp) claim t
+        ;"wv {t} = {c.(subject.e(expr))};"(emit)
+        ;wh claim shifty k
+        ;lurk (k < (alibis.e($length))) {
+            ;"{k > wh ? "}} else " : ""}if ({(t, k[alibis.e](alibiTest))}) {{"(emit)
+            ;++cheat indent
+            ;body.k[alibis.e](blockBody)
+            ;--cheat indent
+            ;++cheat k
+        }
+        ;e, t(suspectElse) claim els
+        ;!doubt (els != uninvited) {
+            ;"}} else {{"(emit)
+            ;++cheat indent
+            ;els(blockBody)
+            ;--cheat indent
+        }
+        ;"}}"(emit)
+    }
+
+    // A suspect used as a value: a statement expression that sets the subject,
+    // then a ternary chain when every block is just a value.
+    ;scheme (e)suspectExpr {
+        ;,(tmp) claim t
+        ;c.(subject.e(expr)) claim subject
+        ;e claim shifty withElse
+        ;e, t(suspectElse) cheat els.withElse
+        ;!doubt (withElse(isPlain)) { ;getaway "({{ wv {t} = {subject}; {(withElse, t(ternaryChain))}; }})" }
+        withElse, t, subject(branchValue)
+    }
+
+    // A call; checked: a signal it leaves pending becomes a tantrum here (§8.2).
+    ;scheme (callee, fickle args, checked)callC {
+        ;"" claim shifty code
+        ;!doubt (k.callee == "std") {
+            ;"std_{name.callee}({args, ", "($join)})" cheat code
+            ;!doubt (!(signalers, name.callee(contains.text))) { ;getaway code }
+        } anyway {
+            ;"" claim shifty f
+            ;uninvited claim shifty parent
+            ;!doubt (k.callee == "mem") {
+                ;"w{(rec.callee(stolenFrom))(modId)}_{field.callee}" cheat f
+            } anyway {
+                ;(pos.callee)[curSlot] claim d
+                ;schemeFn.d[decls] claim sf
+                ;cname.sf[fns] cheat f
+                ;parent.sf[fns] claim pf
+                ;!doubt (!(top.pf[fns])) { ;pf cheat parent }
+            }
+            // A nested scheme gets its parent's frame: ours, or one up the chain.
+            ;[] claim shifty all
+            ;!doubt (parent != uninvited) {
+                ;all, (parent == cur ? "&fr" : "up{("->up", (depth.cur[fns] - depth.parent[fns] - wah)(repeat))}")($push)
+            }
+            ;wh claim shifty k
+            ;lurk (k < (args($length))) { ;all, k[args]($push) ;++cheat k }
+            ;"{f}({all, ", "($join)})" cheat code
+        }
+        checked ? "rt_chk({code}, {top.cur[fns] ? "NULL" : (name.cur[fns](quote.text))})" : code
+    }
+
+    ;scheme (fickle e)expr {
+        ;k.e claim kind
+        ;!doubt (kind == "int") { ;getaway { c: "rt_i({v.e})", k: constK } }
+        ;!doubt (kind == "float") { ;getaway { c: "rt_f({v.e})", k: constK } }
+        ;!doubt (kind == "str") {
+            ;[] claim shifty parts
+            ;wh claim shifty k
+            ;lurk (k < (parts.e($length))) {
+                ;k[parts.e] claim part
+                ;!doubt ((part($typeOf)) == "purple") {
+                    ;!doubt (part != "") { ;parts, { c: "rt_s({part(str)})", k: constK }($push) }
+                } anyway {
+                    ;parts, { c: "rt_text({c.(part(expr))})", k: effectK }($push)
+                }
+                ;++cheat k
+            }
+            ;!doubt ((parts($length)) == wh) { ;getaway { c: "rt_s({""(str)})", k: constK } }
+            ;!doubt ((parts($length)) == wah && k.wh[parts] == constK) { ;getaway wh[parts] }
+            ;parts(seq) claim sq
+            ;getaway sq, "rt_cat({cs.sq($length)}, {cs.sq(values)})"(wrap)
+        }
+        ;!doubt (kind == "bool") { ;getaway { c: "rt_b({v.e ? wah : wh})", k: constK } }
+        ;!doubt (kind == "null") { ;getaway { c: "RT_NULL", k: constK } }
+        ;!doubt (kind == "nan") { ;getaway { c: "RT_NOBODY", k: constK } }
+        ;!doubt (kind == "inf") { ;getaway { c: "RT_EVERYBODY", k: constK } }
+        ;!doubt (kind == "name") { ;getaway (pos.e)[curSlot](read) }
+        ;!doubt (kind == "std") { ;getaway { c: "std_{name.e}()", k: constK } }
+        ;!doubt (kind == "arr") { ;getaway e, fake(array) }
+        ;!doubt (kind == "rec") { ;getaway e, fake(record) }
+        ;!doubt (kind == "idx") {
+            ;[(index.e(expr)), (arr.e(expr))](seq) claim sq
+            ;getaway sq, "rt_idx({wh[cs.sq]}, {wah[cs.sq]})"(wrap)
+        }
+        ;!doubt (kind == "mem") {
+            // A lineup member, a claim stolen from a module, or a record field. The
+            // checker forbids shadowing lineup and module names, so these are exact.
+            ;rec.e(lineupOf) claim lin
+            ;!doubt (lin != uninvited) {
+                ;members.node.lin claim ms
+                ;wh claim shifty k
+                ;lurk (name.k[ms] != field.e) { ;++cheat k }
+                ;getaway { c: "rt_m(&{c.lin}[{k}])", k: constK }
+            }
+            ;rec.e(stolenFrom) claim lib
+            ;!doubt (lib != uninvited) { ;getaway { c: "w{lib(modId)}_{field.e}", k: pureK } }
+            ;{ c: field.e(fieldRef), k: constK } claim key
+            ;[key, (rec.e(expr))](seq) claim sq
+            ;getaway sq, "rt_get({wh[cs.sq]}, {wah[cs.sq]})"(wrap)
+        }
+        ;!doubt (kind == "un") { ;getaway { c: "rt_{op.e(unFn)}({c.(e.e(expr))})", k: effectK } }
+        ;!doubt (kind == "bin") {
+            ;!doubt (op.e == "&&" || op.e == "||") {
+                ;getaway { c: "rt_b(rt_bool({c.(l.e(expr))}, \"{op.e}\") {op.e} rt_bool({c.(r.e(expr))}, \"{op.e}\"))", k: effectK }
+            }
+            ;[(l.e(expr)), (r.e(expr))](seq) claim sq
+            ;getaway sq, "rt_{op.e(binFn)}({wh[cs.sq]}, {wah[cs.sq]})"(wrap)
+        }
+        ;!doubt (kind == "tern") {
+            ;getaway { c: "(rt_cond({c.(c.e(expr))}) ? {c.(a.e(expr))} : {c.(b.e(expr))})", k: effectK }
+        }
+        ;!doubt (kind == "call") {
+            ;args.e(exprs)(seq) claim sq
+            ;getaway sq, (callee.e, cs.sq, real(callC))(wrap)
+        }
+        ;!doubt (kind == "chain") { ;getaway { c: e(chainExpr), k: effectK } }
+        ;!doubt (kind == "suspect") { ;getaway { c: e(suspectExpr), k: effectK } }
+        ;!doubt (kind == "raw") { ;getaway { c: js.e, k: constK } }
+        ;tantrum "codegen: unhandled expression {kind}"
+    }
+
+    // The whole program: the runtime, then static data, then the functions.
+    ;scheme ()assemble {
+        // The runtime gets LF line endings however it is checked out, so the output is the same everywhere.
+        ;[((runtime, "\r\n"($split)), "\n"($join)), "// ---- program ----", ""] claim shifty all
+        ;wh claim shifty k
+        ;lurk (k < (strings($length))) { ;all, "static const wstr S{k} = {k[strings](wstrInit)};"($push) ;++cheat k }
+        ;wh cheat k
+        ;lurk (k < (fields($length))) { ;all, "static wstr F_{k[fields]} = {k[fields](wstrInit)};"($push) ;++cheat k }
+        ;wh cheat k
+        ;lurk (k < (shapes($length))) {
+            ;k[shapes], ","($split) claim names
+            ;[] claim shifty refs
+            ;wh claim shifty j
+            ;lurk (j < (names($length))) { ;refs, "&F_{j[names]}"($push) ;++cheat j }
+            ;all, "static const wstr *const K{k}[] = {{ {refs, ", "($join)} }};"($push)
+            ;++cheat k
+        }
+        ;wh cheat k
+        ;lurk (k < (lineupDefs($length))) { ;all, k[lineupDefs]($push) ;++cheat k }
+        ;wh cheat k
+        ;lurk (k < (frames($length))) {
+            ;k[frames] claim f
+            ;[] claim shifty members
+            ;parent.f[fns] claim pf
+            ;!doubt (!(top.pf[fns])) { ;members, "struct fr{pf} *up;"($push) }
+            ;wh claim shifty j
+            ;lurk (j < (decls($length))) {
+                ;!doubt (fn.j[decls] == f && captured.j[decls] && kind.j[decls] != "scheme") {
+                    ;members, "wv {cname.j[decls]};"($push)
+                }
+                ;++cheat j
+            }
+            ;!doubt ((members($length)) == wh) { ;members, "char none;"($push) }
+            ;all, "struct fr{f} {{ {members, " "($join)} }};"($push)
+            ;++cheat k
+        }
+        ;wh cheat k
+        ;lurk (k < (globals($length))) { ;all, "static wv {k[globals]};"($push) ;++cheat k }
+        ;wh cheat k
+        ;lurk (k < (functions($length))) { ;all, "{proto.k[functions]};"($push) ;++cheat k }
+        ;wh cheat k
+        ;lurk (k < (functions($length))) {
+            ;all, ""($push)
+            ;all, "{proto.k[functions]} {{"($push)
+            ;lines.k[functions] claim lines
+            ;wh claim shifty j
+            ;lurk (j < (lines($length))) { ;all, j[lines]($push) ;++cheat j }
+            ;all, "}}"($push)
+            ;++cheat k
+        }
+        ;all, ""($push)
+        ;all, "static void wah_main(void) {{"($push)
+        ;!doubt ((fields($length)) > wh) {
+            ;[] claim shifty refs
+            ;wh cheat k
+            ;lurk (k < (fields($length))) { ;refs, "&F_{k[fields]}"($push) ;++cheat k }
+            ;all, "  rt_syms({fields($length)}, (wstr *const[]){{ {refs, ", "($join)} }});"($push)
+        }
+        ;wh cheat k
+        ;lurk (k < (out($length))) { ;all, k[out]($push) ;++cheat k }
+        ;all, "}}"($push)
+        ;all, ""($push)
+        all, "\n"($join)
+    }
+
+    ;wh claim shifty mi
+    ;lurk (mi < (modules($length))) {
+        ;mi(analyze)
+        ;++cheat mi
+    }
+    ;wh cheat mi
+    ;lurk (mi < (modules($length))) {
+        ;stmts.program.mi[modules] claim list
+        ;wh claim shifty li
+        ;lurk (li < (list($length))) {
+            ;!doubt (k.li[list] == "lineup") { ;li[list], (mi(modId))(lineupDef) }
+            ;++cheat li
+        }
+        ;++cheat mi
+    }
+    ;wh cheat mi
+    ;lurk (mi < (modules($length))) {
+        ;mi(enter)
+        ;stmts.program.mi[modules](stmts)
+        ;++cheat mi
+    }
+    ,(assemble)
+}
+
+;generateC bribe

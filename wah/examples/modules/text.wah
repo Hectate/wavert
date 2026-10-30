@@ -1,0 +1,10 @@
+// A library of text helpers (spec §13.1), stolen by both modules.wah and
+// shapes.wah. It is loaded and initialized once, however many files steal it.
+
+;"text.wah: initialized"($print) claim ready
+
+;scheme (word, n)plural { n == wah ? word : "{word}s" }
+
+;scheme (n, word)count { "{n} {word, n(plural)}" }
+
+;plural, count bribe

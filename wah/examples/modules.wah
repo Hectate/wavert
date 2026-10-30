@@ -1,0 +1,32 @@
+// Modules: steal and bribe (spec §13.1).
+//
+// The entry file steals libraries, giving each a module name. A library
+// bribes (exports) some of its names, which the stealing file writes as
+// name.module: shapes' describe is describe.shapes. Nothing else enters the
+// file, so libraries never clash with each other or with this file's names.
+//
+// Libraries run first, depth first in steal order, each once; the entry
+// file's body runs last. Paths are relative to the file that steals.
+//
+// Usage: wahc0 run examples/modules.wah
+
+;"modules/shapes.wah" steal shapes
+// Stealing is not transitive: shapes.wah steals text.wah, but this file must
+// steal it too to use count.
+;"modules/text.wah" steal text
+
+;"modules.wah: running"($print)
+
+// A stolen lineup's members are member.Lineup.module; a stolen scheme is
+// called as (name.module).
+;[circle.Shape.shapes, triangle.Shape.shapes, square.Shape.shapes] claim all
+;wh claim shifty total
+;wh claim shifty i
+;lurk (i < (all($length))) {
+    ;i[all](describe.shapes)($print)
+    ;total + (i[all](corners.shapes)) cheat total
+    ;++cheat i
+}
+;total, "corner"(count.text) claim summary
+;"{summary} in all"($print)
+;!invited

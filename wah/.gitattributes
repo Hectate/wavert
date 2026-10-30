@@ -1,0 +1,5 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# The bootstrap seed is generated with LF line endings; keep its exact bytes.
+wahc/wahc.c text eol=lf

@@ -1,0 +1,185 @@
+// wahc: the Γ-- compiler, written in Γ-- (bootstrap stage 1, spec §15).
+//
+// It ports wahc0 (js/src) phase by phase, keeping the same diagnostics, so the
+// two compilers can be checked against each other. Every phase is ported, each
+// in its own module (§13.1): lexer.wah, parser.wah, checker.wah, codegen.wah
+// (JavaScript) and codegen_c.wah (C), with loader.wah for the modules of the
+// program being compiled. This file is the command line.
+//
+// Usage: wahc0 run wahc/wahc.wah <file.wah> [--target js|c] [-o <out>] [--runtime <runtime>]
+//        wahc0 run wahc/wahc.wah (--tokens | --ast) <file.wah>
+
+;"text.wah" steal txt
+;"diag.wah" steal diag
+;"lexer.wah" steal lexer
+;"parser.wah" steal parser
+;"checker.wah" steal checker
+;"codegen.wah" steal codegen
+;"codegen_c.wah" steal codegenC
+;"dump.wah" steal dump
+;"loader.wah" steal loader
+
+// ---- Command line ----
+
+;"usage:\n" +
+    "  wahc0 run wahc/wahc.wah <file.wah> [-o <out.js>] [--runtime <runtime.js>]\n" +
+    "  wahc0 run wahc/wahc.wah <file.wah> --target c [-o <out.c>] [--runtime <wah.c>]\n" +
+    "  wahc0 run wahc/wahc.wah build <file.wah> [-o <program>] [--cc <compiler>] [--runtime <wah.c>]\n" +
+    "  wahc0 run wahc/wahc.wah --tokens <file.wah>\n" +
+    "  wahc0 run wahc/wahc.wah --ast <file.wah>" claim usage
+
+;scheme ()die {
+    ;usage($eprint)
+    ;waah !invited
+}
+
+// Reads file into srcFile and srcChars, dropping a byte-order mark.
+;scheme (file)load {
+    ;file($readFile) claim text
+        whine { ;"wahc: cannot read {file}"($eprint) ;waah !invited }
+    ;text, ""($split) claim chars
+    ;(chars($length)) > wh && wh[chars] == "\u{FEFF}" ? wah : wh claim bom
+    ;file, (chars, bom, (chars($length))($slice))(setSource.diag)
+}
+
+;$args claim argv
+;"" claim shifty mode
+;"" claim shifty input
+;"" claim shifty output
+// The target, the runtime path and the C compiler, "" until given.
+;"" claim shifty target
+;"" claim shifty runtimePath
+;"" claim shifty cc
+;wh claim shifty arg
+;lurk (arg < (argv($length))) {
+    ;arg[argv] claim a
+    ;!doubt (arg == wh && a == "build") {
+        ;a cheat mode
+    } anyway !doubt (a == "--tokens" || a == "--ast") {
+        ;a cheat mode
+    } anyway !doubt (a == "-o" || a == "--runtime" || a == "--target" || a == "--cc") {
+        ;++cheat arg
+        ;!doubt (arg >= (argv($length))) { ;,(die) }
+        ;!doubt (a == "-o") {
+            ;arg[argv] cheat output
+        } anyway !doubt (a == "--runtime") {
+            ;arg[argv] cheat runtimePath
+        } anyway !doubt (a == "--cc") {
+            ;arg[argv] cheat cc
+        } anyway !doubt (arg[argv] == "js" || arg[argv] == "c") {
+            ;arg[argv] cheat target
+        } anyway {
+            ;,(die)
+        }
+    } anyway !doubt (input != "" || (a($length)) > wh && (a, wh($at)) == "-") {
+        ;,(die)
+    } anyway {
+        ;a cheat input
+    }
+    ;++cheat arg
+}
+;mode == "--tokens" || mode == "--ast" claim inspect
+;!doubt (input == "" || inspect && (output != "" || runtimePath != "" || target != "")
+    || mode == "build" && target != "" || mode != "build" && cc != "") { ;,(die) }
+
+;scheme ()onWindows {
+    ;"OS"($env) claim os
+        whine { "" }
+    os == "Windows_NT"
+}
+;(input($length)) >= waaaah && (input, WAAAAH, (input($length))($slice)) == ".wah" claim dotWah
+;!doubt (mode == "build") {
+    ;"c" cheat target
+    ;!doubt (cc == "") { ;"ZIG"($env) cheat cc whine { "zig" } }
+    // The program: the input without .wah, as an .exe on Windows.
+    ;!doubt (output == "" && !dotWah) {
+        ;"wahc: {input} does not end with .wah, so name the program with -o"($eprint)
+        ;waah !invited
+    }
+    ;!doubt (output == "") { ;(input, wh, WAAAAH($slice)) + (,(onWindows) ? ".exe" : "") cheat output }
+}
+;!doubt (target == "") { ;"js" cheat target }
+;runtimePath != "" claim runtimeGiven
+;!doubt (!runtimeGiven) { ;(target == "c" ? "runtime/wah.c" : "js/src/runtime.js") cheat runtimePath }
+
+// The text of path, or uninvited if it cannot be read.
+;scheme (path)tryRead {
+    ;path($readFile) claim text
+        whine { uninvited }
+    text
+}
+
+// The directory of $programPath, with a trailing separator.
+;scheme ()programDir {
+    ;$programPath, ""($split) claim cs
+    ;(cs($length)) - wah claim shifty k
+    ;lurk (k >= wh && k[cs] != "/" && k[cs] != "\\") { ;--cheat k }
+    cs, wh, k + wah($slice), ""($join)
+}
+
+// The runtime: the one given, else the default path from the current
+// directory, then from where wahc is, so a native wahc runs from anywhere: in
+// the repository's root, or one level down (wahc/wahc.exe).
+;scheme ()readRuntime {
+    ;runtimePath(tryRead) claim text
+    ;!doubt (text != uninvited || runtimeGiven) { ;getaway text }
+    ;,(programDir) claim dir
+    ;dir + runtimePath(tryRead) claim here
+    here != uninvited ? here : (dir + "../" + runtimePath(tryRead))
+}
+
+;input(load)
+// --tokens and --ast show the input file alone, without the libraries it steals.
+;!doubt (mode == "--tokens") {
+    ;srcChars.diag(lex.lexer) claim tokens
+    ;,(flushWarnings.diag)
+    ;tokens, ""(dumpTokens.dump)
+    ;!invited
+}
+;!doubt (mode == "--ast") {
+    ;srcChars.diag(lex.lexer)(parse.parser) claim program
+    ;,(flushWarnings.diag)
+    ;program, ""(dumpValue.dump)($print)
+    ;!invited
+}
+;srcFile.diag, srcChars.diag(loadProgram.loader) claim modules
+;modules, real(check.checker) claim problems
+;!doubt ((problems($length)) > wh) {
+    ;,(flushWarnings.diag)
+    ;wh claim shifty p
+    ;lurk (p < (problems($length))) {
+        ;p[problems](formatDiag.diag)($eprint)
+        ;++cheat p
+    }
+    ;waah !invited
+}
+;,(readRuntime) claim runtime
+;!doubt (runtime == uninvited) {
+    ;"wahc: cannot read {runtimePath}"($eprint)
+    ;waah !invited
+}
+;target == "c" ? (modules, runtime(generateC.codegenC)) : (modules, runtime(generate.codegen)) claim code
+;,(flushWarnings.diag)
+;!doubt (mode != "build") {
+    ;!doubt (output == "") { ;(dotWah ? (input, wh, WAAAAH($slice)) : input) + ".{target}" cheat output }
+    ;output, code($writeFile)
+        whine { ;"wahc: cannot write {output}"($eprint) ;waah !invited }
+    ;!invited
+}
+
+// build: the C goes beside the program, then a C compiler builds it. Zig is
+// called as `zig cc`; any other compiler gets the flags directly.
+;(output($length)) >= waaaah && ((output, WAAAAH, (output($length))($slice))(toLower.txt)) == ".exe" claim dotExe
+;(dotExe ? (output, wh, WAAAAH($slice)) : output) + ".c" claim cFile
+;cFile, code($writeFile)
+    whine { ;"wahc: cannot write {cFile}"($eprint) ;waah !invited }
+;(cc, "\\"($split)), "/"($join), "/"($split) claim parts
+;WAH[parts](toLower.txt) claim ccName
+;["-O2", "-o", output, cFile] claim flags
+;cc, (ccName == "zig" || ccName == "zig.exe" ? ["cc", "-O2", "-o", output, cFile] : flags)($run) claim status
+    whine { ;"wahc: cannot run {cc}: install Zig (https://ziglang.org), or name a C compiler with --cc"($eprint) ;waah !invited }
+;!doubt (status != wh) {
+    ;"wahc: {cc} failed with exit code {status}"($eprint)
+    ;waah !invited
+}
+;!invited

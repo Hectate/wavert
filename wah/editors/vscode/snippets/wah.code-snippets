@@ -1,0 +1,72 @@
+{
+  "Program": {
+    "prefix": "program",
+    "description": "An entry file: statements, then ;!invited (§13)",
+    "body": [
+      "$0",
+      ";!invited"
+    ]
+  },
+  "Scheme": {
+    "prefix": "scheme",
+    "description": "Function definition: parameters before the name (§6.1)",
+    "body": [
+      ";scheme (${1:a, b})${2:name} {",
+      "\t$0",
+      "}"
+    ]
+  },
+  "Lineup": {
+    "prefix": "lineup",
+    "description": "Enumeration: members before the name, top level only (§4.1)",
+    "body": [
+      ";lineup (${1:a, b})${2:Name}"
+    ]
+  },
+  "If": {
+    "prefix": "!doubt",
+    "description": "if (§7.1)",
+    "body": [
+      ";!doubt (${1:cond}) {",
+      "\t$0",
+      "}"
+    ]
+  },
+  "If else": {
+    "prefix": "!doubt-anyway",
+    "description": "if / else (§7.1)",
+    "body": [
+      ";!doubt (${1:cond}) {",
+      "\t$2",
+      "} anyway {",
+      "\t$0",
+      "}"
+    ]
+  },
+  "Loop over an array": {
+    "prefix": "lurk-each",
+    "description": "while loop over an array's elements (§7.4)",
+    "body": [
+      ";wh claim shifty ${1:i}",
+      ";lurk (${1:i} < (${2:xs}(\\$length))) {",
+      "\t;${1:i}[${2:xs}] claim ${3:x}",
+      "\t$0",
+      "\t;++cheat ${1:i}",
+      "}"
+    ]
+  },
+  "Whine": {
+    "prefix": "whine",
+    "description": "Signal handler on its own line, indented one level (§8.2)",
+    "body": [
+      "\twhine (${1:c}) { ${0:wh} }"
+    ]
+  },
+  "Record": {
+    "prefix": "record",
+    "description": "Record literal (§10.7)",
+    "body": [
+      "{ ${1:kind}: ${2:value} }"
+    ]
+  }
+}
