@@ -1,0 +1,10 @@
+// A library of text helpers, imported by both modules.wvt and shapes.wvt.
+// It is loaded and initialized once, however many files import it.
+
+;const ready is "text.wvt: initialized"($print)
+
+;export fn plural(word, n) { n == 1 ? word : "{word}s" }
+
+;export fn count(n, word) { "{n} {(word, n)(plural)}" }
+
+;end

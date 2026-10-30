@@ -1,0 +1,32 @@
+// Modules: import and export.
+//
+// The entry file imports libraries, giving each a module name. A library
+// exports some of its declarations, which the importing file writes as
+// module.name: shapes' describe is shapes.describe. Nothing else enters the
+// file, so libraries never clash with each other or with this file's names.
+//
+// Libraries run first, depth first in import order, each once; the entry
+// file's body runs last. Paths are relative to the file that imports.
+//
+// Usage: wvc build examples/modules.wvt
+
+;import shapes from "modules/shapes.wvt"
+// Importing is not transitive: shapes.wvt imports text.wvt, but this file must
+// import it too to use count.
+;import text from "modules/text.wvt"
+
+;"modules.wvt: running"($print)
+
+// An imported enum's members are module.Enum.member; an imported function is
+// called as (module.name).
+;const all is [shapes.Shape.circle, shapes.Shape.triangle, shapes.Shape.square]
+;var total is 0
+;var i is 0
+;while (i < all($length)) {
+    ;all[i](shapes.describe)($print)
+    ;set total to total + all[i](shapes.corners)
+    ;set i += 1
+}
+;const summary is (total, "corner")(text.count)
+;"{summary} in all"($print)
+;exit

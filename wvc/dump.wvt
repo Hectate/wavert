@@ -1,0 +1,85 @@
+// wvc: The --tokens and --ast dumps.
+// One token per line: type, start, end, sp, then the name or the numeral's text and value.
+// A string's parts follow on their own lines: | "text", or { pos, the tokens, }.
+
+;import text from "text.wvt"
+
+;export fn dumpTokens(toks, indent) {
+    ;var k is 0
+    ;while (k < toks($length)) {
+        ;const tk is toks[k]
+        ;var line is "{indent}{tk.t} {tk.pos} {tk.end} {tk.sp}"
+        ;if (tk.t == "id" || tk.t == "std" || tk.t == "opset") {
+            ;set line to line + " {tk.v}"
+        } else if (tk.t == "int" || tk.t == "float") {
+            ;set line to line + " {tk.text} {tk.v}"
+        }
+        ;line($print)
+        ;if (tk.t == "str") {
+            ;var p is 0
+            ;while (p < tk.parts($length)) {
+                ;const part is tk.parts[p]
+                ;if (part($typeOf) == "string") {
+                    ;"{indent}  | {part(text.quote)}"($print)
+                } else {
+                    ;"{indent}  {{ {part.pos}"($print)
+                    ;(part.tokens, indent + "    ")(dumpTokens)
+                    ;"{indent}  }}"($print)
+                }
+                ;set p += 1
+            }
+        }
+        ;set k += 1
+    }
+}
+
+// ---- AST dump (wahc --ast) ----
+// Any value as indented text. Record fields are sorted, so the output does not
+// depend on field order.
+
+;fn sorted(xs) {
+    ;var out is []
+    ;var k is 0
+    ;while (k < xs($length)) {
+        ;(out, xs[k])($push)
+        ;var j is out($length) - 1
+        ;while (j > 0 && out[j - 1] > out[j]) {
+            ;const swap is out[j]
+            ;set out[j] to out[j - 1]
+            ;set out[j - 1] to swap
+            ;set j -= 1
+        }
+        ;set k += 1
+    }
+    out
+}
+
+;export fn dumpValue(x, indent) {
+    ;const type is x($typeOf)
+    ;if (type == "string") { ;return x(text.quote) }
+    ;const inner is indent + "  "
+    ;if (type == "array") {
+        ;if (x($length) == 0) { ;return "[]" }
+        ;var out is "["
+        ;var k is 0
+        ;while (k < x($length)) {
+            ;set out to out + "\n" + inner + (x[k], inner)(dumpValue)
+            ;set k += 1
+        }
+        ;return out + "\n" + indent + "]"
+    }
+    ;if (type == "record") {
+        ;const keys is x($fields)(sorted)
+        ;var out is "{{"
+        ;var k is 0
+        ;while (k < keys($length)) {
+            ;const key is keys[k]
+            ;set out to out + "\n{inner}{key}: " + (x[key], inner)(dumpValue)
+            ;set k += 1
+        }
+        ;return out + "\n{indent}}}"
+    }
+    x($toString)
+}
+
+;end

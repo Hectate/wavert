@@ -1,0 +1,416 @@
+// wvc: The Wavert lexer (docs/hybrid-syntax.md; rewritten from wahc's lexer.wah).
+//
+// Token: { t, pos, end, sp, nl, v, text, parts }
+//   t      token type: punctuation/operator text, a keyword, "!if" | "!while",
+//          "int" | "float" | "str" | "id" | "std" | "opset" | "eof"
+//   sp     real when whitespace or a comment precedes the token (used by lints)
+//   nl     real when that whitespace or comment contains a newline (used by hints)
+//   v      int/float value, id/std name, or the operator of an opset ("+" for "+=")
+//   text   source text of a numeral
+//   parts  for "str": strings and { tokens, pos } interpolations, alternating
+// Positions count code points.
+
+;import text from "text.wvt"
+;import diag from "diag.wvt"
+
+;export const keywords is ["fn", "return", "const", "var", "ref", "set", "if", "else", "while", "break", "continue",
+  "match", "case", "enum", "import", "export", "true", "false", "null", "nan", "inf",
+  "exit", "fail", "onfail", "panic"]
+;const reserved is [
+    { word: "fails", message: "'fails' is reserved for marking functions that can fail; it is not designed yet" },
+    { word: "recover", message: "'recover' is reserved: catching panics is not designed yet" },
+    { word: "finally", message: "'finally' is reserved: catching panics is not designed yet" }
+]
+;const bangWords is ["if", "while"]
+// Compound assignments (;set x += 1), longest first.
+;const setOps is ["**=", "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="]
+;const ops is ["**", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>",
+  "+", "-", "*", "/", "%", "<", ">", "&", "|", "^", "~", "!", "?", ":",
+  ";", ",", "(", ")", "[", "]", "{{", "}}"]
+
+// The largest int (§11.2).
+;const maxInt is 9007199254740991
+
+// The index just past the run of characters starting at k for which digit holds.
+;fn digitRun(cs, k, base) {
+    ;var j is k
+    ;while (j < cs($length) && (cs[j], base)(isDigitIn)) { ;set j += 1 }
+    j
+}
+
+;fn isDigitIn(c, base) {
+    ;if (base == 16) { ;return c(text.isHexDigit) }
+    ;if (base == 2) { ;return c == "0" || c == "1" }
+    c(text.isDigit)
+}
+
+// The value of the digits in base, or WAH if it exceeds the 53-bit safe range.
+;fn digitsValue(digits, base) {
+    ;const hex is ("0123456789abcdef", "")($split)
+    ;var v is 0
+    ;var k is 0
+    ;while (k < digits($length)) {
+        ;const c is digits[k](text.toLower)
+        ;var d is 0
+        ;while (hex[d] != c) { ;set d += 1 }
+        ;if (v > (maxInt - d) / base) { ;return -1 }
+        ;set v to v * base + d
+        ;set k += 1
+    }
+    v
+}
+
+// The value of the escape \e, or null unless e is a one-character escape.
+;fn simpleEscape(e) {
+    ;if (e == "n") { ;return "\n" }
+    ;if (e == "r") { ;return "\r" }
+    ;if (e == "t") { ;return "\t" }
+    ;if (e == "\\" || e == "\"" || e == "$") { ;return e }
+    null
+}
+
+// Lexes cs, an array of characters; the result ends with an "eof" token.
+;export fn lex(cs) {
+    ;const n is cs($length)
+    ;var i is 0
+    ;var prevT is ""
+    // Whether the whitespace before the current token contains a newline (used by hints).
+    ;var nlNow is false
+    ;var toks is []
+
+    // The character at k, or "" outside the text.
+    ;fn ch(k) { k >= 0 && k < n ? cs[k] : "" }
+    ;fn cut(a, b) { ((cs, a, b)($slice), "")($join) }
+
+    // Does the text s occur at k?
+    ;fn startsWith(k, s) {
+        ;const sc is (s, "")($split)
+        ;if (k + sc($length) > n) { ;return false }
+        ;var q is 0
+        ;while (q < sc($length)) {
+            ;if (cs[k + q] != sc[q]) { ;return false }
+            ;set q += 1
+        }
+        true
+    }
+
+    // The first index at or after from where s occurs, or WAH.
+    ;fn find(s, from) {
+        ;var q is from
+        ;while (q < n) {
+            ;if ((q, s)(startsWith)) { ;return q }
+            ;set q += 1
+        }
+        (-1)
+    }
+
+    ;fn tok(t, pos, sp, v, spelling, parts) {
+        ;set prevT to t
+        { t: t, pos: pos, end: i, sp: sp, nl: nlNow, v: v, text: spelling, parts: parts }
+    }
+    ;fn plain(t, pos, sp) { (t, pos, sp, null, null, null)(tok) }
+
+    // Skips whitespace and comments; returns real if anything was skipped.
+    ;fn skip() {
+        ;var skipped is false
+        ;while (true) {
+            ;const c is i(ch)
+            ;if (c(text.isSpace)) {
+                ;set i += 1
+                ;set skipped to true
+            } else if (c == "/" && (i + 1)(ch) == "/") {
+                ;if (!skipped && (i - 1)(ch)(text.isIdChar) && (i + 2)(ch)(text.isIdChar)) {
+                    ;(diag.warnings, (i, "'//' starts a comment; Wavert has no integer-division operator",
+                        "for integer division write (a / b)(\$floor)")(diag.warn))($push)
+                }
+                ;while (i < n && cs[i] != "\n") { ;set i += 1 }
+                ;set skipped to true
+            } else if (c == "/" && (i + 1)(ch) == "*") {
+                ;const close is ("*/", i + 2)(find)
+                ;if (close < 0) { ;(i, "unterminated block comment")(diag.abort) }
+                ;set i to close + 2
+                ;set skipped to true
+            } else {
+                ;return skipped
+            }
+        }
+    }
+
+    ;fn next() {
+        ;const from is i
+        ;const sp is (skip) || i == 0
+        ;set nlNow to false
+        ;var q is from
+        ;while (q < i) {
+            ;if (cs[q] == "\n") { ;set nlNow to true }
+            ;set q += 1
+        }
+        ;const start is i
+        ;const c is start(ch)
+        ;if (c == "") { ;return ("eof", start, sp)(plain) }
+        ;if (c(text.isIdStart)) { ;return (start, sp)(word) }
+        ;if (c == "\"") { ;return (start, sp)(string) }
+        ;if (c == "$") { ;return (start, sp)(sigil) }
+        ;if (c(text.isDigit)) { ;return (start, sp)(number) }
+        ;var k is 0
+        ;while (k < setOps($length)) {
+            ;const op is setOps[k]
+            ;if ((start, op)(startsWith)) {
+                ;set i to start + op($length)
+                ;return ("opset", start, sp, (op, 0, op($length) - 1)($slice), null, null)(tok)
+            }
+            ;set k += 1
+        }
+        ;if (c == "!") {
+            // Only the first 64 characters are examined, as in wahc.
+            ;const limit is start + 64
+            ;var j is start + 1
+            ;while (j < limit && j(ch)(text.isJsSpace)) { ;set j += 1 }
+            ;const wordStart is j
+            ;if (j < limit && j(ch)(text.isIdStart)) {
+                ;while (j < limit && j(ch)(text.isIdChar)) { ;set j += 1 }
+                ;const w is (wordStart, j)(cut)
+                ;if ((bangWords, w)(text.contains)) {
+                    ;if (wordStart > start + 1) {
+                        ;(start, "no whitespace is allowed inside '!{w}'", "write '!{w}'")(diag.failHint)
+                    }
+                    ;set i to j
+                    ;return ("!" + w, start, sp)(plain)
+                }
+            }
+        }
+        ;if ((start, ">>>")(startsWith)) {
+            ;(start, "there is no '>>>' operator", "for an unsigned interpretation use x(\$toUint32)")(diag.failHint)
+        }
+        ;if ((start, "--")(startsWith)) {
+            ;(start, "'--' is not an operator",
+                "write '- -x' or '-(-x)' for double negation, or ';set x -= 1' to decrement")(diag.failHint)
+        }
+        ;if ((start, "++")(startsWith)) {
+            ;(start, "'++' is not an operator", "write ';set x += 1' to increment")(diag.failHint)
+        }
+        ;set k to 0
+        ;while (k < ops($length)) {
+            ;const op is ops[k]
+            ;if ((start, op)(startsWith)) {
+                ;set i to start + op($length)
+                ;if (op == ";" && prevT == ";") {
+                    ;(diag.warnings, (start, "';;': likely a habitual trailing ';' from C-style languages",
+                        "Wavert statements begin with ;, they are not terminated by it")(diag.warn))($push)
+                }
+                ;return (op, start, sp)(plain)
+            }
+            ;set k += 1
+        }
+        ;if (c == "=") {
+            ;(start, "'=' is not an operator",
+                "declare with ';const x is value', assign with ';set x to value', and compare with '=='")(diag.failHint)
+        }
+        // Member access (§10.8): '.' must touch both sides.
+        ;if (c == ".") {
+            ;const after is (start + 1)(ch)
+            ;if (sp || after == "" || after(text.isSpace) || (start + 1, "//")(startsWith) || (start + 1, "/*")(startsWith)) {
+                ;(start, "no whitespace is allowed around '.'", "member access is written record.field, e.g. node.kind")(diag.failHint)
+            }
+            ;set i to start + 1
+            ;return (".", start, sp)(plain)
+        }
+        ;(start, "unexpected character '{c}'")(diag.abort)
+    }
+
+    ;fn word(start, sp) {
+        ;var j is start
+        ;while (j(ch)(text.isIdChar)) { ;set j += 1 }
+        ;const w is (start, j)(cut)
+        ;set i to j
+        ;if (j(ch) == "$") {
+            ;(j, "'$' cannot appear in identifiers", "'$' is reserved for the standard library; user names have no sigil")(diag.failHint)
+        }
+        ;if ((keywords, w)(text.contains)) { ;return (w, start, sp)(plain) }
+        ;var k is 0
+        ;while (k < reserved($length)) {
+            ;if (reserved[k].word == w) { ;(start, reserved[k].message)(diag.abort) }
+            ;set k += 1
+        }
+        ("id", start, sp, w, null, null)(tok)
+    }
+
+    // A numeric literal: 42, 0xFF, 0b101, 1.5, 1e9, 2.5e-3 (§2.3).
+    ;fn number(start, sp) {
+        ;var kind is "int"
+        ;var j is start
+        ;var base is 10
+        ;if (start(ch) == "0" && ((start + 1)(ch) == "x" || (start + 1)(ch) == "b")) {
+            ;set base to (start + 1)(ch) == "x" ? 16 : 2
+            ;set j to (cs, start + 2, base)(digitRun)
+            ;if (j == start + 2) {
+                ;(start, "'{(start, start + 2)(cut)}' must be followed by {base == 2 ? "binary" : "hex"} digits")(diag.abort)
+            }
+        } else {
+            ;set j to (cs, start, 10)(digitRun)
+            ;if (j(ch) == ".") {
+                ;if (!(j + 1)(ch)(text.isDigit)) {
+                    ;(start, "digits are required on both sides of '.'", "write {(start, j)(cut)}.0")(diag.failHint)
+                }
+                ;set kind to "float"
+                ;set j to (cs, j + 1, 10)(digitRun)
+            }
+            ;if (j(ch) == "e" || j(ch) == "E") {
+                ;var e is j + 1
+                ;if (e(ch) == "+" || e(ch) == "-") { ;set e += 1 }
+                ;const after is (cs, e, 10)(digitRun)
+                ;if (after == e) { ;(start, "an exponent needs digits: 1e9, 2.5e-3")(diag.abort) }
+                ;set kind to "float"
+                ;set j to after
+            }
+        }
+        ;if (j(ch)(text.isIdChar) || j(ch) == "." && (j + 1)(ch)(text.isDigit)) {
+            ;var bad is start
+            ;while (bad(ch) == "." || bad(ch)(text.isIdChar)) { ;set bad += 1 }
+            ;(start, "'{(start, bad)(cut)}' is not a numeric literal")(diag.abort)
+        }
+        ;set i to j
+        ;const spelling is (start, j)(cut)
+        ;if (kind == "float") {
+            ;const f is spelling($toFloat)
+                onfail { ;(start, "float literal is out of range")(diag.abort) 0 }
+            ;return ("float", start, sp, f, spelling, null)(tok)
+        }
+        ;if (base == 10) {
+            ;const v is spelling($toInt)
+                onfail { ;(start, "integer literal exceeds the 53-bit safe range")(diag.abort) 0 }
+            ;return ("int", start, sp, v, spelling, null)(tok)
+        }
+        ;const v is (((spelling, "")($split), 2, spelling($length))($slice), base)(digitsValue)
+        ;if (v < 0) { ;(start, "integer literal exceeds the 53-bit safe range")(diag.abort) }
+        ("int", start, sp, v, spelling, null)(tok)
+    }
+
+    ;fn sigil(start, sp) {
+        ;if (!(start + 1)(ch)(text.isIdStart)) {
+            ;(start, "'$' must be immediately followed by a standard library name",
+                "'$' is reserved for the standard library; user names have no sigil")(diag.failHint)
+        }
+        ;var j is start + 1
+        ;while (j(ch)(text.isIdChar)) { ;set j += 1 }
+        ;set i to j
+        ("std", start, sp, (start + 1, j)(cut), null, null)(tok)
+    }
+
+    ;fn string(start, sp) {
+        ;var parts is []
+        ;var buf is ""
+        ;var rawDollar is -1
+        ;var k is start + 1
+        ;while (true) {
+            ;const c is k(ch)
+            ;if (c == "") { ;(start, "unterminated string")(diag.abort) }
+            ;if (c == "\n" || c == "\r") { ;(k, "raw newline inside a string", "write '\\n'")(diag.failHint) }
+            ;if (c == "\"") {
+                ;set k += 1
+                ;break
+            }
+            ;if (c == "\\") {
+                ;const e is (k + 1)(ch)
+                ;const simple is e(simpleEscape)
+                ;if (simple != null) {
+                    ;set buf to buf + simple
+                    ;set k += 2
+                    ;continue
+                }
+                ;if (e == "u" && (k + 2)(ch) == "{{") {
+                    ;const close is ("}}", k + 3)(find)
+                    ;const hex is close < 0 ? "" : (k + 3, close)(cut)
+                    ;const cp is hex(text.hexValue)
+                    ;if (cp < 0 || cp > 0x10FFFF || cp >= 0xD800 && cp <= 0xDFFF) {
+                        ;(k, "invalid \\u{{...}} escape",
+                            "write 1 to 6 hex digits naming a Unicode scalar value, e.g. \\u{{1F608}}")(diag.failHint)
+                    }
+                    ;set buf to buf + cp($fromCode)
+                    ;set k to close + 1
+                    ;continue
+                }
+                ;(k, "unknown escape '\\{e}'", "valid escapes are \\n \\r \\t \\\\ \\\" \\$ \\u{{...}}")(diag.failHint)
+            }
+            ;if (c == "{{") {
+                ;if ((k + 1)(ch) == "{{") {
+                    ;set buf to buf + "{{"
+                    ;set k += 2
+                    ;continue
+                }
+                ;if (rawDollar == k - 1) {
+                    ;(diag.warnings, (rawDollar, "Wavert interpolation is {{x}}, not \${{x}}", null)(diag.warn))($push)
+                }
+                ;(parts, buf)($push)
+                ;set buf to ""
+                ;const sub is k(interpolation)
+                ;(parts, { tokens: sub.tokens, pos: k })($push)
+                ;set k to sub.end
+                ;continue
+            }
+            ;if (c == "}}") {
+                ;if ((k + 1)(ch) == "}}") {
+                    ;set buf to buf + "}}"
+                    ;set k += 2
+                    ;continue
+                }
+                ;(k, "unmatched '}}' in string", "write '}}}}' for a literal brace")(diag.failHint)
+            }
+            ;if (c == "$") {
+                ;set rawDollar to k
+                ;if ((k + 1)(ch)(text.isIdStart)) {
+                    ;var j is k + 1
+                    ;while (j(ch)(text.isIdChar)) { ;set j += 1 }
+                    ;const name is (k + 1, j)(cut)
+                    ;(diag.warnings, (k, "did you mean {{{name}}}?", "Wavert interpolation is {{x}}; write \\\$ for a literal \$")(diag.warn))($push)
+                }
+            }
+            ;set buf to buf + c
+            ;set k += 1
+        }
+        ;(parts, buf)($push)
+        ;set i to k
+        ("str", start, sp, null, null, parts)(tok)
+    }
+
+    // Lexes the expression inside "{...}" of a string; open is the '{'.
+    // Returns { tokens, end }, where the tokens end with an "eof" in place of the '}'.
+    ;fn interpolation(open) {
+        ;const saveI is i
+        ;const savePrev is prevT
+        ;const saveNl is nlNow
+        ;set i to open + 1
+        ;set prevT to ""
+        ;var sub is []
+        ;var depth is 0
+        ;while (true) {
+            ;const tk is (next)
+            ;if (tk.t == "eof") { ;(open, "unterminated interpolation in string")(diag.abort) }
+            ;if (tk.t == "}}") {
+                ;if (depth == 0) {
+                    ;(sub, { t: "eof", pos: tk.pos, end: tk.end, sp: tk.sp, nl: tk.nl, v: null, text: null, parts: null })($push)
+                    ;break
+                }
+                ;set depth -= 1
+            } else if (tk.t == "{{") {
+                ;set depth += 1
+            }
+            ;(sub, tk)($push)
+        }
+        ;const endI is i
+        ;set i to saveI
+        ;set prevT to savePrev
+        ;set nlNow to saveNl
+        ;if (sub($length) == 1) { ;(open, "empty interpolation", "write '{{{{' for a literal brace")(diag.failHint) }
+        { tokens: sub, end: endI }
+    }
+
+    ;while (true) {
+        ;const t0 is (next)
+        ;(toks, t0)($push)
+        ;if (t0.t == "eof") { ;break }
+    }
+    toks
+}
+
+;end

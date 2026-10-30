@@ -1,0 +1,113 @@
+// wvc: Loading the modules of the program being compiled (Γ-- spec §13.1).
+// A module is { file, chars, path, program, steals, exports, notLibrary, fickleTargets },
+// where steals is [{ node, lib }] (its imports) and lib is the imported module's index in the
+// module list. The checker fills in exports (the declarations it exports),
+// notLibrary, and fickleTargets (the positions of set targets that are
+// ref bindings, which the code generator binds without copying, §10.4).
+
+;import diag from "diag.wvt"
+;import lexer from "lexer.wvt"
+;import parser from "parser.wvt"
+
+// The directory part of a path, with its trailing '/'.
+;fn dirOf(path) {
+    ;const cs is (path, "")($split)
+    ;var k is cs($length) - 1
+    ;while (k >= 0 && cs[k] != "/") { ;set k -= 1 }
+    ((cs, 0, k + 1)($slice), "")($join)
+}
+
+// Removes '.' segments, empty segments and 'dir/..' pairs.
+;fn normalize(path) {
+    ;const segs is (path, "/")($split)
+    ;var out is []
+    ;var k is 0
+    ;while (k < segs($length)) {
+        ;const seg is segs[k]
+        ;set k += 1
+        ;if (seg == "." || seg == "" && out($length) > 0) { ;continue }
+        ;if (seg == ".." && out($length) > 0 && out[-1] != ".." && out[-1] != "") {
+            ;out($pop)
+        } else {
+            ;(out, seg)($push)
+        }
+    }
+    (out, "/")($join)
+}
+
+// A copy of xs with x added.
+;fn with(xs, x) {
+    ;var out is []
+    ;var k is 0
+    ;while (k < xs($length)) {
+        ;(out, xs[k])($push)
+        ;set k += 1
+    }
+    ;(out, x)($push)
+    out
+}
+
+// Fails with an error in another file than the current one.
+;fn failIn(file, chars, pos, message) {
+    ;(file, chars)(diag.setSource)
+    ;(pos, message)(diag.abort)
+}
+
+// Loads the entry file and every library it imports, directly or indirectly.
+// Returns the modules in initialization order: libraries depth first, in import
+// order, each before any file that imports it; the entry file last.
+;export fn loadProgram(entryFile, ref entryChars) {
+    ;var modules is []
+
+    ;fn loaded(path) {
+        ;var k is 0
+        ;while (k < modules($length)) {
+            ;if (modules[k].path == path) { ;return k }
+            ;set k += 1
+        }
+        null
+    }
+
+    // Loads one file and what it imports; returns its index. chain: the paths
+    // from the entry file to this one, for finding cycles.
+    ;fn visit(file, chars, path, chain) {
+        ;(file, chars)(diag.setSource)
+        ;const program is chars(lexer.lex)(parser.parse)
+        ;var steals is []
+        ;var k is 0
+        ;while (k < program.stmts($length)) {
+            ;const s is program.stmts[k]
+            ;set k += 1
+            ;if (s.k != "steal") { ;continue }
+            ;const libPath is (path(dirOf) + s.path)(normalize)
+            ;var at is 0
+            ;while (at < chain($length) && chain[at] != libPath) { ;set at += 1 }
+            ;if (at < chain($length)) {
+                ;const cycle is ((chain, at, chain($length))($slice), libPath)(with)
+                ;(file, chars, s.pathPos, "import cycle: {(cycle, " -> ")($join)}")(failIn)
+            }
+            ;var lib is libPath(loaded)
+            ;if (lib == null) {
+                ;const text is libPath($readFile)
+                    onfail { ;(file, chars, s.pathPos, "cannot read '{libPath}'")(failIn) null }
+                ;const cs is (text, "")($split)
+                ;const bom is cs($length) > 0 && cs[0] == "\u{FEFF}" ? 1 : 0
+                ;set lib to (libPath, (cs, bom, cs($length))($slice), libPath, (chain, libPath)(with))(visit)
+            }
+            ;(steals, { node: s, lib: lib })($push)
+        }
+        ;var fickleTargets is []
+        ;var mod is {
+            file: file, chars: chars, path: path, program: program, steals: steals, exports: [], notLibrary: false,
+            fickleTargets: fickleTargets
+        }
+        ;(modules, mod)($push)
+        modules($length) - 1
+    }
+
+    ;const path is ((entryFile, "\\")($split), "/")($join)(normalize)
+    ;(entryFile, entryChars, path, [path])(visit)
+    modules
+}
+
+;end

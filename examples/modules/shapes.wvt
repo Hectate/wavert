@@ -1,0 +1,23 @@
+// A library. Its top level holds only import, fn, const, var, ref and enum
+// declarations, export marks what other files may use, and it ends with ;end.
+;import text from "text.wvt"
+
+;export enum Shape (circle, triangle, square)
+
+// Not exported, so private: text.wvt has its own 'ready', and they never conflict.
+;const ready is "shapes.wvt: initialized"($print)
+
+;export fn corners(shape) {
+    match (shape) {
+        case Shape.circle { 0 }
+        case Shape.triangle { 3 }
+        case Shape.square { 4 }
+    }
+}
+
+;export fn describe(shape) {
+    ;const n is (shape(corners), "corner")(text.count)
+    "a {shape} has {n}"
+}
+
+;end

@@ -1,0 +1,4 @@
+// The traditional greeting.
+;const s is "World"
+;"Hello, {s}"($print)
+;exit

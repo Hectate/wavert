@@ -1,0 +1,10 @@
+// Echoes standard input to standard output, line by line, until 'quit' or end of input.
+// $readLine fails at end of input; the onfail handler leaves the loop.
+;"Simple input/output echo test. Type 'quit' to end."($print)
+;while (true) {
+    ;const line is ($readLine)
+        onfail { ;break }
+    ;if (line == "quit") { ;break }
+    ;"ECHO: {line}"($print)
+}
+;exit

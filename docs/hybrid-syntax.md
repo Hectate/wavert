@@ -176,10 +176,30 @@ Wavert is a **new language inspired by Γ--**, not a replacement for it. Γ-- an
 
 - **Shared AST:** every change is syntax or naming only, so the new language's front end (lexer and parser) can produce the existing `wahc` AST and reuse its checker and codegens.
 - **Converter:** written in Γ--, reusing `lexer.wah`/`parser.wah`, with a pretty-printer from the AST to the new syntax. Printing from the AST handles call precedence, declaration reordering (`;value claim name` → `;const name is value`), member order and argument grouping, which a text rewrite would get wrong.
-  - The lexer has to start recording comments with their positions. The printer emits each comment before the statement it precedes. Comments in the middle of an expression are kept where possible and otherwise listed for hand-fixing, never dropped silently.
+  - Comments are recovered from the source text between tokens, so `wahc`'s lexer did not have to change. The printer emits each comment before the statement it precedes, or at the end of the line it ended. Comments in the middle of an expression move to the next line break and are listed for hand-fixing, never dropped silently.
 - **Verification:** each converted file must produce the same AST, and therefore byte-identical generated C, as its Γ-- original. Any difference is a bug.
 - **Bootstrap order:**
   1. Fork `wahc` as `wvc` and build the new front end in it, still written in Γ--.
   2. Convert the examples and tests, and verify them.
   3. Convert the compiler, build it with the Γ-- `wahc`, and check that the generated C is identical.
   4. Let it compile itself. Its generated C becomes the new language's seed, independent of Γ--.
+
+### Bootstrap status
+
+All four steps are done (October 2026). `wvc` is written in Wavert ([wvc/](../wvc/)), and its seed `wvc/wvc.c` reproduces itself.
+
+1. `wahc` was forked, and its lexer and parser were rewritten for Wavert, still in Γ--. Names in `wahc` that Wavert reserves were renamed first: `fail` → `abort`, `fn` → `func` and `ref` → `resolve`.
+2. [tools/wah2wvt.wah](../tools/wah2wvt.wah) converted the Γ-- examples and `src/` programs. [tools/verify.mjs](../tools/verify.mjs) confirmed the same syntax trees and byte-identical C and JavaScript.
+3. The converted compiler, compiled by `wvc`, produced the same C as the Γ-- original compiled by `wahc` (8,705 lines).
+4. That C became the seed. A native `wvc` built from it compiles `wvc/wvc.wvt` back to the same file.
+
+The runtime's themed text was replaced after step 4, with two more self-compiles: first teaching `wvc` the new standard library names alongside the old ones, then switching to them. Programs now print `true`, `false`, `null`, `nan` and `inf`, `$typeOf` gives `"string"`, and errors read `uncaught panic: …` and `unhandled fail (code 3) from 'parse' in 'ignore'`.
+
+Decisions made during the implementation, beyond this document:
+- `from` (in `;import name from "…"`) and `end` (as the statement `;end`) are contextual, like `is` and `to`, because `wahc` uses both as names (`end` is an AST field).
+- `$isNobody` is `$isNan`.
+- A call binds tighter than unary minus, as in C-family languages: `-5(abs)` is `-(5(abs))`, and `(-5)(abs)` calls `abs` with -5. The converter writes the parentheses.
+- A negative number is a literal: the parser folds `-` applied to a number literal, so `case -1` works and the syntax tree matches Γ--'s `WAH`. `-(5)` stays a negation.
+- Runtime messages call non-`var` arrays and records *frozen*: `cannot modify a frozen array`.
+- `wvc`'s default target is C. `--target js` is still available.
+- The syntax tree keeps `wahc`'s node kinds (`scheme`, `claim`, `lineup`, `suspect`, …), so the checker and code generators are unchanged. Renaming them is a possible later cleanup.

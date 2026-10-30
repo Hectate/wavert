@@ -1,0 +1,84 @@
+// Checks converted files against their Γ-- originals (docs/hybrid-syntax.md,
+// "Verification"): each .wvt file must parse to the same syntax tree as its
+// .wah original, apart from positions and parentheses, and each program must
+// compile to the same C and JavaScript. Both compilers are given Wavert's
+// runtime, so the only difference allowed is the standard library functions
+// that Wavert renamed ($toPurple is $toString, $isNobody is $isNan).
+//
+// Usage: node tools/verify.mjs <wahc> <wvc> <dir.wah> <dir.wvt> [file.wah ...]
+//   Compares every .wah file under dir.wah (or just the files named) with the
+//   .wvt file at the same place under dir.wvt.
+
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, relative } from 'node:path';
+
+const [wahc, wvc, wahDir, wvtDir, ...only] = process.argv.slice(2);
+if (!wvtDir) {
+  console.error('usage: node tools/verify.mjs <wahc> <wvc> <dir.wah> <dir.wvt> [file.wah ...]');
+  process.exit(2);
+}
+const runtime = new URL('../runtime/', import.meta.url);
+const runtimeC = join(runtime.pathname.replace(/^\/([A-Za-z]:)/, '$1'), 'wvt.c');
+const runtimeJs = join(runtime.pathname.replace(/^\/([A-Za-z]:)/, '$1'), 'wvt.js');
+const tmp = mkdtempSync(join(tmpdir(), 'wvt-verify-'));
+
+const walk = (dir) => readdirSync(dir).flatMap((f) => {
+  const p = join(dir, f);
+  return statSync(p).isDirectory() ? walk(p) : f.endsWith('.wah') ? [p] : [];
+});
+
+function run(exe, args) {
+  const r = spawnSync(exe, args, { encoding: 'utf8' });
+  return { out: r.stdout, err: r.stderr, code: r.status };
+}
+
+// The --ast dump without positions and parentheses, which differ by design.
+const positionKeys = /^\s*(pos|end|namePos|pathPos|paramPos|close|paren): /;
+function ast(exe, file) {
+  const r = run(exe, ['--ast', file]);
+  if (r.code !== 0) return { error: r.err };
+  return { text: renamed(r.out.split('\n').filter((l) => !positionKeys.test(l)).join('\n').replace(/\.wah"/g, '.wvt"')) };
+}
+
+// Γ-- output with Wavert's names for the renamed standard library functions,
+// and with values in a --ast dump spelled as Wavert's wvc prints them.
+const renamed = (text) => text
+  .replace(/(\bstd_|\$std\.|\bname: ")toPurple\b/g, '$1toString')
+  .replace(/(\bstd_|\$std\.|\bname: ")isNobody\b/g, '$1isNan')
+  .replace(/^(\s*\w+: )(uninvited|real|fake)$/gm, (m, key, v) => key + { uninvited: 'null', real: 'true', fake: 'false' }[v]);
+
+const files = only.length ? only : walk(wahDir);
+let failed = 0;
+for (const wah of files) {
+  const rel = relative(wahDir, wah);
+  const wvt = join(wvtDir, rel.replace(/\.wah$/, '.wvt'));
+  const problems = [];
+  const a = ast(wahc, wah), b = ast(wvc, wvt);
+  if (a.error || b.error) problems.push(`--ast failed:\n${a.error ?? ''}${b.error ?? ''}`);
+  else if (a.text !== b.text) {
+    const al = a.text.split('\n'), bl = b.text.split('\n');
+    let i = 0;
+    while (i < al.length && al[i] === bl[i]) i++;
+    problems.push(`syntax trees differ at line ${i + 1} of the dump:\n  wah: ${al.slice(Math.max(0, i - 3), i + 3).join('\n       ')}\n  wvt: ${bl.slice(Math.max(0, i - 3), i + 3).join('\n       ')}`);
+  }
+  const isProgram = /^\s*;\s*(\w+\s*)?!invited\s*(\/\/.*)?$/m.test(readFileSync(wah, 'utf8').trimEnd().split('\n').reverse().find((l) => l.trim() && !l.trim().startsWith('//')) ?? '');
+  if (isProgram) {
+    for (const [target, rt] of [['c', runtimeC], ['js', runtimeJs]]) {
+      const outA = join(tmp, `a.${target}`), outB = join(tmp, `b.${target}`);
+      const ra = run(wahc, [wah, '--target', target, '-o', outA, '--runtime', rt]);
+      const rb = run(wvc, [wvt, '--target', target, '-o', outB, '--runtime', rt]);
+      if (ra.code !== 0 || rb.code !== 0) { problems.push(`--target ${target} failed:\n${ra.err}${rb.err}`); continue; }
+      if (renamed(readFileSync(outA, 'utf8')) !== readFileSync(outB, 'utf8')) problems.push(`--target ${target}: the output differs`);
+    }
+  }
+  if (problems.length) {
+    failed++;
+    console.log(`FAIL ${rel}\n  ${problems.join('\n  ')}`);
+  } else {
+    console.log(`ok   ${rel}${isProgram ? ' (C and JavaScript identical)' : ''}`);
+  }
+}
+console.log(failed ? `${failed} of ${files.length} failed` : `all ${files.length} match`);
+process.exit(failed ? 1 : 0);

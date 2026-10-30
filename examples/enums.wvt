@@ -1,0 +1,58 @@
+// enum: enumerations, and matches over their members.
+//
+// An enum's members are constants, written Name.member. Each one equals only
+// itself. A match over members that has no else must list every member, so
+// adding a member is a compile error until every such match handles it.
+//
+// Usage: wvc build examples/enums.wvt
+
+;enum Hand (rock, paper, scissors)
+
+// ---- Exhaustive matches as values ----
+// No else is needed, because every member is listed.
+;fn beats(h) {
+    match (h) {
+        case Hand.rock { Hand.scissors }
+        case Hand.paper { Hand.rock }
+        case Hand.scissors { Hand.paper }
+    }
+}
+
+;fn winner(a, b) {
+    if (a == b) { "draw" } else if (a(beats) == b) { "{a} wins" } else { "{b} wins" }
+}
+
+// Members are values: they go in arrays, print as their names, and their
+// $typeOf is the enum's name.
+;const hands is [Hand.rock, Hand.paper, Hand.scissors]
+;const names is (hands, ", ")($join)
+;"{names} are each a {hands[0]($typeOf)}"($print)
+
+;const rounds is [[Hand.rock, Hand.scissors], [Hand.scissors, Hand.paper], [Hand.rock, Hand.paper], [Hand.paper, Hand.paper]]
+;var r is 0
+;while (r < rounds($length)) {
+    ;const round is rounds[r]
+    ;const result is (round[0], round[1])(winner)
+    ;"{round[0]} vs {round[1]}: {result}"($print)
+    ;set r += 1
+}
+
+// ---- A state machine ----
+// A match as a statement, with members of a second enum.
+;enum Light (red, green, amber)
+
+;var light is Light.red
+;var seen is []
+;while (seen($length) < 5) {
+    ;(seen, light)($push)
+    ;match (light) {
+        case Light.red { ;set light to Light.green }
+        case Light.green { ;set light to Light.amber }
+        case Light.amber { ;set light to Light.red }
+    }
+}
+;(seen, " -> ")($join)($print)
+
+// Members of different enums are never equal, even with the same position.
+;(Hand.rock == Light.red)($print)
+;exit

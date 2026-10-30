@@ -1,0 +1,98 @@
+// wvc: Characters and text helpers.
+
+;export fn isSpace(c) { c == " " || c == "\t" || c == "\n" || c == "\r" }
+;export fn isDigit(c) { c >= "0" && c <= "9" }
+;export fn isHexDigit(c) { c(isDigit) || c >= "a" && c <= "f" || c >= "A" && c <= "F" }
+;export fn isIdStart(c) { c >= "a" && c <= "z" || c >= "A" && c <= "Z" || c == "_" }
+;export fn isIdChar(c) { c(isIdStart) || c(isDigit) }
+
+// JS's \s, used to find whitespace inside a bang token such as '! if'.
+;export fn isJsSpace(c) {
+    ;if (c == "") { ;return false }
+    ;const k is c($code)
+    k >= 9 && k <= 13 || k == 32 || k == 0xA0 || k == 0x1680
+        || k >= 0x2000 && k <= 0x200A || k == 0x2028 || k == 0x2029
+        || k == 0x202F || k == 0x205F || k == 0x3000 || k == 0xFEFF
+}
+
+// A signal's '!' must be followed by whitespace, ';', '}', ')' or the end (§2.5).
+;export fn isSigTerm(c) { c == "" || c(isSpace) || c == ";" || c == "}}" || c == ")" }
+
+;export fn contains(ref xs, x) {
+    ;var k is 0
+    ;while (k < xs($length)) {
+        ;if (xs[k] == x) { ;return true }
+        ;set k += 1
+    }
+    false
+}
+
+// ASCII case changes: shift is -32 for upper, 32 for lower.
+;fn shiftCase(s, from, shift) {
+    ;const cs is (s, "")($split)
+    ;var out is ""
+    ;var k is 0
+    ;while (k < cs($length)) {
+        ;const c is cs[k]
+        ;if (c >= from && c <= (from($code) + 25)($fromCode)) {
+            ;set out to out + (c($code) + shift)($fromCode)
+        } else {
+            ;set out to out + c
+        }
+        ;set k += 1
+    }
+    out
+}
+;export fn toUpper(s) { (s, "a", -32)(shiftCase) }
+;export fn toLower(s) { (s, "A", 32)(shiftCase) }
+
+// The value of 1 to 6 hex digits, or WAH if s is not that.
+;export fn hexValue(s) {
+    ;const cs is (s, "")($split)
+    ;if (cs($length) < 1 || cs($length) > 6) { ;return -1 }
+    ;var v is 0
+    ;var k is 0
+    ;while (k < cs($length)) {
+        ;const c is cs[k]
+        ;if (!c(isHexDigit)) { ;return -1 }
+        ;const digits is ("0123456789abcdef", "")($split)
+        ;var d is 0
+        ;while (digits[d](toUpper) != c(toUpper)) { ;set d += 1 }
+        ;set v to v * 16 + d
+        ;set k += 1
+    }
+    v
+}
+
+// JS's JSON.stringify for a string.
+;export fn quote(s) {
+    ;const cs is (s, "")($split)
+    ;var out is "\""
+    ;var k is 0
+    ;while (k < cs($length)) {
+        ;const c is cs[k]
+        ;const code is c($code)
+        ;if (c == "\"" || c == "\\") {
+            ;set out to out + "\\" + c
+        } else if (c == "\n") {
+            ;set out to out + "\\n"
+        } else if (c == "\r") {
+            ;set out to out + "\\r"
+        } else if (c == "\t") {
+            ;set out to out + "\\t"
+        } else if (code == 8) {
+            ;set out to out + "\\b"
+        } else if (code == 12) {
+            ;set out to out + "\\f"
+        } else if (code < 32) {
+            ;const hex is ("0123456789abcdef", "")($split)
+            ;set out to out + "\\u00" + hex[(code / 16)($floor)] + hex[code % 16]
+        } else {
+            ;set out to out + c
+        }
+        ;set k += 1
+    }
+    out + "\""
+}
+
+;end

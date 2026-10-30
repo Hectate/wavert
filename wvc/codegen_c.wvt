@@ -1,0 +1,1108 @@
+// wvc: The C code generator, for --target c (forked from wahc's codegen_c.wah,
+// a port of wah/js/src/codegen_c.js: see there for the design).
+//
+// Syntax tree records have fixed shapes, so what the analysis finds is kept
+// beside them: bindings and functions are numbered (decls, fns), and each
+// module's slot array maps a source position to the binding declared or used
+// there. Every name, declaration, parameter and onfail code is its own token, so
+// positions tell them apart.
+
+;import text from "text.wvt"
+;import diag from "diag.wvt"
+
+;const binOps is ["+", "-", "*", "/", "%", "**", "==", "!=", "<", ">", "<=", ">=", "&", "|", "^", "<<", ">>"]
+;const binFns is ["add", "sub", "mul", "div", "mod", "pow", "eq", "ne", "lt", "gt", "le", "ge", "band", "bor", "bxor", "shl", "shr"]
+// Node kinds whose value can never be an array or record (so binding needs no copy check).
+;const scalarKinds is ["int", "float", "str", "bool", "null", "nan", "inf", "bin", "un"]
+// Node kinds that evaluate without calling anything.
+;const plainKinds is ["int", "float", "bool", "null", "nan", "inf", "name", "std"]
+// Stdlib functions that can fail (§12.1).
+;const signalers is ["readLine", "readFile", "writeFile", "appendFile", "listDir", "deleteFile", "env", "run", "toInt", "toFloat"]
+
+// How an expression's evaluation interacts with others (see seq).
+;const constK is 0 // a constant: nothing can change it
+;const pureK is 1 // reads a binding, so another argument's effects could change it
+;const effectK is 2 // may have effects or raise a tantrum
+
+;fn binFn(op) {
+    ;var k is 0
+    ;while (binOps[k] != op) { ;set k += 1 }
+    binFns[k]
+}
+// How a declaration or parameter binds its values (§10.4): "shifty", "fickle" or "const".
+;fn modeOf(x) { x.isShifty ? "shifty" : x.isFickle ? "fickle" : "const" }
+
+;fn unFn(op) { op == "-" ? "neg" : op == "!" ? "not" : "bnot" }
+
+;fn repeat(s, count) {
+    ;var out is ""
+    ;var k is 0
+    ;while (k < count) {
+        ;set out to out + s
+        ;set k += 1
+    }
+    out
+}
+
+// The UTF-8 length of s.
+;fn utf8Length(s) {
+    ;const cs is (s, "")($split)
+    ;var n is 0
+    ;var k is 0
+    ;while (k < cs($length)) {
+        ;const c is cs[k]($code)
+        ;set n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4
+        ;set k += 1
+    }
+    n
+}
+
+// A C string literal for s: printable characters as they are (the C file is
+// UTF-8), other control characters as three-digit octal escapes.
+;fn cString(s) {
+    ;const cs is (s, "")($split)
+    ;var out is "\""
+    ;var k is 0
+    ;while (k < cs($length)) {
+        ;const ch is cs[k]
+        ;const c is ch($code)
+        ;if (ch == "\"") {
+            ;set out to out + "\\\""
+        } else if (ch == "\\") {
+            ;set out to out + "\\\\"
+        } else if (ch == "\n") {
+            ;set out to out + "\\n"
+        } else if (ch == "\t") {
+            ;set out to out + "\\t"
+        } else if (ch == "\r") {
+            ;set out to out + "\\r"
+        } else if (c < 32 || c == 127) {
+            ;set out to out + "\\{(c / 64)($floor)}{(c / 8)($floor) % 8}{c % 8}"
+        } else {
+            ;set out to out + ch
+        }
+        ;set k += 1
+    }
+    out + "\""
+}
+
+// A static wstr initializer: { bytes, code points, ascii, sym, data }.
+;fn wstrInit(s) {
+    ;const bytes is s(utf8Length)
+    ;const cps is s($length)
+    "{{ {bytes}, {cps}, {bytes == cps ? 1 : 0}, 0, {s(cString)} }}"
+}
+
+// A C array of values: (wv[]){ ... }, or NULL when empty.
+;fn values(ref cs) { cs($length) == 0 ? "NULL" : "(wv[]){{ {(cs, ", ")($join)} }}" }
+
+// modules: checked, in initialization order, the entry file last.
+;export fn generateC(modules, runtime) {
+    ;var n is 0
+    ;var tmps is 0
+    ;var strings is []
+    ;var fields is []
+    ;var shapes is []
+    ;var lineupDefs is []
+    ;var globals is []
+    ;var frames is []
+    ;var functions is []
+    ;var out is []
+    ;var indent is 1
+    // loops: enclosing loops reachable by break/continue; iife: inside a conditional used as a value
+    ;var loops is 0
+    ;var iife is false
+
+    // Bindings: { kind, name, func, cname, isFickle, captured, schemeFn }, where func
+    // is the index of the function that owns it, and schemeFn, for a function, its
+    // own function. Functions: { name, parent, depth, top, children, cname },
+    // where parent is null for a module's top level.
+    ;var decls is []
+    ;var fns is []
+    // Per module: its top-level function, and its positions -> binding index.
+    ;var tops is []
+    ;var slots is []
+
+    // The current module: its index and id, its positions, its module names as
+    // { name, lib }, its enum statements, and the current function.
+    ;var curMod is 0
+    ;var mod is ""
+    ;var curSlot is []
+    ;var stolen is []
+    ;var ownLineups is []
+    ;var cur is 0
+
+    // The id of module m: its place in initialization order for a library, "" for the entry file.
+    ;fn modId(m) { m == modules($length) - 1 ? "" : "{m + 1}" }
+
+    ;fn hasFrame(f) { !fns[f].top && fns[f].children > 0 }
+
+    // ---- analysis: resolve names, find what nested functions use ----
+
+    ;fn newScope(parent) {
+        ;var names is []
+        { parent: parent, names: names }
+    }
+    ;fn put(scope, name, kind, d) { ;(scope.names, { name: name, kind: kind, d: d })($push) }
+    // The entry for name in scope or around it, or null.
+    ;fn find(ref scope, name) {
+        ;ref s is scope
+        ;while (s != null) {
+            ;ref ns is s.names
+            ;var k is 0
+            ;while (k < ns($length)) {
+                ;if (ns[k].name == name) { ;return ns[k] }
+                ;set k += 1
+            }
+            ;set s to s.parent
+        }
+        null
+    }
+    ;fn kindOf(scope, name) {
+        ;const entry is (scope, name)(find)
+        entry == null ? null : entry.kind
+    }
+
+    ;fn newFn(name, parent) {
+        ;var f is {
+            name: name, parent: parent, depth: parent == null ? 0 : fns[parent].depth + 1,
+            top: parent == null, children: 0, cname: ""
+        }
+        ;(fns, f)($push)
+        fns($length) - 1
+    }
+
+    // A binding of function f. At a module's top scope, declarations and functions keep
+    // their names (other modules use them); everything else is numbered.
+    ;fn bind(kind, name, f, atTop, mode) {
+        ;var cname is "w{mod}_{name}"
+        ;if (!atTop) {
+            ;set cname to (kind == "scheme" ? "s" : "v") + "{n}_{name}"
+            ;set n += 1
+        }
+        ;var d is { kind: kind, name: name, func: f, cname: cname, isFickle: mode == "fickle", captured: false, schemeFn: null }
+        ;(decls, d)($push)
+        ;if (fns[f].top && kind != "scheme") { ;(globals, cname)($push) }
+        decls($length) - 1
+    }
+
+    ;fn ablock(ref b, scope, f, topScope) {
+        ;const atTop is scope == topScope
+        ;const list is b.stmts
+        ;var k is 0
+        ;while (k < list($length)) {
+            ;const s is list[k]
+            ;if (s.k == "scheme") {
+                ;const d is ("scheme", s.name, f, atTop, "")(bind)
+                ;const child is (s.name, f)(newFn)
+                ;set fns[child].cname to decls[d].cname
+                ;set decls[d].schemeFn to child
+                ;set fns[f].children += 1
+                ;set curSlot[s.namePos] to d
+                ;(scope, s.name, "scheme", d)(put)
+            } else if (s.k == "lineup") {
+                ;(scope, s.name, "lineup", null)(put)
+            } else if (s.k == "claim") {
+                ;const d is ("claim", s.name, f, atTop, s(modeOf))(bind)
+                ;set curSlot[s.namePos] to d
+                ;(scope, s.name, "claim", d)(put)
+            }
+            ;set k += 1
+        }
+        ;set k to 0
+        ;while (k < list($length)) {
+            ;(list[k], scope, f, topScope)(astmt)
+            ;set k += 1
+        }
+        ;if (b.value != null) { ;(b.value, scope, f)(aexpr) }
+    }
+
+    ;fn astmt(ref s, scope, f, topScope) {
+        ;const kind is s.k
+        ;if (kind == "scheme") {
+            ;const d is curSlot[s.namePos]
+            ;const child is decls[d].schemeFn
+            ;const ps is scope(newScope)
+            ;var k is 0
+            ;while (k < s.params($length)) {
+                ;const p is s.params[k]
+                ;const pd is ("param", p.name, child, false, p(modeOf))(bind)
+                ;set curSlot[p.pos] to pd
+                ;(ps, p.name, "param", pd)(put)
+                ;set k += 1
+            }
+            ;(s.body, ps(newScope), child, topScope)(ablock)
+        } else if (kind == "lurk") {
+            ;(s.cond, scope, f)(aexpr)
+            ;(s.body, scope(newScope), f, topScope)(ablock)
+        } else if (kind == "getaway" || kind == "tantrum" || kind == "exit" || kind == "claim") {
+            ;if (s.e != null) { ;(s.e, scope, f)(aexpr) }
+        } else if (kind == "expr") {
+            ;if (s.e.k == "sigcall") { ;(s.e.arg, scope, f)(aexpr) } else { ;(s.e, scope, f)(aexpr) }
+        } else if (kind == "cheat") {
+            ;(s.e, scope, f)(aexpr)
+            ;(s.target, scope, f)(atarget)
+        }
+        ;if (s.handler != null) {
+            ;const h is s.handler
+            ;const hs is scope(newScope)
+            ;if (h.param != null) {
+                ;const wd is ("whine", h.param, f, false, "")(bind)
+                ;set curSlot[h.paramPos] to wd
+                ;(hs, h.param, "whine", wd)(put)
+            }
+            ;(h.body, hs(newScope), f, topScope)(ablock)
+        }
+    }
+
+    // A name used in function f: a binding of another function is captured.
+    ;fn use(x, scope, f) {
+        ;const d is (scope, x.name)(find).d
+        ;set curSlot[x.pos] to d
+        ;if (decls[d].func != f) { ;set decls[d].captured to true }
+    }
+
+    ;fn atarget(t, scope, f) {
+        ;if (t.k == "name") { ;(t, scope, f)(use) ;return }
+        ;if (t.k == "idx") { ;(t.index, scope, f)(aexpr) }
+        ;(t.k == "mem" ? t.rec : t.arr, scope, f)(aexpr)
+    }
+
+    // Is x (the right of '.') an enum or module name, rather than a value?
+    ;fn notValue(ref x, scope) {
+        ;if (x.k == "mem") { ;return x.rec.k == "name" && (scope, x.rec.name)(kindOf) == "module" }
+        ;if (x.k != "name") { ;return false }
+        ;const kind is (scope, x.name)(kindOf)
+        kind == "lineup" || kind == "module"
+    }
+
+    ;fn aexpr(ref e, scope, f) {
+        ;const kind is e.k
+        ;if (kind == "str") {
+            ;var k is 0
+            ;while (k < e.parts($length)) {
+                ;if (e.parts[k]($typeOf) != "string") { ;(e.parts[k], scope, f)(aexpr) }
+                ;set k += 1
+            }
+        } else if (kind == "name") {
+            ;(e, scope, f)(use)
+        } else if (kind == "arr") {
+            ;var k is 0
+            ;while (k < e.items($length)) { ;(e.items[k], scope, f)(aexpr) ;set k += 1 }
+        } else if (kind == "rec") {
+            ;var k is 0
+            ;while (k < e.fields($length)) { ;(e.fields[k].e, scope, f)(aexpr) ;set k += 1 }
+        } else if (kind == "idx") {
+            ;(e.index, scope, f)(aexpr)
+            ;(e.arr, scope, f)(aexpr)
+        } else if (kind == "mem") {
+            ;if (!(e.rec, scope)(notValue)) { ;(e.rec, scope, f)(aexpr) }
+        } else if (kind == "un") {
+            ;(e.e, scope, f)(aexpr)
+        } else if (kind == "bin") {
+            ;(e.l, scope, f)(aexpr)
+            ;(e.r, scope, f)(aexpr)
+        } else if (kind == "tern") {
+            ;(e.c, scope, f)(aexpr)
+            ;(e.a, scope, f)(aexpr)
+            ;(e.b, scope, f)(aexpr)
+        } else if (kind == "call") {
+            ;var k is 0
+            ;while (k < e.args($length)) { ;(e.args[k], scope, f)(aexpr) ;set k += 1 }
+            ;if (e.callee.k == "name") { ;set curSlot[e.callee.pos] to (scope, e.callee.name)(find).d }
+        } else if (kind == "chain") {
+            ;var k is 0
+            ;while (k < e.branches($length)) {
+                ;(e.branches[k].cond, scope, f)(aexpr)
+                ;(e.branches[k].body, scope(newScope), f, null)(ablock)
+                ;set k += 1
+            }
+            ;if (e.els != null) { ;(e.els, scope(newScope), f, null)(ablock) }
+        } else if (kind == "suspect") {
+            ;(e.subject, scope, f)(aexpr)
+            ;var k is 0
+            ;while (k < e.alibis($length)) {
+                ;(e.alibis[k].body, scope(newScope), f, null)(ablock)
+                ;set k += 1
+            }
+            ;if (e.els != null) { ;(e.els, scope(newScope), f, null)(ablock) }
+        }
+    }
+
+    ;fn analyze(m) {
+        ;set curMod to m
+        ;set mod to m(modId)
+        ;const top is (null, null)(newFn)
+        ;(tops, top)($push)
+        ;var slot is []
+        ;var i is 0
+        ;while (i <= modules[m].chars($length)) {
+            ;(slot, null)($push)
+            ;set i += 1
+        }
+        ;(slots, slot)($push)
+        ;set curSlot to slot
+        ;const scope is null(newScope)
+        ;const steals is modules[m].steals
+        ;var k is 0
+        ;while (k < steals($length)) {
+            ;(scope, steals[k].node.name, "module", null)(put)
+            ;set k += 1
+        }
+        ;({ stmts: modules[m].program.stmts, value: null }, scope, top, scope)(ablock)
+    }
+
+    // ---- emission ----
+
+    // Starts module m: module.name means the imported module's name (§13.1).
+    ;fn enter(m) {
+        ;(modules[m].file, modules[m].chars)(diag.setSource)
+        ;set curMod to m
+        ;set mod to m(modId)
+        ;set curSlot to slots[m]
+        ;set cur to tops[m]
+        ;set stolen to []
+        ;set ownLineups to []
+        ;const list is modules[m].program.stmts
+        ;var k is 0
+        ;while (k < list($length)) {
+            ;if (list[k].k == "lineup") { ;(ownLineups, list[k])($push) }
+            ;set k += 1
+        }
+        ;const steals is modules[m].steals
+        ;set k to 0
+        ;while (k < steals($length)) {
+            ;(stolen, { name: steals[k].node.name, lib: steals[k].lib })($push)
+            ;set k += 1
+        }
+    }
+
+    ;fn emit(line) { ;(out, ("  ", indent)(repeat) + line)($push) }
+    ;fn tmp() {
+        ;const name is "t{tmps}"
+        ;set tmps += 1
+        name
+    }
+
+    ;fn str(s) {
+        ;var k is 0
+        ;while (k < strings($length) && strings[k] != s) { ;set k += 1 }
+        ;if (k == strings($length)) { ;(strings, s)($push) }
+        "&S{k}"
+    }
+    ;fn fieldRef(name) {
+        ;if (!(fields, name)(text.contains)) { ;(fields, name)($push) }
+        "&F_{name}"
+    }
+
+    // An enum is a static array of its members (§4.1).
+    ;fn lineupDef(s, m) {
+        ;const nm is s.name(str)
+        ;var members is []
+        ;var k is 0
+        ;while (k < s.members($length)) {
+            ;(members, "{{ {nm}, {s.members[k].name(str)} }}")($push)
+            ;set k += 1
+        }
+        ;(lineupDefs, "static const wmem l{m}_{s.name}[] = {{ {(members, ", ")($join)} }};")($push)
+    }
+
+    // The index of the module that x names, or null. The checker forbids shadowing a module name.
+    ;fn stolenFrom(ref x) {
+        ;if (x.k != "name") { ;return null }
+        ;var k is 0
+        ;while (k < stolen($length)) {
+            ;if (stolen[k].name == x.name) { ;return stolen[k].lib }
+            ;set k += 1
+        }
+        null
+    }
+
+    // The enum statement named name in a list of statements, or null.
+    ;fn lineupIn(ref list, name) {
+        ;var k is 0
+        ;while (k < list($length)) {
+            ;if (list[k].k == "lineup" && list[k].name == name) { ;return list[k] }
+            ;set k += 1
+        }
+        null
+    }
+
+    // The C name and statement of the enum x names (Enum or module.Enum), as { c, node }, or null.
+    ;fn lineupOf(ref x) {
+        ;if (x.k == "name") {
+            ;const s is (ownLineups, x.name)(lineupIn)
+            ;return s == null ? null : { c: "l{mod}_{x.name}", node: s }
+        }
+        ;if (x.k != "mem") { ;return null }
+        ;const lib is x.rec(stolenFrom)
+        ;if (lib == null) { ;return null }
+        ;const xs is modules[lib].exports
+        ;var k is 0
+        ;while (k < xs($length) && xs[k].name != x.field) { ;set k += 1 }
+        ;if (k == xs($length) || xs[k].kind != "lineup") { ;return null }
+        { c: "l{lib(modId)}_{x.field}", node: (modules[lib].program.stmts, x.field)(lineupIn) }
+    }
+
+    // Where binding d lives, seen from the current function.
+    ;fn place(d) {
+        ;const owner is decls[d].func
+        ;if (fns[owner].top) { ;return decls[d].cname }
+        ;if (owner == cur) { ;return decls[d].captured ? "fr.{decls[d].cname}" : decls[d].cname }
+        "up{("->up", fns[cur].depth - fns[owner].depth - 1)(repeat)}->{decls[d].cname}"
+    }
+    // Does reading d need the temporal dead zone check (§5.1)?
+    ;fn tdz(d) { decls[d].kind == "claim" && decls[d].func != cur }
+    ;fn read(d) {
+        d(tdz) ? { c: "rt_def({d(place)}, {decls[d].name(text.quote)})", k: effectK } : { c: d(place), k: pureK }
+    }
+
+    // Arguments evaluated left to right (codegen_c.js call()), as { pre, cs }:
+    // the temporaries to declare first, and the arguments' code. A direct C call
+    // is safe when at most one argument has effects and the others are constants.
+    ;fn seq(args) {
+        ;var effects is 0
+        ;var anyPure is false
+        ;var k is 0
+        ;while (k < args($length)) {
+            ;if (args[k].k == effectK) { ;set effects += 1 }
+            ;if (args[k].k == pureK) { ;set anyPure to true }
+            ;set k += 1
+        }
+        ;var cs is []
+        ;if (effects == 0 || effects == 1 && !anyPure) {
+            ;set k to 0
+            ;while (k < args($length)) { ;(cs, args[k].c)($push) ;set k += 1 }
+            ;return { pre: "", cs: cs }
+        }
+        ;var pre is []
+        ;set k to 0
+        ;while (k < args($length)) {
+            ;if (args[k].k == constK) {
+                ;(cs, args[k].c)($push)
+            } else {
+                ;const temp is (tmp)
+                ;(pre, "wv {temp} = {args[k].c};")($push)
+                ;(cs, temp)($push)
+            }
+            ;set k += 1
+        }
+        { pre: (pre, " ")($join), cs: cs }
+    }
+    ;fn wrap(sq, inner) { { c: sq.pre == "" ? inner : "({{ {sq.pre} {inner}; }})", k: effectK } }
+
+    ;fn stmts(list) {
+        ;var k is 0
+        ;while (k < list($length)) {
+            ;list[k](stmt)
+            ;set k += 1
+        }
+    }
+
+    // A block's captured declarations start unset each time it runs, as a fresh scope
+    // would (temporal dead zone, §5.1).
+    ;fn resets(ref b) {
+        ;var k is 0
+        ;while (k < b.stmts($length)) {
+            ;ref s is b.stmts[k]
+            ;if (s.k == "claim") {
+                ;const d is curSlot[s.namePos]
+                ;if (decls[d].captured) { ;"{d(place)} = RT_UNSET;"(emit) }
+            }
+            ;set k += 1
+        }
+    }
+
+    // A block whose value is discarded.
+    ;fn blockBody(b) {
+        ;b(resets)
+        ;b.stmts(stmts)
+        ;if (b.value != null) { ;"(void){b.value(expr).c};"(emit) }
+    }
+
+    ;fn valueOf(b) { b.value == null ? "RT_NULL" : b.value(expr).c }
+
+    ;fn stmt(ref s) {
+        ;if (s.handler != null) { ;s(whineStmt) ;return }
+        ;const kind is s.k
+        ;if (kind == "empty" || kind == "lineup" || kind == "steal" || kind == "bribe") { ;return }
+        ;if (kind == "scheme") { ;s(schemeDef) ;return }
+        ;if (kind == "getaway") {
+            ;if (iife) { ;(s.pos, "'return' inside a conditional used as a value is not supported yet")(diag.abort) }
+            ;"RT_RET({s.e == null ? "RT_NULL" : s.e(expr).c});"(emit)
+            ;return
+        }
+        ;if (kind == "tantrum") { ;"rt_tantrum({s.e(expr).c});"(emit) ;return }
+        ;if (kind == "bail" || kind == "loiter") {
+            ;if (loops == 0) { ;(s.pos, "'{kind == "bail" ? "break" : "continue"}' cannot leave a conditional used as a value yet")(diag.abort) }
+            ;(kind == "bail" ? "break;" : "continue;")(emit)
+            ;return
+        }
+        ;if (kind == "lurk") {
+            ;"while ({s.neg ? "!" : ""}rt_cond({s.cond(expr).c})) {{"(emit)
+            ;set indent += 1
+            ;set loops += 1
+            ;s.body(blockBody)
+            ;set loops -= 1
+            ;set indent -= 1
+            ;"}}"(emit)
+            ;return
+        }
+        ;if (kind == "signal") { ;"rt_i({s.code})"(signal) ;return }
+        ;if (kind == "exit") { ;"rt_exit({s.e == null ? "rt_i(0)" : s.e(expr).c});"(emit) ;return }
+        ;if (kind == "expr") {
+            ;if (s.e.k == "chain") { ;s.e(chainStmt) ;return }
+            ;if (s.e.k == "suspect") { ;s.e(suspectStmt) ;return }
+            ;if (s.e.k == "sigcall") { ;s.e.arg(expr).c(signal) ;return }
+            ;"(void){s.e(expr).c};"(emit)
+            ;return
+        }
+        ;if (kind == "claim") { ;(curSlot[s.namePos], (s.e, s(modeOf))(bindRhs))(claimDecl) ;return }
+        ;if (kind == "cheat") { ;s(cheatStmt) ;return }
+        ;panic "codegen: unhandled statement {kind}"
+    }
+
+    // A fail leaves the function at once; the caller sees the code (§8.2).
+    ;fn signal(code) {
+        ;"rt_signal({code});"(emit)
+        ;"RT_RET(RT_NULL);"(emit)
+    }
+
+    // Sets binding d for the first time: a new C local, or its frame slot or global.
+    ;fn claimDecl(d, value) {
+        ;const owner is decls[d].func
+        ;if (!fns[owner].top && owner == cur && !decls[d].captured) {
+            ;"wv {decls[d].cname} = {value};"(emit)
+        } else {
+            ;"{d(place)} = {value};"(emit)
+        }
+    }
+
+    ;fn schemeDef(s) {
+        ;const d is curSlot[s.namePos]
+        ;const f is decls[d].schemeFn
+        ;const pf is fns[f].parent
+        ;const hasUp is !fns[pf].top
+        ;var params is []
+        ;if (hasUp) { ;(params, "struct fr{pf} *up")($push) }
+        ;var k is 0
+        ;while (k < s.params($length)) {
+            ;const pd is curSlot[s.params[k].pos]
+            ;(params, "wv {decls[pd].captured ? "p_" : ""}{decls[pd].cname}")($push)
+            ;set k += 1
+        }
+        ;const proto is "static wv {fns[f].cname}({params($length) == 0 ? "void" : (params, ", ")($join)})"
+        ;var entry is { proto: proto, lines: [] }
+        ;(functions, entry)($push)
+        ;if (f(hasFrame)) { ;(frames, f)($push) }
+        ;const start is out($length)
+        ;const savedIndent is indent
+        ;const savedLoops is loops
+        ;const savedIife is iife
+        ;const savedCur is cur
+        ;set indent to 1
+        ;set loops to 0
+        ;set iife to false
+        ;set cur to f
+        ;"rt_enter({s.name(text.quote)});"(emit)
+        ;if (f(hasFrame)) { ;"struct fr{f} fr = {{ {hasUp ? ".up = up" : "0"} }};"(emit) }
+        ;set k to 0
+        ;while (k < s.params($length)) {
+            ;const p is s.params[k]
+            ;const pd is curSlot[p.pos]
+            ;const cn is decls[pd].cname
+            // A ref parameter takes the argument as it is (§6.1).
+            ;const arg is decls[pd].captured ? "p_{cn}" : cn
+            ;const v is p.isFickle ? arg : "rt_bind({arg}, {p.isShifty ? 1 : 0})"
+            ;if (decls[pd].captured) { ;"fr.{cn} = {v};"(emit) } else if (!p.isFickle) { ;"{cn} = {v};"(emit) }
+            ;set k += 1
+        }
+        ;s.body.stmts(stmts)
+        ;"RT_RET({s.body(valueOf)});"(emit)
+        ;set entry.lines to (out, start, out($length))($slice)
+        ;while (out($length) > start) { ;out($pop) }
+        ;set indent to savedIndent
+        ;set loops to savedLoops
+        ;set iife to savedIife
+        ;set cur to savedCur
+    }
+
+    // The value bound by a declaration or set, applying the copy table (§10.4, §10.9).
+    // mode: the column of the copy table, "const", "shifty" or "fickle". A
+    // literal is frozen unless bound var; ref keeps any other value as it is.
+    ;fn bindRhs(e, mode) {
+        ;const mutable is mode == "shifty"
+        ;if (e.k == "arr") { ;return (e, mutable)(array).c }
+        ;if (e.k == "rec") { ;return (e, mutable)(record).c }
+        ;if ((scalarKinds, e.k)(text.contains) || mode == "fickle") { ;return e(expr).c }
+        "rt_bind({e(expr).c}, {mutable ? 1 : 0})"
+    }
+
+    ;fn cheatStmt(s) {
+        ;const t is s.target
+        ;if (t.k == "name") {
+            ;const d is curSlot[t.pos]
+            ;const at is d(place)
+            ;if (s.op == null) {
+                ;const v is (s.e, decls[d].isFickle ? "fickle" : "shifty")(bindRhs)
+                ;if (!d(tdz)) { ;"{at} = {v};"(emit) ;return }
+                // The value is evaluated first; then the binding must exist (§5.1).
+                ;const temp is (tmp)
+                ;"wv {temp} = {v};"(emit)
+                ;"(void)rt_def({at}, {decls[d].name(text.quote)});"(emit)
+                ;"{at} = {temp};"(emit)
+                ;return
+            }
+            // The value is evaluated before the target is read (source order).
+            ;var v is s.e(expr)
+            ;if (s.e.k != "int" && s.e.k != "name") {
+                ;const temp is (tmp)
+                ;"wv {temp} = {v.c};"(emit)
+                ;set v to { c: temp, k: constK }
+            }
+            ;const sq is [d(read), v](seq)
+            ;"{at} = {(sq, "rt_{s.op(binFn)}({sq.cs[0]}, {sq.cs[1]})")(wrap).c};"(emit)
+            ;return
+        }
+        ;var key is null
+        ;if (t.k == "mem") { ;set key to { c: t.field(fieldRef), k: constK } }
+        ;const v is s.e(expr)
+        ;const i is t.k == "mem" ? key : t.index(expr)
+        ;const box is (t.k == "mem" ? t.rec : t.arr)(expr)
+        ;const sq is [v, i, box](seq)
+        ;const which is t.k == "mem" ? "mem" : "idx"
+        ;if (s.op == null) {
+            ;"{(sq, "rt_set_{which}({(sq.cs, ", ")($join)})")(wrap).c};"(emit)
+            ;return
+        }
+        ;"{(sq, "rt_upd_{which}({(sq.cs, ", ")($join)}, rt_{s.op(binFn)})")(wrap).c};"(emit)
+    }
+
+    ;fn exprs(list) {
+        ;var xs is []
+        ;var k is 0
+        ;while (k < list($length)) {
+            ;(xs, list[k](expr))($push)
+            ;set k += 1
+        }
+        xs
+    }
+
+    ;fn array(e, mutable) {
+        ;const sq is e.items(exprs)(seq)
+        (sq, "rt_arr({sq.cs($length)}, {sq.cs(values)}, {mutable ? 1 : 0})")(wrap)
+    }
+
+    // Records of one literal share their keys: a static shape K<n>.
+    ;fn record(e, mutable) {
+        ;var shape is "NULL"
+        ;if (e.fields($length) > 0) {
+            ;var names is []
+            ;var k is 0
+            ;while (k < e.fields($length)) {
+                ;(names, e.fields[k].name)($push)
+                ;set k += 1
+            }
+            ;const key is (names, ",")($join)
+            ;set k to 0
+            ;while (k < names($length)) {
+                ;names[k](fieldRef)
+                ;set k += 1
+            }
+            ;set k to 0
+            ;while (k < shapes($length) && shapes[k] != key) { ;set k += 1 }
+            ;if (k == shapes($length)) { ;(shapes, key)($push) }
+            ;set shape to "K{k}"
+        }
+        ;var vals is []
+        ;var k is 0
+        ;while (k < e.fields($length)) {
+            ;(vals, e.fields[k].e(expr))($push)
+            ;set k += 1
+        }
+        ;const sq is vals(seq)
+        (sq, "rt_rec({mutable ? 1 : 0}, {sq.cs($length)}, {shape}, {sq.cs(values)})")(wrap)
+    }
+
+    // `whine` catches a signal from the statement's outermost call only, so the
+    // call's arguments are evaluated before it.
+    ;fn whineStmt(s) {
+        ;const call is s.e
+        ;var args is []
+        ;var k is 0
+        ;while (k < call.args($length)) {
+            ;const a is call.args[k]
+            ;if ((plainKinds, a.k)(text.contains)) {
+                ;(args, a(expr).c)($push)
+            } else {
+                ;const temp is (tmp)
+                ;"wv {temp} = {a(expr).c};"(emit)
+                ;(args, temp)($push)
+            }
+            ;set k += 1
+        }
+        ;const r is (tmp)
+        ;"wv {r} = {(call.callee, args, false)(callC)};"(emit)
+        ;"if (rt_sigcode) {{"(emit)
+        ;set indent += 1
+        ;const h is s.handler
+        ;if (h.param != null) { ;(curSlot[h.paramPos], "rt_i(rt_sigcode)")(claimDecl) }
+        ;"rt_sigcode = 0;"(emit)
+        ;"{{"(emit)
+        ;set indent += 1
+        ;h.body(resets)
+        ;h.body.stmts(stmts)
+        ;"{r} = {h.body(valueOf)};"(emit)
+        ;set indent -= 1
+        ;"}}"(emit)
+        ;set indent -= 1
+        ;"}}"(emit)
+        ;var rest is s
+        ;set rest.handler to null
+        ;set rest.e to { k: "raw", js: r, pos: s.pos, paren: false }
+        ;rest(stmt)
+    }
+
+    ;fn chainStmt(e) {
+        ;var k is 0
+        ;while (k < e.branches($length)) {
+            ;const b is e.branches[k]
+            ;"{k > 0 ? "}} else " : ""}if ({b(test)}) {{"(emit)
+            ;set indent += 1
+            ;b.body(blockBody)
+            ;set indent -= 1
+            ;set k += 1
+        }
+        ;if (e.els != null) {
+            ;"}} else {{"(emit)
+            ;set indent += 1
+            ;e.els(blockBody)
+            ;set indent -= 1
+        }
+        ;"}}"(emit)
+    }
+
+    ;fn test(b) { "{b.neg ? "!" : ""}rt_cond({b.cond(expr).c})" }
+
+    // Branches used as values, shared by conditional chains and matches. For a
+    // chain, branch i is its i-th branch; for a match, its i-th case, tested
+    // against the temporary t that holds the subject.
+    ;fn branchCount(e) { e.k == "chain" ? e.branches($length) : e.alibis($length) }
+    ;fn branchBody(e, i) { e.k == "chain" ? e.branches[i].body : e.alibis[i].body }
+    ;fn branchTest(e, t, i) { e.k == "chain" ? e.branches[i](test) : (t, e.alibis[i])(alibiTest) }
+
+    // Is every block, the else included, just a value?
+    ;fn isPlain(e) {
+        ;var k is 0
+        ;while (k <= e(branchCount)) {
+            ;const b is k < e(branchCount) ? (e, k)(branchBody) : e.els
+            ;var j is 0
+            ;while (j < b.stmts($length)) {
+                ;if (b.stmts[j].k != "empty") { ;return false }
+                ;set j += 1
+            }
+            ;set k += 1
+        }
+        true
+    }
+
+    // A ternary chain over the branches, ending in the else block's value.
+    ;fn ternaryChain(e, t) {
+        ;var code is e.els(valueOf)
+        ;var k is e(branchCount) - 1
+        ;while (k >= 0) {
+            ;set code to "({(e, t, k)(branchTest)} ? {(e, k)(branchBody)(valueOf)} : {code})"
+            ;set k -= 1
+        }
+        code
+    }
+
+    // A statement expression ({ ... }) that runs the first block whose test
+    // holds and has its value. subject, if not null, is the code that sets
+    // the temporary t first. Its lines are emitted into out, then taken back off.
+    ;fn branchValue(e, t, subject) {
+        ;const start is out($length)
+        ;const savedIndent is indent
+        ;const savedLoops is loops
+        ;const savedIife is iife
+        ;set indent to savedIndent + 1
+        ;set loops to 0
+        ;set iife to true
+        ;if (subject != null) { ;"wv {t} = {subject};"(emit) }
+        ;const r is (tmp)
+        ;"wv {r};"(emit)
+        ;var k is 0
+        ;while (k < e(branchCount)) {
+            ;const b is (e, k)(branchBody)
+            ;"{k > 0 ? "}} else " : ""}if ({(e, t, k)(branchTest)}) {{"(emit)
+            ;set indent += 1
+            ;b(resets)
+            ;b.stmts(stmts)
+            ;"{r} = {b(valueOf)};"(emit)
+            ;set indent -= 1
+            ;set k += 1
+        }
+        ;"}} else {{"(emit)
+        ;set indent += 1
+        ;e.els(resets)
+        ;e.els.stmts(stmts)
+        ;"{r} = {e.els(valueOf)};"(emit)
+        ;set indent -= 1
+        ;"}}"(emit)
+        ;"{r};"(emit)
+        ;const body is ((out, start, out($length))($slice), "\n")($join)
+        ;while (out($length) > start) { ;out($pop) }
+        ;set indent to savedIndent
+        ;set loops to savedLoops
+        ;set iife to savedIife
+        "({{\n{body}\n{("  ", indent)(repeat)}}})"
+    }
+
+    // A conditional used as a value: a ternary chain when every branch is just a
+    // value, otherwise a statement expression.
+    ;fn chainExpr(e) {
+        ;if (e(isPlain)) { ;return (e, null)(ternaryChain) }
+        (e, null, null)(branchValue)
+    }
+
+    // match (§7.5): the subject is evaluated once into a temporary, then
+    // compared with each case value by ==.
+    ;fn alibiTest(t, a) {
+        ;var tests is []
+        ;var k is 0
+        ;while (k < a.values($length)) {
+            ;(tests, "eq({t}, {a.values[k](expr).c})")($push)
+            ;set k += 1
+        }
+        (tests, " || ")($join)
+    }
+
+    // The else block, or for an exhaustive enum match (which has none), a
+    // block that raises a panic for a subject that is not one of the members.
+    ;fn suspectElse(e, t) {
+        ;if (e.els != null || e.alibis[0].values[0].k != "mem") { ;return e.els }
+        { stmts: [], value: { k: "raw", js: "(rt_no_alibi({t}), RT_NULL)", pos: null, paren: false }, close: null }
+    }
+
+    ;fn suspectStmt(e) {
+        ;const t is (tmp)
+        ;"wv {t} = {e.subject(expr).c};"(emit)
+        ;var k is 0
+        ;while (k < e.alibis($length)) {
+            ;"{k > 0 ? "}} else " : ""}if ({(t, e.alibis[k])(alibiTest)}) {{"(emit)
+            ;set indent += 1
+            ;e.alibis[k].body(blockBody)
+            ;set indent -= 1
+            ;set k += 1
+        }
+        ;const els is (e, t)(suspectElse)
+        ;if (els != null) {
+            ;"}} else {{"(emit)
+            ;set indent += 1
+            ;els(blockBody)
+            ;set indent -= 1
+        }
+        ;"}}"(emit)
+    }
+
+    // A match used as a value: a statement expression that sets the subject,
+    // then a ternary chain when every block is just a value.
+    ;fn suspectExpr(e) {
+        ;const t is (tmp)
+        ;const subject is e.subject(expr).c
+        ;var withElse is e
+        ;set withElse.els to (e, t)(suspectElse)
+        ;if (withElse(isPlain)) { ;return "({{ wv {t} = {subject}; {(withElse, t)(ternaryChain)}; }})" }
+        (withElse, t, subject)(branchValue)
+    }
+
+    // A call; checked: a fail it leaves pending becomes a panic here (§8.2).
+    ;fn callC(callee, ref args, checked) {
+        ;var code is ""
+        ;if (callee.k == "std") {
+            ;set code to "std_{callee.name}({(args, ", ")($join)})"
+            ;if (!(signalers, callee.name)(text.contains)) { ;return code }
+        } else {
+            ;var f is ""
+            ;var parent is null
+            ;if (callee.k == "mem") {
+                ;set f to "w{callee.rec(stolenFrom)(modId)}_{callee.field}"
+            } else {
+                ;const d is curSlot[callee.pos]
+                ;const sf is decls[d].schemeFn
+                ;set f to fns[sf].cname
+                ;const pf is fns[sf].parent
+                ;if (!fns[pf].top) { ;set parent to pf }
+            }
+            // A nested function gets its parent's frame: ours, or one up the chain.
+            ;var all is []
+            ;if (parent != null) {
+                ;(all, parent == cur ? "&fr" : "up{("->up", fns[cur].depth - fns[parent].depth - 1)(repeat)}")($push)
+            }
+            ;var k is 0
+            ;while (k < args($length)) { ;(all, args[k])($push) ;set k += 1 }
+            ;set code to "{f}({(all, ", ")($join)})"
+        }
+        checked ? "rt_chk({code}, {fns[cur].top ? "NULL" : fns[cur].name(text.quote)})" : code
+    }
+
+    ;fn expr(ref e) {
+        ;const kind is e.k
+        ;if (kind == "int") { ;return { c: "rt_i({e.v})", k: constK } }
+        ;if (kind == "float") { ;return { c: "rt_f({e.v})", k: constK } }
+        ;if (kind == "str") {
+            ;var parts is []
+            ;var k is 0
+            ;while (k < e.parts($length)) {
+                ;const part is e.parts[k]
+                ;if (part($typeOf) == "string") {
+                    ;if (part != "") { ;(parts, { c: "rt_s({part(str)})", k: constK })($push) }
+                } else {
+                    ;(parts, { c: "rt_text({part(expr).c})", k: effectK })($push)
+                }
+                ;set k += 1
+            }
+            ;if (parts($length) == 0) { ;return { c: "rt_s({""(str)})", k: constK } }
+            ;if (parts($length) == 1 && parts[0].k == constK) { ;return parts[0] }
+            ;const sq is parts(seq)
+            ;return (sq, "rt_cat({sq.cs($length)}, {sq.cs(values)})")(wrap)
+        }
+        ;if (kind == "bool") { ;return { c: "rt_b({e.v ? 1 : 0})", k: constK } }
+        ;if (kind == "null") { ;return { c: "RT_NULL", k: constK } }
+        ;if (kind == "nan") { ;return { c: "RT_NOBODY", k: constK } }
+        ;if (kind == "inf") { ;return { c: "RT_EVERYBODY", k: constK } }
+        ;if (kind == "name") { ;return curSlot[e.pos](read) }
+        ;if (kind == "std") { ;return { c: "std_{e.name}()", k: constK } }
+        ;if (kind == "arr") { ;return (e, false)(array) }
+        ;if (kind == "rec") { ;return (e, false)(record) }
+        ;if (kind == "idx") {
+            ;const sq is [e.index(expr), e.arr(expr)](seq)
+            ;return (sq, "rt_idx({sq.cs[0]}, {sq.cs[1]})")(wrap)
+        }
+        ;if (kind == "mem") {
+            // An enum member, a declaration imported from a module, or a record field. The
+            // checker forbids shadowing enum and module names, so these are exact.
+            ;const lin is e.rec(lineupOf)
+            ;if (lin != null) {
+                ;const ms is lin.node.members
+                ;var k is 0
+                ;while (ms[k].name != e.field) { ;set k += 1 }
+                ;return { c: "rt_m(&{lin.c}[{k}])", k: constK }
+            }
+            ;const lib is e.rec(stolenFrom)
+            ;if (lib != null) { ;return { c: "w{lib(modId)}_{e.field}", k: pureK } }
+            ;const key is { c: e.field(fieldRef), k: constK }
+            ;const sq is [key, e.rec(expr)](seq)
+            ;return (sq, "rt_get({sq.cs[0]}, {sq.cs[1]})")(wrap)
+        }
+        ;if (kind == "un") { ;return { c: "rt_{e.op(unFn)}({e.e(expr).c})", k: effectK } }
+        ;if (kind == "bin") {
+            ;if (e.op == "&&" || e.op == "||") {
+                ;return { c: "rt_b(rt_bool({e.l(expr).c}, \"{e.op}\") {e.op} rt_bool({e.r(expr).c}, \"{e.op}\"))", k: effectK }
+            }
+            ;const sq is [e.l(expr), e.r(expr)](seq)
+            ;return (sq, "rt_{e.op(binFn)}({sq.cs[0]}, {sq.cs[1]})")(wrap)
+        }
+        ;if (kind == "tern") {
+            ;return { c: "(rt_cond({e.c(expr).c}) ? {e.a(expr).c} : {e.b(expr).c})", k: effectK }
+        }
+        ;if (kind == "call") {
+            ;const sq is e.args(exprs)(seq)
+            ;return (sq, (e.callee, sq.cs, true)(callC))(wrap)
+        }
+        ;if (kind == "chain") { ;return { c: e(chainExpr), k: effectK } }
+        ;if (kind == "suspect") { ;return { c: e(suspectExpr), k: effectK } }
+        ;if (kind == "raw") { ;return { c: e.js, k: constK } }
+        ;panic "codegen: unhandled expression {kind}"
+    }
+
+    // The whole program: the runtime, then static data, then the functions.
+    ;fn assemble() {
+        // The runtime gets LF line endings however it is checked out, so the output is the same everywhere.
+        ;var all is [((runtime, "\r\n")($split), "\n")($join), "// ---- program ----", ""]
+        ;var k is 0
+        ;while (k < strings($length)) { ;(all, "static const wstr S{k} = {strings[k](wstrInit)};")($push) ;set k += 1 }
+        ;set k to 0
+        ;while (k < fields($length)) { ;(all, "static wstr F_{fields[k]} = {fields[k](wstrInit)};")($push) ;set k += 1 }
+        ;set k to 0
+        ;while (k < shapes($length)) {
+            ;const names is (shapes[k], ",")($split)
+            ;var refs is []
+            ;var j is 0
+            ;while (j < names($length)) { ;(refs, "&F_{names[j]}")($push) ;set j += 1 }
+            ;(all, "static const wstr *const K{k}[] = {{ {(refs, ", ")($join)} }};")($push)
+            ;set k += 1
+        }
+        ;set k to 0
+        ;while (k < lineupDefs($length)) { ;(all, lineupDefs[k])($push) ;set k += 1 }
+        ;set k to 0
+        ;while (k < frames($length)) {
+            ;const f is frames[k]
+            ;var members is []
+            ;const pf is fns[f].parent
+            ;if (!fns[pf].top) { ;(members, "struct fr{pf} *up;")($push) }
+            ;var j is 0
+            ;while (j < decls($length)) {
+                ;if (decls[j].func == f && decls[j].captured && decls[j].kind != "scheme") {
+                    ;(members, "wv {decls[j].cname};")($push)
+                }
+                ;set j += 1
+            }
+            ;if (members($length) == 0) { ;(members, "char none;")($push) }
+            ;(all, "struct fr{f} {{ {(members, " ")($join)} }};")($push)
+            ;set k += 1
+        }
+        ;set k to 0
+        ;while (k < globals($length)) { ;(all, "static wv {globals[k]};")($push) ;set k += 1 }
+        ;set k to 0
+        ;while (k < functions($length)) { ;(all, "{functions[k].proto};")($push) ;set k += 1 }
+        ;set k to 0
+        ;while (k < functions($length)) {
+            ;(all, "")($push)
+            ;(all, "{functions[k].proto} {{")($push)
+            ;const lines is functions[k].lines
+            ;var j is 0
+            ;while (j < lines($length)) { ;(all, lines[j])($push) ;set j += 1 }
+            ;(all, "}}")($push)
+            ;set k += 1
+        }
+        ;(all, "")($push)
+        ;(all, "static void wah_main(void) {{")($push)
+        ;if (fields($length) > 0) {
+            ;var refs is []
+            ;set k to 0
+            ;while (k < fields($length)) { ;(refs, "&F_{fields[k]}")($push) ;set k += 1 }
+            ;(all, "  rt_syms({fields($length)}, (wstr *const[]){{ {(refs, ", ")($join)} }});")($push)
+        }
+        ;set k to 0
+        ;while (k < out($length)) { ;(all, out[k])($push) ;set k += 1 }
+        ;(all, "}}")($push)
+        ;(all, "")($push)
+        (all, "\n")($join)
+    }
+
+    ;var mi is 0
+    ;while (mi < modules($length)) {
+        ;mi(analyze)
+        ;set mi += 1
+    }
+    ;set mi to 0
+    ;while (mi < modules($length)) {
+        ;const list is modules[mi].program.stmts
+        ;var li is 0
+        ;while (li < list($length)) {
+            ;if (list[li].k == "lineup") { ;(list[li], mi(modId))(lineupDef) }
+            ;set li += 1
+        }
+        ;set mi += 1
+    }
+    ;set mi to 0
+    ;while (mi < modules($length)) {
+        ;mi(enter)
+        ;modules[mi].program.stmts(stmts)
+        ;set mi += 1
+    }
+    ((assemble))
+}
+
+;end

@@ -1,0 +1,55 @@
+// match / case: a multi-way branch.
+//
+// The first case whose value equals the subject runs; there is no fallthrough.
+// else handles everything else.
+//
+// Usage: wvc build examples/match.wvt
+
+// ---- As a value ----
+// Every branch needs a value, and the match needs an else.
+;fn fizz(n) {
+    match (n % 15) {
+        case 0 { "FizzBuzz" }
+        case 3, 6, 9, 12 { "Fizz" }
+        case 5, 10 { "Buzz" }
+        else { n($toString) }
+    }
+}
+
+;var line is []
+;var n is 1
+;while (n <= 15) {
+    ;(line, n(fizz))($push)
+    ;set n += 1
+}
+;(line, " ")($join)($print)
+
+// ---- As a statement ----
+// A tiny stack machine. break and continue inside a case act on the enclosing loop.
+;const program is ["push 3", "push 4", "add", "print", "dance", "push 10", "mul", "print", "quit", "print"]
+;var stack is []
+;var pc is 0
+;while (pc < program($length)) {
+    ;const words is (program[pc], " ")($split)
+    ;set pc += 1
+    ;match (words[0]) {
+        case "push" {
+            ;(stack, words[1]($toInt))($push)
+        }
+        case "add", "mul" {
+            ;const b is stack($pop)
+            ;const a is stack($pop)
+            ;(stack, words[0] == "add" ? a + b : a * b)($push)
+        }
+        case "print" {
+            ;stack[-1]($print)
+        }
+        case "quit" {
+            ;break
+        }
+        else {
+            ;"unknown instruction '{words[0]}', skipped"($print)
+        }
+    }
+}
+;exit

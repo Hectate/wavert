@@ -1,0 +1,29 @@
+// FizzBuzz, with a function that returns a value and one that can fail.
+
+;fn fizzbuzz(n) {
+    ;var i is 1
+    ;while (i <= n) {
+        ;if (i % 15 == 0) {
+            ;"FizzBuzz"($print)
+        } else if (i % 3 == 0) {
+            ;"Fizz"($print)
+        } else if (i % 5 == 0) {
+            ;"Buzz"($print)
+        } else {
+            ;i($print)
+        }
+        ;set i += 1
+    }
+}
+
+;fn average(a, b) {
+    (a + b) / 2
+}
+
+// "x" is not a number, so $toInt fails; the handler's value replaces the call's.
+;const n is "x"($toInt)
+    onfail (c) { 0 }
+
+;100(fizzbuzz)
+;(1, 2)(average)($print) // 1.5
+;exit

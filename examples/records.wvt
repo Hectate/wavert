@@ -1,0 +1,73 @@
+// Records and member access.
+//
+// Builds an expression tree out of records and evaluates it, then shows
+// mutation, copying, computed field access and equality.
+//
+// Usage: wvc build examples/records.wvt
+
+// ---- Literals ----
+// A record as a block's value needs its own braces: the outer pair is the block.
+;fn num(n) { { kind: "num", value: n } }
+;fn bin(op, l, r) { { kind: "bin", op: op, left: l, right: r } }
+
+// (2 + 3) * 7. Several arguments are grouped before the function: (a, b)(f).
+;const sum is ("+", 2(num), 3(num))(bin)
+;const expr is ("*", sum, 7(num))(bin)
+
+// ---- Member access ----
+// Member access and indexing read left to right: e.left, xs[i].kind.
+;fn eval(e) {
+    ;if (e.kind == "num") { ;return e.value }
+    ;const l is e.left(eval)
+    ;const r is e.right(eval)
+    ;if (e.op == "+") { ;return l + r }
+    ;if (e.op == "*") { ;return l * r }
+    ;panic "unknown operator {e.op}"
+}
+
+;fn show(e) {
+    ;if (e.kind == "num") { ;return e.value($toString) }
+    "({e.left(show)} {e.op} {e.right(show)})"
+}
+
+;"{expr(show)} = {expr(eval)}"($print) // ((2 + 3) * 7) = 35
+;expr.left.left.value($print) // expr.left.left.value: 2
+
+// Records inside arrays.
+;const players is [{ name: "Ada", coins: 50 }, { name: "Grace", coins: 3 }]
+;var i is 0
+;while (i < players($length)) {
+    ;"{players[i].name}: {players[i].coins}"($print)
+    ;set i += 1
+}
+
+// ---- Mutation ----
+// Only mutable (var) records can change, and only fields that already exist.
+;var me is { name: "Grace", coins: 0, wins: 0 }
+;set me.coins += 10
+;set me.wins += 1
+;"{me.name}: {me.coins} coins, {me.wins} win"($print)
+
+// Declaring a mutable record with const takes a frozen snapshot.
+;const snapshot is me
+;set me.coins += 5
+;"now {me.coins}, snapshot {snapshot.coins}"($print)
+
+// ---- Computed access ----
+// record[key] reads or writes the field named by a string.
+;const stat is "wins"
+;set me[stat] += 1
+;const keys is me($fields)
+;var k is 0
+;while (k < keys($length)) {
+    ;const key is keys[k]
+    ;"{key} = {me[key]}"($print)
+    ;set k += 1
+}
+
+// ---- Equality ----
+// == compares references; $same compares fields and values.
+;const two is 2(num)
+;(two == 2(num))($print) // false
+;(two, 2(num))($same)($print) // true
+;exit

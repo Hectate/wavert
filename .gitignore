@@ -1,3 +1,11 @@
-# Build outputs (build.ps1)
+# Build outputs (build.ps1), and wvc built there
 /bin/
-/.wah/
+/.wvt/
+# Native builds of wvc (zig cc -O2 -o wvc/wvc.exe wvc/wvc.c)
+/wvc/wvc
+/wvc/wvc.exe
+/wvc/wvc.pdb
+# Programs built from the examples with wvc build
+/examples/**/*.c
+/examples/**/*.exe
+/examples/**/*.pdb

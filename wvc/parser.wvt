@@ -1,0 +1,768 @@
+// wvc: The Wavert parser (docs/hybrid-syntax.md; rewritten from wahc's parser.wah).
+//
+// Statements begin with ';'. Expressions use precedence climbing. Postfix
+// calls `x(f)`, indexing `xs[i]` and member access `rec.field` bind tightest.
+// Several arguments are grouped before the call, `(a, b)(f)`, and `(f)` or
+// `(module.f)` where an expression starts is a call with no arguments.
+//
+// The syntax tree is wahc's, so the checker and the code generators are
+// shared with it, and its node kinds keep wahc's Γ-- names:
+// Expression nodes (k): int float str bool null nan inf name std arr rec idx mem
+//   un bin tern call sigcall chain suspect. Each has pos and paren (true when parenthesized).
+// Statement nodes (k): empty scheme lineup steal bribe getaway tantrum bail loiter
+//   lurk signal exit expr claim cheat. Each has pos, end and handler: null, or the statement's
+//   onfail handler as { pos, param, paramPos, body }.
+// Wavert words map onto them: fn is a scheme, enum a lineup, import a steal,
+// const/var/ref a claim (isShifty for var, isFickle for ref), set a cheat,
+// return a getaway, panic a tantrum, break and continue are bail and loiter,
+// while is lurk, if and !if are a chain, match/case a suspect with alibis,
+// fail a signal (or a sigcall statement), and exit is exit. The export
+// modifiers are collected into the bribe statement that ;end becomes.
+
+;import text from "text.wvt"
+;import diag from "diag.wvt"
+;import lexer from "lexer.wvt"
+
+;const exprStart is ["int", "float", "str", "true", "false", "null", "nan", "inf", "id", "std",
+  "(", "[", "{{", "if", "!if", "match", "-", "!", "~"]
+;const whineOk is ["expr", "claim", "cheat", "getaway", "tantrum", "exit"]
+;const callees is ["id", "std"]
+;const exportable is ["fn", "const", "var", "ref", "enum"]
+
+// Binding power of a binary operator, or wh if t is not one.
+;fn precedence(t) {
+    ;if (t == "||") { ;return 1 }
+    ;if (t == "&&") { ;return 2 }
+    ;if (t == "==" || t == "!=") { ;return 3 }
+    ;if (t == "<" || t == ">" || t == "<=" || t == ">=") { ;return 4 }
+    ;if (t == "|") { ;return 5 }
+    ;if (t == "^") { ;return 6 }
+    ;if (t == "&") { ;return 7 }
+    ;if (t == "<<" || t == ">>") { ;return 8 }
+    ;if (t == "+" || t == "-") { ;return 9 }
+    ;if (t == "*" || t == "/" || t == "%") { ;return 10 }
+    0
+}
+
+;fn isIdent(s) {
+    ;const cs is (s, "")($split)
+    ;if (cs($length) == 0 || !cs[0](text.isIdStart)) { ;return false }
+    ;var k is 1
+    ;while (k < cs($length)) {
+        ;if (!cs[k](text.isIdChar)) { ;return false }
+        ;set k += 1
+    }
+    true
+}
+
+;fn describe(tk) {
+    ;if (tk.t == "eof") { ;return "end of input" }
+    ;if (tk.t == "id") { ;return "'{tk.v}'" }
+    ;if (tk.t == "std") { ;return "'\${tk.v}'" }
+    ;if (tk.t == "int" || tk.t == "float") { ;return "'{tk.text}'" }
+    ;if (tk.t == "str") { ;return "a string" }
+    ;if (tk.t == "opset") { ;return "'{tk.v}='" }
+    "'{tk.t}'"
+}
+
+;fn failAtHint(tk, message, hint) { ;(tk.pos, message, hint)(diag.failHint) }
+;fn failAt(tk, message) { ;(tk.pos, message, null)(diag.failHint) }
+
+;fn simpleStatement(k, e) { { k: k, e: e, pos: null, end: null, handler: null } }
+
+;export fn parse(ref toks) { (toks, false)(parser) }
+
+// Does evaluating e call anything? An expression statement that does not has no effect (§2.8).
+// Conditional chains count as having an effect.
+;fn hasEffect(e) {
+    ;const kind is e.k
+    ;if (kind == "call" || kind == "sigcall" || kind == "chain" || kind == "suspect") { ;return true }
+    ;if (kind == "str") {
+        ;var i is 0
+        ;while (i < e.parts($length)) {
+            ;if (e.parts[i]($typeOf) != "string" && e.parts[i](hasEffect)) { ;return true }
+            ;set i += 1
+        }
+        ;return false
+    }
+    ;if (kind == "arr") {
+        ;var i is 0
+        ;while (i < e.items($length)) {
+            ;if (e.items[i](hasEffect)) { ;return true }
+            ;set i += 1
+        }
+        ;return false
+    }
+    ;if (kind == "rec") {
+        ;var i is 0
+        ;while (i < e.fields($length)) {
+            ;if (e.fields[i].e(hasEffect)) { ;return true }
+            ;set i += 1
+        }
+        ;return false
+    }
+    ;if (kind == "idx") { ;return e.index(hasEffect) || e.arr(hasEffect) }
+    ;if (kind == "mem") { ;return e.rec(hasEffect) }
+    ;if (kind == "un") { ;return e.e(hasEffect) }
+    ;if (kind == "bin") { ;return e.l(hasEffect) || e.r(hasEffect) }
+    ;if (kind == "tern") { ;return e.c(hasEffect) || e.a(hasEffect) || e.b(hasEffect) }
+    false
+}
+
+// Parses toks as a program, or as the expression of a string interpolation when inner is real.
+;fn parser(ref toks, inner) {
+    ;var p is 0
+    // Blocks entered; hints about block values apply only inside one.
+    ;var depth is 0
+    // The declarations marked export, as { name, pos }, for the bribe that ;end becomes.
+    ;var exports is []
+    ;var firstExport is null
+
+    ;fn peek() { toks[p] }
+    ;fn at(type) { toks[p].t == type }
+    // Is the token at p the contextual keyword word (is, to, from, end)?
+    ;fn atWord(word) { toks[p].t == "id" && toks[p].v == word }
+    // A call is exactly `(name)`, `($name)` or `(module.name)`. After an
+    // expression it calls the function with that expression; where an
+    // expression starts, it calls it with no arguments. Any other '(' after an
+    // expression ends the expression.
+    ;fn atCall() {
+        ;if (p + 2 >= toks($length) || toks[p].t != "(") { ;return false }
+        ;if (toks[p + 2].t == ")" && (callees, toks[p + 1].t)(text.contains)) { ;return true }
+        // (module.name): a function a module exports (§13.1)
+        p + 4 < toks($length) && toks[p + 1].t == "id" && toks[p + 2].t == "."
+            && toks[p + 3].t == "id" && toks[p + 4].t == ")"
+    }
+    ;fn next() {
+        ;const tk is toks[p]
+        ;if (tk.t != "eof") { ;set p += 1 }
+        tk
+    }
+    ;fn accept(type) { type(at) ? (next) : null }
+    // msg null means "expected '<type>'".
+    ;fn expect(type, msg, hint) {
+        ;if (type(at)) { ;return (next) }
+        ;const found is (peek)
+        ;const m is msg == null ? "expected '{type}'" : msg
+        ;(found, "{m}, found {found(describe)}", hint)(failAtHint)
+    }
+    // Expects the contextual keyword word.
+    ;fn expectWord(word, hint) {
+        ;if (word(atWord)) { ;return (next) }
+        ;const found is (peek)
+        ;(found, "expected '{word}', found {found(describe)}", hint)(failAtHint)
+    }
+    ;fn lintSpace(op) {
+        ;if (!op.sp || !(peek).sp) {
+            ;(diag.warnings, (op.pos, "missing whitespace around '{op.t}'", null)(diag.warn))($push)
+        }
+    }
+
+    // ---- statements ----
+
+    ;fn program() {
+        ;var stmts is []
+        // Has a statement other than import or empty been seen?
+        ;var started is false
+        // The ;end statement, once seen.
+        ;var ended is null
+        ;while (!"eof"(at)) {
+            ;if (!";"(at)) {
+                ;const tk is (peek)
+                ;const hint is "("(at) ? "calls are postfix: write the arguments first, then the function, e.g. (a, b)(f)"
+                    : "every Wavert statement begins with ;"
+                ;(tk, "expected ';' to start a statement, found {tk(describe)}", hint)(failAtHint)
+            }
+            ;const s is (statement)
+            ;if (ended != null && s.k != "empty") {
+                ;(ended, "';end' must be the last statement of a library")(failAt)
+            }
+            ;if (s.k == "steal" && started) { ;(s.pos, "'import' must come before every other statement")(diag.abort) }
+            ;if (s.k != "steal" && s.k != "empty") { ;set started to true }
+            ;if (s.k == "bribe") { ;set ended to { pos: s.pos } }
+            ;(stmts, s)($push)
+        }
+        ;if (firstExport != null && ended == null) {
+            ;(firstExport, "'export' is only allowed in a library, which ends with ;end")(failAt)
+        }
+        { stmts: stmts, end: (peek).pos }
+    }
+
+    ;fn statement() {
+        ;const semi is (next)
+        ;const tk is (peek)
+        ;if (tk.t == ";" || tk.t == "}}" || tk.t == "eof") {
+            ;return { k: "empty", pos: semi.pos, end: tk.pos, handler: null }
+        }
+        ;var s is tk(statementBody)
+        ;set s.pos to tk.pos
+        ;if ("onfail"(at)) {
+            ;const w is (next)
+            ;if (!(whineOk, s.k)(text.contains)) {
+                ;(w, "'onfail' must follow a statement whose value comes from a call")(failAt)
+            }
+            ;var param is null
+            ;if ("("(accept) != null) {
+                ;set param to ("id", "expected a name for the fail code", null)(expect)
+                ;(")", null, null)(expect)
+            }
+            ;const noParam is param == null
+            ;set s.handler to {
+                pos: w.pos,
+                param: noParam ? null : param.v,
+                paramPos: noParam ? null : param.pos,
+                body: (block)
+            }
+        }
+        ;set s.end to (peek).pos
+        s
+    }
+
+    // The statement starting at tk, without its pos, end and handler.
+    ;fn statementBody(tk) {
+        ;const kind is tk.t
+        ;if (kind == "fn") { ;return (fnStatement) }
+        ;if (kind == "enum") { ;return (enumStatement) }
+        ;if (kind == "import") { ;return (importStatement) }
+        ;if (kind == "export") { ;return (exportStatement) }
+        ;if (kind == "const" || kind == "var" || kind == "ref") { ;return (declaration) }
+        ;if (kind == "set") { ;return (setStatement) }
+        ;if (kind == "return") {
+            ;(next)
+            ;const e is (exprStart, (peek).t)(text.contains) ? (expr) : null
+            ;return ("getaway", e)(simpleStatement)
+        }
+        ;if (kind == "panic") {
+            ;(next)
+            ;return ("tantrum", (expr))(simpleStatement)
+        }
+        ;if (kind == "break" || kind == "continue") {
+            ;(next)
+            ;return { k: kind == "break" ? "bail" : "loiter", pos: null, end: null, handler: null }
+        }
+        ;if (kind == "while" || kind == "!while") {
+            ;(next)
+            ;return {
+                k: "lurk", neg: kind == "!while", cond: kind(cond), body: (block),
+                pos: null, end: null, handler: null
+            }
+        }
+        ;if (kind == "fail") { ;return (failStatement) }
+        ;if (kind == "exit") {
+            ;(next)
+            ;const e is (exprStart, (peek).t)(text.contains) ? (expr) : null
+            ;return ("exit", e)(simpleStatement)
+        }
+        ;if (kind == "id" && tk.v == "end") {
+            ;const after is toks[p + 1].t
+            ;if (after == ";" || after == "}}" || after == "eof") { ;return (endStatement) }
+        }
+        ;if (kind == "onfail") { ;(tk, "'onfail' must follow a statement whose value comes from a call")(failAt) }
+        ;if (kind == "else") { ;(tk, "'else' without a preceding if or !if")(failAt) }
+        ;if (kind == "case") { ;(tk, "'case' outside a match")(failAt) }
+        ;const e is (expr)
+        ;if ("opset"(at) || "to"(atWord) && (e.k == "name" || e.k == "idx" || e.k == "mem")) {
+            ;(tk, "an assignment starts with 'set'", ";set x to value")(failAtHint)
+        }
+        ;if (!e(hasEffect)) {
+            ;const hint is depth > 0 ? "to make it the block's value, remove the ';' before it" : null
+            ;(diag.warnings, (tk.pos, "this statement has no effect", hint)(diag.warn))($push)
+        }
+        ("expr", e)(simpleStatement)
+    }
+
+    // ;const name is value, ;var name is value, ;ref name is value (§5).
+    ;fn declaration() {
+        ;const kw is (next)
+        ;const name is ("id", "expected a name after '{kw.t}'", ";{kw.t} name is value")(expect)
+        ;("is", ";{kw.t} {name.v} is value")(expectWord)
+        ;const e is (expr)
+        {
+            k: "claim", e: e, isShifty: kw.t == "var", isFickle: kw.t == "ref", name: name.v, namePos: name.pos,
+            pos: null, end: null, handler: null
+        }
+    }
+
+    // ;set target to value, or ;set target op= value.
+    ;fn setStatement() {
+        ;(next)
+        ;const target is (lvalue)
+        ;if ("to"(atWord)) {
+            ;(next)
+            ;return { k: "cheat", e: (expr), op: null, target: target, pos: null, end: null, handler: null }
+        }
+        ;if ("opset"(at)) {
+            ;const op is (next)
+            ;return { k: "cheat", e: (expr), op: op.v, target: target, pos: null, end: null, handler: null }
+        }
+        ;const found is (peek)
+        ;(found, "expected 'to' or a compound assignment such as '+=' after the target, found {found(describe)}",
+            ";set x to value")(failAtHint)
+    }
+
+    // ;fail, ;fail 3 (a code), or ;fail c (a computed code) (§8.2).
+    ;fn failStatement() {
+        ;const kw is (next)
+        ;if (!(exprStart, (peek).t)(text.contains)) {
+            ;return { k: "signal", code: 1, pos: null, end: null, handler: null }
+        }
+        ;const first is (peek)
+        ;const e is (expr)
+        ;if (e.k == "float" || e.k == "int" && e.v < 1) {
+            ;(first, "a fail code must be an integer >= 1")(failAt)
+        }
+        ;if (e.k == "int") {
+            ;return { k: "signal", code: e.v, pos: null, end: null, handler: null }
+        }
+        ("expr", { k: "sigcall", arg: e, pos: kw.pos, paren: false })(simpleStatement)
+    }
+
+    // ;import name from "path.wvt" (§13.1). The path is a plain string literal.
+    ;fn importStatement() {
+        ;const kw is (next)
+        ;if (depth > 0) { ;(kw, "'import' is only allowed at the top level of a file")(failAt) }
+        ;const name is ("id", "expected a name for the module after 'import'", ";import lib from \"lib.wvt\"")(expect)
+        ;("from", ";import {name.v} from \"{name.v}.wvt\"")(expectWord)
+        ;const e is (peek)
+        ;if (e.t != "str" || e.parts($length) != 1) {
+            ;(e, "an import path must be a plain string literal", ";import lib from \"lib.wvt\"")(failAtHint)
+        }
+        ;(next)
+        ;const path is e.parts[0]
+        ;if (((path, "")($split), "\\")(text.contains)) { ;(e, "import paths use '/' as the separator")(failAt) }
+        ;if (!(path($length) >= 4 && (path, -4, path($length))($slice) == ".wvt")) {
+            ;(e, "an import path includes the .wvt extension")(failAt)
+        }
+        { k: "steal", path: path, pathPos: e.pos, name: name.v, namePos: name.pos, pos: null, end: null, handler: null }
+    }
+
+    // ;export before a top-level declaration (§13.1).
+    ;fn exportStatement() {
+        ;const kw is (next)
+        ;if (depth > 0) { ;(kw, "only top-level declarations can be exported")(failAt) }
+        ;const tk is (peek)
+        ;if (!(exportable, tk.t)(text.contains)) {
+            ;(tk, "only fn, const, var, ref and enum declarations can be exported, found {tk(describe)}")(failAt)
+        }
+        ;const s is tk(statementBody)
+        ;if (firstExport == null) { ;set firstExport to kw }
+        ;(exports, { name: s.name, pos: s.namePos })($push)
+        s
+    }
+
+    // ;end, the last statement of a library: a bribe of what it exports.
+    ;fn endStatement() {
+        ;const kw is (next)
+        ;if (depth > 0) { ;(kw, "';end' is only allowed at the top level of a library")(failAt) }
+        ;if (exports($length) == 0) {
+            ;(kw, "a library must export at least one declaration", "mark one with 'export', e.g. ;export fn name(x) {{ ... }}")(failAtHint)
+        }
+        { k: "bribe", names: exports, pos: null, end: null, handler: null }
+    }
+
+    // ;fn name(a, var b, ref c) { ... } (§6.1).
+    ;fn fnStatement() {
+        ;(next)
+        ;if ("("(at)) {
+            ;((peek), "the name comes before the parameters", ";fn name(a, b) {{ ... }}")(failAtHint)
+        }
+        ;const name is ("id", "expected the function name after 'fn'", ";fn name(a, b) {{ ... }}")(expect)
+        ;("(", "expected '(' to open the parameter list", ";fn {name.v}(a, b) {{ ... }}")(expect)
+        ;var params is []
+        ;if (!")"(at)) {
+            ;while (true) {
+                ;const isShifty is "var"(accept) != null
+                ;const isFickle is !isShifty && ("ref"(accept) != null)
+                ;const pname is ("id", "expected a parameter name", "a parameter is a name, var name or ref name")(expect)
+                ;(params, { name: pname.v, isShifty: isShifty, isFickle: isFickle, pos: pname.pos })($push)
+                ;if (","(accept) == null) { ;break }
+            }
+        }
+        ;(")", "expected ')' to close the parameter list", null)(expect)
+        {
+            k: "scheme", name: name.v, namePos: name.pos, params: params, body: (block),
+            pos: null, end: null, handler: null
+        }
+    }
+
+    // ;enum Name (member, ...) (§4.1), only at the top level.
+    ;fn enumStatement() {
+        ;const kw is (next)
+        ;if (depth > 0) { ;(kw, "an enum can only be declared at the top level")(failAt) }
+        ;if ("("(at)) {
+            ;((peek), "the name comes before the members", ";enum Name (a, b)")(failAtHint)
+        }
+        ;const name is ("id", "expected the enum name after 'enum'", ";enum Name (a, b)")(expect)
+        ;("(", "expected '(' to open the member list", ";enum {name.v} (a, b)")(expect)
+        ;if (")"(at)) {
+            ;((peek), "an enum needs at least one member", ";enum {name.v} (a, b)")(failAtHint)
+        }
+        ;var members is []
+        ;while (true) {
+            ;const m is (peek)
+            ;if (m.t != "id") {
+                ;const message is (lexer.keywords, m.t)(text.contains) ? "'{m.t}' is a keyword and cannot be a member name"
+                    : "expected a member name, found {m(describe)}"
+                ;(m, message)(failAt)
+            }
+            ;(next)
+            ;var k is 0
+            ;while (k < members($length)) {
+                ;if (members[k].name == m.v) { ;(m, "duplicate member '{m.v}' in enum")(failAt) }
+                ;set k += 1
+            }
+            ;(members, { name: m.v, pos: m.pos })($push)
+            ;if (","(accept) == null) { ;break }
+        }
+        ;(")", "expected ',' or ')' in the member list", null)(expect)
+        {
+            k: "lineup", name: name.v, namePos: name.pos, members: members,
+            pos: null, end: null, handler: null
+        }
+    }
+
+    ;fn cond(kw) {
+        ;("(", "expected '(' after '{kw}'", "conditions are parenthesized: {kw} (x) {{ ... }}")(expect)
+        ;const e is (expr)
+        ;(")", "expected ')' to close the condition", null)(expect)
+        e
+    }
+
+    ;fn block() {
+        ;("{{", "expected '{{'", null)(expect)
+        ;set depth += 1
+        ;var stmts is []
+        ;while (";"(at)) { ;(stmts, (statement))($push) }
+        ;if ("}}"(at)) {
+            ;const close is (next)
+            ;set depth -= 1
+            ;return { stmts: stmts, value: null, close: close.pos }
+        }
+        ;if ("eof"(at)) { ;((peek), "unterminated block: expected '}}'")(failAt) }
+        ;const value is (expr)
+        ;if (!"}}"(at)) {
+            ;const hint is ":"(at) ? "a record as a block's value needs its own braces: {{ {{ key: value }} }}"
+                : "an expression without a leading ';' is the block's value and must come last"
+            ;const found is (peek)
+            ;(found, "expected '}}' after the block's value, found {found(describe)}", hint)(failAtHint)
+        }
+        ;const close is (next)
+        ;set depth -= 1
+        { stmts: stmts, value: value, close: close.pos }
+    }
+
+    ;fn lvalue() {
+        ;const tk is (peek)
+        ;const e is (postfix)
+        ;if (e.k != "name" && e.k != "idx" && e.k != "mem") {
+            ;(tk, "expected a name, an indexed element or a field to set")(failAt)
+        }
+        e
+    }
+
+    // ---- expressions ----
+
+    ;fn expr() { (ternary) }
+
+    ;fn ternary() { 1(binary)(ternaryTail) }
+
+    ;fn ternaryTail(ref c) {
+        ;if (!"?"(at)) { ;return c }
+        ;const q is (next)
+        ;q(lintSpace)
+        ;const a is (ternary)
+        ;const colon is (":", "expected ':' in conditional expression", null)(expect)
+        ;colon(lintSpace)
+        ;const b is (ternary)
+        { k: "tern", c: c, a: a, b: b, pos: q.pos, paren: false }
+    }
+
+    ;fn binary(min) { ((unary), min)(binaryFrom) }
+
+    ;fn binaryFrom(left, min) {
+        ;ref acc is left
+        ;while (true) {
+            ;const op is (peek)
+            ;const prec is op.t(precedence)
+            ;if (prec < min) { ;return acc }
+            ;(next)
+            ;op(lintSpace)
+            ;ref right is (prec + 1)(binary)
+            ;set acc to { k: "bin", op: op.t, l: acc, r: right, pos: op.pos, paren: false }
+        }
+    }
+
+    ;fn unary() {
+        ;const tk is (peek)
+        ;if (tk.t == "-" || tk.t == "!" || tk.t == "~") {
+            ;(next)
+            ;const e is (unary)
+            ;if (tk.t == "-" && e.k == "bin" && e.op == "**" && !e.paren) {
+                ;(tk, "'-x ** y' is ambiguous", "write -(x ** y) or (-x) ** y")(failAtHint)
+            }
+            // A negative number is a literal, as wah's WAH was.
+            ;if (tk.t == "-" && (e.k == "int" || e.k == "float") && !e.paren) {
+                ;return { k: e.k, v: -e.v, pos: tk.pos, paren: false }
+            }
+            ;return { k: "un", op: tk.t, e: e, pos: tk.pos, paren: false }
+        }
+        ((postfix)(powerTail))
+    }
+
+    ;fn powerTail(ref base) {
+        ;if (!"**"(at)) { ;return base }
+        ;const op is (next)
+        ;op(lintSpace)
+        { k: "bin", op: "**", l: base, r: (unary), pos: op.pos, paren: false }
+    }
+
+    // Postfix operators, which bind tightest: calls x(f), indexing xs[i] and
+    // member access rec.field, in any order, left to right.
+    ;fn postfix() {
+        ;ref e is (primary)
+        ;while (true) {
+            ;if ((atCall)) {
+                ;set e to [e](call)
+            } else if ("["(at)) {
+                ;const open is (next)
+                ;if (open.nl && depth > 0) {
+                    ;(diag.warnings, (open.pos, "'[' at the start of a line indexes the expression before it",
+                        "if it starts the block's value, wrap the value in parentheses: ([a, b])")(diag.warn))($push)
+                }
+                ;const index is (expr)
+                ;("]", "expected ']' to close the index", null)(expect)
+                ;if (index.k == "str" && !index.paren && index.parts($length) == 1 && index.parts[0]($typeOf) == "string") {
+                    ;const key is index.parts[0]
+                    ;if (key(isIdent) && !(lexer.keywords, key)(text.contains)) {
+                        ;(diag.warnings, (index.pos, "string-literal field key: write record.{key} instead of record[\"{key}\"]",
+                            null)(diag.warn))($push)
+                    }
+                }
+                ;set e to { k: "idx", index: index, arr: e, pos: open.pos, paren: false }
+            } else if ("."(at)) {
+                ;(next)
+                ;const tk is (peek)
+                ;if (tk.t != "id") {
+                    ;const message is (lexer.keywords, tk.t)(text.contains) ? "'{tk.t}' is a keyword and cannot be a field name"
+                        : "expected a field name after '.', found {tk(describe)}"
+                    ;(tk, message, "member access is written record.field, e.g. node.kind")(failAtHint)
+                }
+                ;(next)
+                ;set e to { k: "mem", field: tk.v, rec: e, pos: tk.pos, paren: false }
+            } else {
+                ;break
+            }
+        }
+        e
+    }
+
+    // Called only when atCall() holds: '(' name ')', '(' $name ')' or '(' module '.' name ')'.
+    ;fn call(ref args) {
+        ;(next)
+        ;const c is (next)
+        ;if ("."(accept) != null) {
+            ;const m is (next)
+            ;(next)
+            ;const rec is { k: "name", name: c.v, pos: c.pos, paren: false }
+            ;return {
+                k: "call", callee: { k: "mem", field: m.v, rec: rec, pos: m.pos, paren: false },
+                args: args, pos: m.pos, paren: false
+            }
+        }
+        ;(next)
+        {
+            k: "call", callee: { k: c.t == "id" ? "name" : "std", name: c.v, pos: c.pos, paren: false },
+            args: args, pos: c.pos, paren: false
+        }
+    }
+
+    ;fn primary() {
+        ;const tk is (peek)
+        ;const at0 is tk.pos
+        ;const kind is tk.t
+        ;if (kind == "if" || kind == "!if") { ;return (chain) }
+        ;if (kind == "match") { ;return (parseMatch) }
+        // (f) or (module.f) where an expression starts: a call with no arguments.
+        ;if ((atCall)) { ;return [](call) }
+        ;(next)
+        ;if (kind == "int" || kind == "float") { ;return { k: kind, v: tk.v, pos: at0, paren: false } }
+        ;if (kind == "str") {
+            ;var parts is []
+            ;var k is 0
+            ;while (k < tk.parts($length)) {
+                ;const part is tk.parts[k]
+                ;if (part($typeOf) == "string") {
+                    ;(parts, part)($push)
+                } else {
+                    ;(parts, (part.tokens, true)(parser))($push)
+                }
+                ;set k += 1
+            }
+            ;return { k: "str", parts: parts, pos: at0, paren: false }
+        }
+        ;if (kind == "true" || kind == "false") { ;return { k: "bool", v: kind == "true", pos: at0, paren: false } }
+        ;if (kind == "null") { ;return { k: "null", pos: at0, paren: false } }
+        ;if (kind == "nan") { ;return { k: "nan", pos: at0, paren: false } }
+        ;if (kind == "inf") { ;return { k: "inf", pos: at0, paren: false } }
+        ;if (kind == "id") { ;return { k: "name", name: tk.v, pos: at0, paren: false } }
+        ;if (kind == "std") { ;return { k: "std", name: tk.v, pos: at0, paren: false } }
+        ;if (kind == "(") {
+            ;if (")"(at)) { ;(tk, "empty parentheses", "a call with no arguments is written (f)")(failAtHint) }
+            ;var e is (expr)
+            ;if (","(at)) {
+                // (a, b)(f): the arguments of a call.
+                ;var args is [e]
+                ;while (","(accept) != null) {
+                    ;if (")"(at)) { ;((peek), "trailing comma in an argument list")(failAt) }
+                    ;(args, (expr))($push)
+                }
+                ;(")", "expected ',' or ')' in the argument list", null)(expect)
+                ;if (!(atCall)) {
+                    ;(tk, "a parenthesized list must be followed by the function it is passed to",
+                        "(a, b)(f) calls f with a and b")(failAtHint)
+                }
+                ;return args(call)
+            }
+            ;(")", null, null)(expect)
+            ;set e.paren to true
+            ;return e
+        }
+        ;if (kind == "[") {
+            ;var items is []
+            ;if (!"]"(at)) {
+                ;(items, (expr))($push)
+                ;while (","(at)) {
+                    ;const comma is (next)
+                    ;if ("]"(at)) { ;(comma, "trailing comma in array literal")(failAt) }
+                    ;(items, (expr))($push)
+                }
+            }
+            ;("]", "expected ',' or ']' in the array", null)(expect)
+            ;return { k: "arr", items: items, pos: at0, paren: false }
+        }
+        ;if (kind == "const" || kind == "var" || kind == "ref" || kind == "set") {
+            ;(tk, "unexpected '{kind}'", "declarations and assignments are statements: ;{kind} ...")(failAtHint)
+        }
+        ;if (kind == "fail") { ;(tk, "'fail' is a statement", ";fail c fails with code c")(failAtHint) }
+        ;if (kind == "opset") {
+            ;(tk, "unexpected '{tk.v}='", "an assignment is a statement: ;set x {tk.v}= value")(failAtHint)
+        }
+        ;if (kind == "{{") { ;return tk(record) }
+        ;(tk, "expected an expression, found {tk(describe)}")(failAt)
+    }
+
+    // Record literal (§10.7); the '{' is already consumed.
+    ;fn record(open) {
+        ;var fields is []
+        ;var seen is []
+        ;if (!"}}"(at)) {
+            ;while (true) {
+                ;const key is (peek)
+                ;if (key.t != "id") {
+                    ;const message is (lexer.keywords, key.t)(text.contains) ? "'{key.t}' is a keyword and cannot be a field name"
+                        : "expected a field name, found {key(describe)}"
+                    ;(key, message, "record literals are written {{ key: value, ... }}")(failAtHint)
+                }
+                ;(next)
+                ;if ((seen, key.v)(text.contains)) { ;(key, "duplicate field '{key.v}' in record literal")(failAt) }
+                ;(seen, key.v)($push)
+                ;if (!":"(at)) {
+                    ;const found is (peek)
+                    ;const hint is ","(at) || "}}"(at) ? "there is no shorthand; write {key.v}: {key.v}" : null
+                    ;(found, "expected ':' after field name '{key.v}', found {found(describe)}", hint)(failAtHint)
+                }
+                ;(next)
+                ;(fields, { name: key.v, e: (expr), pos: key.pos })($push)
+                ;if (!","(at)) { ;break }
+                ;const comma is (next)
+                ;if ("}}"(at)) { ;(comma, "trailing comma in record literal")(failAt) }
+            }
+        }
+        ;("}}", "expected ',' or '}}' in record literal", null)(expect)
+        { k: "rec", fields: fields, pos: open.pos, paren: false }
+    }
+
+    // match (subject) { case v, v { ... } ... else { ... } } (§7.5).
+    ;fn parseMatch() {
+        ;const kw is (next)
+        ;const subject is "match"(cond)
+        ;("{{", "expected '{{' after the match's subject", null)(expect)
+        ;var alibis is []
+        ;var els is null
+        ;while (true) {
+            ;if ("case"(at)) {
+                ;const a is (next)
+                ;if (els != null) { ;(a, "'else' must come last in a match")(failAt) }
+                ;if ("{{"(at)) {
+                    ;((peek), "a case needs at least one value", "case \"a\", \"b\" {{ ... }}")(failAtHint)
+                }
+                ;var values is []
+                ;(values, (caseValue))($push)
+                ;while (","(accept) != null) { ;(values, (caseValue))($push) }
+                ;(alibis, { values: values, body: (block), pos: a.pos })($push)
+            } else if ("else"(at)) {
+                ;const a is (next)
+                ;if (els != null) { ;(a, "a match has only one 'else'")(failAt) }
+                ;if (alibis($length) == 0) { ;(a, "a match needs at least one case before 'else'")(failAt) }
+                ;set els to (block)
+            } else {
+                ;break
+            }
+        }
+        ;if (alibis($length) == 0) {
+            ;((peek), "a match needs at least one case", "match (x) {{ case \"a\" {{ ... }} }}")(failAtHint)
+        }
+        ;("}}", "expected 'case', 'else' or '}}' in a match", null)(expect)
+        { k: "suspect", subject: subject, alibis: alibis, els: els, pos: kw.pos, paren: false }
+    }
+
+    // A case value: a literal, or Enum.member, which the checker resolves (§7.5).
+    ;fn caseValue() {
+        ;const tk is (peek)
+        ;const v is (unary)
+        ;const kind is v.k
+        ;if (kind == "int" || kind == "bool" || kind == "null") { ;return v }
+        // Enum.member, or module.Enum.member for an imported enum
+        ;if (kind == "mem" && (v.rec.k == "name" || v.rec.k == "mem" && v.rec.rec.k == "name")) { ;return v }
+        ;if (kind == "str") {
+            ;if (v.parts($length) == 1 && v.parts[0]($typeOf) == "string") { ;return v }
+            ;(tk, "a case value cannot be interpolated")(failAt)
+        }
+        ;if (kind == "float" || kind == "nan" || kind == "inf") {
+            ;(tk, "floats cannot be case values", "float equality makes a poor match; compare with if instead")(failAtHint)
+        }
+        ;(tk, "a case value must be a literal or an enum member",
+            "case values are integers, strings, true, false, null or Enum.member")(failAtHint)
+        null
+    }
+
+    ;fn chain() {
+        ;var branches is []
+        ;var els is null
+        ;while (true) {
+            ;const kw is (next)
+            ;const c is kw.t(cond)
+            ;if (kw.t == "!if" && c.k == "bin" && c.op == "!=") {
+                ;(diag.warnings, (kw.pos, "'!if (a != b)' is a double negative", "write 'if (a == b)'")(diag.warn))($push)
+            }
+            ;(branches, { neg: kw.t == "!if", cond: c, body: (block), pos: kw.pos })($push)
+            ;if ("else"(accept) == null) { ;break }
+            ;if ("if"(at) || "!if"(at)) { ;continue }
+            ;set els to (block)
+            ;break
+        }
+        { k: "chain", branches: branches, els: els, pos: branches[0].pos, paren: false }
+    }
+
+    ;if (inner) {
+        ;const e is (expr)
+        ;if (!"eof"(at)) {
+            ;const tk is (peek)
+            ;(tk, "unexpected {tk(describe)} in interpolation")(failAt)
+        }
+        ;return e
+    }
+    ((program))
+}
+
+;end

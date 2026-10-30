@@ -1,0 +1,14 @@
+{
+  "name": "wvc",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The Wavert compiler, written in Wavert",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22.3"
+  }
+}

@@ -1,0 +1,55 @@
+// ref bindings: rebound with set, but each value is kept as it is, frozen or
+// mutable, and never copied.
+//
+// Builds a list out of frozen records, walks it with a ref parameter, and
+// compares ref with var.
+//
+// Usage: wvc build examples/refs.wvt
+
+// ---- Building ----
+// Each step rebinds the head of the list to a new frozen record. A var
+// binding would copy every record to make it mutable; a ref one does not.
+;ref list is null
+;var i is 1
+;while (i <= 4) {
+    ;set list to { value: i, next: list }
+    ;set i += 1
+}
+
+// ---- Walking ----
+// A ref parameter takes the argument as it is and can be rebound, so the
+// function steps through the list without copying any of it.
+;fn total(ref node) {
+    ;var sum is 0
+    ;while (node != null) {
+        ;set sum += node.value
+        ;set node to node.next
+    }
+    sum
+}
+;"total: {list(total)}"($print)
+
+;fn describe(ref node) {
+    ;var values is []
+    ;while (node != null) {
+        ;(values, node.value)($push)
+        ;set node to node.next
+    }
+    (values, " -> ")($join)
+}
+;list(describe)($print)
+
+// ---- ref vs var ----
+// A ref binding keeps the value's identity; a var binding copies a frozen
+// value to make it mutable.
+;const frozen is [1, 2]
+;ref same is frozen
+;var copy is frozen
+;"ref keeps it: {same == frozen}, var copies it: {copy == frozen}"($print)
+
+// A frozen value stays frozen through a ref binding: its contents cannot
+// change. A mutable value is shared, so changes show through both names.
+;ref alias is copy
+;set alias[0] to 3
+;"through the alias: {copy[0]}"($print)
+;exit

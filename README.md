@@ -12,19 +12,68 @@ A programming language derived from [Γ--](wah/README.md) ("wah"). Wavert keeps 
 ;exit
 ```
 
-Wavert is still being designed. The proposed syntax, and the reasoning behind each decision, is in [docs/hybrid-syntax.md](docs/hybrid-syntax.md).
+The design, and the reasoning behind each decision, is in [docs/hybrid-syntax.md](docs/hybrid-syntax.md). Wavert's semantics are Γ--'s, specified in [wah/wah-spec.md](wah/wah-spec.md).
+
+## Quick tour
+
+| Wavert | Meaning |
+|---|---|
+| `;const x is 1` / `;var i is 0` / `;ref node is head` | declare a frozen, mutable or alias binding |
+| `;set i to i + 1` / `;set i += 1` / `;set xs[k] to v` / `;set rec.f to v` | assign |
+| `;x(f)` / `;(a, b)(f)` / `;(f)` | `f(x)` / `f(a, b)` / `f()`: calls are postfix and bind tightest |
+| `xs[i]`, `node.kind`, `items[i].tags[0]` | indexing and member access |
+| `0`, `42`, `-7`, `0xFF`, `0b101`, `1.5`, `1e9` | numbers |
+| `true`, `false`, `null`, `nan`, `inf` | constants |
+| `;if (c) { } else if (d) { } else { }` / `;!if (c) { }` | if / unless |
+| `;while (c) { }` / `;!while (c) { }` / `;break` / `;continue` | loops |
+| `;match (x) { case "a", "b" { } else { } }` | multi-way branch, no fallthrough |
+| `;enum Light (red, green)` / `Light.red` | enumeration |
+| `;fn add(a, b) { a + b }` / `;return x` | function; the last bare expression is its value |
+| `;fail 3` + `onfail (c) { ... }` | a failure the immediate caller handles |
+| `;panic "message"` | a fatal error |
+| `;import lib from "lib.wvt"` / `;export fn f() { }` / `lib.f`, `(x)(lib.f)` | modules |
+| `;exit` / `;end` | end of a program / of a library (required) |
 
 ## Layout
 
 | Path | Contents |
 |---|---|
 | [docs/](docs/) | Wavert design documents. |
-| [wah/](wah/) | The Γ-- language and toolchain, imported from the wah repo (commit `5d2318b`): spec, compilers, runtime, examples, editor support and project template. It is the seed for bootstrapping Wavert, and its contents will be converted to Wavert over time. This repo does not depend on the wah repo. |
-| [src/](src/) | Programs, built by `build.ps1`. Γ-- (`.wah`) for now. |
-| [build.ps1](build.ps1) | Builds every program in `src\` into `bin\` with the Γ-- compiler in `wah\` and Zig. |
+| [wvc/](wvc/) | `wvc`, the Wavert compiler, written in Wavert, with its tests; `wvc/wvc.c` is the bootstrap seed. |
+| [runtime/](runtime/) | The runtimes that compiled programs inline: `wvt.c` for C, `wvt.js` for `--target js`. |
+| [examples/](examples/) | Hello World, echo, FizzBuzz, records, `match`, enums, modules, `ref` bindings, and a Wavert tokenizer written in Wavert. |
+| [src/](src/) | Programs, built by `build.ps1`. |
+| [build.ps1](build.ps1) | Builds every program in `src\` into `bin\` with `wvc` and Zig. |
+| [tools/](tools/) | `wah2wvt.wah`, a Γ-- to Wavert converter written in Γ--, and `verify.mjs`, which checks a conversion. |
+| [wah/](wah/) | The Γ-- language and toolchain, imported from the wah repo (commit `5d2318b`): spec, compilers, runtime, examples, editor support and project template. It was the seed for bootstrapping Wavert, and Wavert no longer depends on it. This repo does not depend on the wah repo. |
 
 ## Building
 
-`.\build.ps1` builds every program; `.\build.ps1 -Program hello -Run` builds and runs one. It needs [Zig](https://ziglang.org/download/) (on PATH, in `ZIG`, or passed with `-Zig`). The first build compiles the compiler from `wah\wahc\wahc.c` and caches it in `.wah\`.
+You need [Zig](https://ziglang.org/download/) (on PATH, in `ZIG`, or passed with `-Zig`); see [Getting Zig](wah/README.md#getting-zig).
 
-The imported toolchain's tests need Node ≥ 22.3: run `npm test` in `wah\js`, `wah\wahc` or `wah\runtime`.
+`.\build.ps1` builds every program in `src\`; `.\build.ps1 -Program primes -Run` builds and runs one. The first build compiles `wvc` from `wvc\wvc.c` and caches it in `.wvt\`.
+
+To use `wvc` directly:
+
+```
+zig cc -O2 -o wvc/wvc.exe wvc/wvc.c
+wvc/wvc.exe build examples/fizzbuzz.wvt
+```
+
+See [wvc/README.md](wvc/README.md) for its options, and for changing it.
+
+## Tests
+
+Run `npm test` in `wvc\` (Node ≥ 22.3, and Zig). The imported Γ-- toolchain has its own tests: `npm test` in `wah\js`, `wah\wahc` or `wah\runtime`.
+
+## Converting Γ-- code
+
+```
+zig cc -O2 -o .wvt/wahc.exe wah/wahc/wahc.c
+.wvt/wahc.exe tools/wah2wvt.wah --target c -o .wvt/wah2wvt.c --runtime wah/runtime/wah.c
+zig cc -O2 -o .wvt/wah2wvt.exe .wvt/wah2wvt.c
+.wvt/wah2wvt.exe program.wah              # writes program.wvt
+node tools/verify.mjs .wvt/wahc.exe wvc/wvc.exe <dir with .wah files> <dir with .wvt files>
+```
+
+The converter keeps comments, blank lines and line breaks. It refuses names that are Wavert keywords (rename them in the Γ-- source first) and `$toWah`. Comparisons with `$typeOf`'s result `"purple"` must be changed to `"string"` by hand.

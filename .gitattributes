@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Generated C seeds keep LF line endings, so they are the same file everywhere.
+wvc/wvc.c text eol=lf
+*.wvt text eol=lf

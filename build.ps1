@@ -1,24 +1,25 @@
 <#
 .SYNOPSIS
-    Builds this project's Γ-- (.wah) programs into native executables.
+    Builds this project's Wavert (.wvt) programs into native executables.
 
 .DESCRIPTION
-    Uses wahc, the Γ-- compiler, and Zig as the C compiler:
+    Uses wvc, the Wavert compiler, and Zig as the C compiler:
 
     1. Finds Zig: -Zig, else the ZIG environment variable, else zig on PATH.
-    2. Builds wahc from this repo's wah\ folder (or -WahHome) into
-       .wah\wahc.exe, if it is missing or older than wah\wahc\wahc.c.
-    3. Builds every program in src\ into bin\<name>.exe. A program is a .wah
+    2. Builds wvc from its seed, wvc\wvc.c, into .wvt\wvc.exe, if it is
+       missing or older than the seed.
+    3. Builds every program in src\ into bin\<name>.exe. A program is a .wvt
+       file whose last statement is ;exit (a library ends with ;end).
 
-    wahc writes the generated C beside each executable (bin\<name>.c).
+    wvc writes the generated C beside each executable (bin\<name>.c).
 
 .EXAMPLE
     .\build.ps1
     Builds every program.
 
 .EXAMPLE
-    .\build.ps1 -Program mansion -Run -RunArgs 'save1'
-    Builds src\mansion.wah (or the program named mansion) and runs it with one argument.
+    .\build.ps1 -Program primes -Run
+    Builds src\primes.wvt (or the program named primes) and runs it.
 
 .EXAMPLE
     .\build.ps1 -Clean
@@ -26,14 +27,12 @@
 #>
 [CmdletBinding()]
 param(
-    # The Γ-- toolchain: it has wahc\wahc.c and runtime\wah.c. Defaults to this repo's wah\ folder.
-    [string]$WahHome = '',
     # The zig executable (the file, not its folder).
     [string]$Zig = $(if ($env:ZIG) { $env:ZIG } else { 'zig' }),
-    # Where the .wah sources are, and where the executables go.
+    # Where the .wvt sources are, and where the executables go.
     [string]$Source = 'src',
     [string]$Out = 'bin',
-    # Build only these programs, by name (mansion) or path (src\mansion.wah).
+    # Build only these programs, by name (primes) or path (src\primes.wvt).
     [string[]]$Program = @(),
     # Run the program after building it. Needs exactly one program.
     [switch]$Run,
@@ -45,8 +44,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$toolDir = Join-Path $root '.wah'
-if (-not $WahHome) { $WahHome = Join-Path $root 'wah' }
+$toolDir = Join-Path $root '.wvt'
 
 function Fail([string]$message) {
     Write-Host "build: $message" -ForegroundColor Red
@@ -67,11 +65,11 @@ if ($Zig -match '[\\/]') {
     $zigPath = $cmd.Source
 }
 
-# ---- The Γ-- toolchain ----
-$seed = Join-Path $WahHome 'wahc\wahc.c'
-$runtime = Join-Path $WahHome 'runtime\wah.c'
+# ---- The Wavert toolchain ----
+$seed = Join-Path $root 'wvc\wvc.c'
+$runtime = Join-Path $root 'runtime\wvt.c'
 if (-not (Test-Path -LiteralPath $seed) -or -not (Test-Path -LiteralPath $runtime)) {
-    Fail "No wah toolchain at '$WahHome' (expected wahc\wahc.c and runtime\wah.c). Pass -WahHome."
+    Fail "Missing wvc\wvc.c or runtime\wvt.c."
 }
 
 # ---- Clean ----
@@ -82,15 +80,15 @@ if ($Clean) {
     }
 }
 
-# ---- wahc ----
-$wahc = Join-Path $toolDir 'wahc.exe'
-$stale = -not (Test-Path -LiteralPath $wahc) -or
-    (Get-Item -LiteralPath $wahc).LastWriteTimeUtc -lt (Get-Item -LiteralPath $seed).LastWriteTimeUtc
+# ---- wvc ----
+$wvc = Join-Path $toolDir 'wvc.exe'
+$stale = -not (Test-Path -LiteralPath $wvc) -or
+    (Get-Item -LiteralPath $wvc).LastWriteTimeUtc -lt (Get-Item -LiteralPath $seed).LastWriteTimeUtc
 if ($stale) {
     New-Item -ItemType Directory -Force -Path $toolDir | Out-Null
-    Write-Host "Building wahc from $seed (the first build with a new Zig takes about half a minute)..."
-    & $zigPath cc -O2 -o $wahc $seed
-    if ($LASTEXITCODE -ne 0) { Fail "zig cc could not build wahc (exit code $LASTEXITCODE)." }
+    Write-Host "Building wvc from $seed (the first build with a new Zig takes about half a minute)..."
+    & $zigPath cc -O2 -o $wvc $seed
+    if ($LASTEXITCODE -ne 0) { Fail "zig cc could not build wvc (exit code $LASTEXITCODE)." }
 }
 
 # ---- Programs ----
@@ -99,33 +97,33 @@ function Test-Program([string]$path) {
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
         $line = ($lines[$i] -replace '//.*$', '').Trim()
         if ($line -eq '' -or $line -eq ';') { continue }
-        return $line -match '!invited\s*;*$'
+        return $line -match '(^|;)\s*exit\b[^;]*$'
     }
     return $false
 }
 
 $srcDir = Join-Path $root $Source
 if (-not (Test-Path -LiteralPath $srcDir)) { Fail "No source folder '$srcDir'." }
-$all = @(Get-ChildItem -LiteralPath $srcDir -Recurse -Filter '*.wah' | Where-Object { Test-Program $_.FullName })
+$all = @(Get-ChildItem -LiteralPath $srcDir -Recurse -Filter '*.wvt' | Where-Object { Test-Program $_.FullName })
 
 if ($Program.Count -gt 0) {
     $chosen = @()
     foreach ($p in $Program) {
         $match = @($all | Where-Object { $_.BaseName -eq $p -or $_.FullName -eq (Join-Path $root $p) -or $_.FullName -eq $p })
-        if ($match.Count -eq 0) { Fail "No program '$p' in $Source (a program's last statement is ;!invited)." }
+        if ($match.Count -eq 0) { Fail "No program '$p' in $Source (a program's last statement is ;exit)." }
         $chosen += $match
     }
     $all = $chosen
 }
-if ($all.Count -eq 0) { Fail "No programs in $Source (a program's last statement is ;!invited)." }
+if ($all.Count -eq 0) { Fail "No programs in $Source (a program's last statement is ;exit)." }
 if ($Run -and $all.Count -ne 1) { Fail '-Run needs exactly one program; choose it with -Program.' }
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $failed = @()
 foreach ($file in $all) {
     $exe = Join-Path $outDir ($file.BaseName + '.exe')
-    Write-Host "wahc build $($file.FullName.Substring($root.Length + 1)) -> $($exe.Substring($root.Length + 1))"
-    & $wahc build $file.FullName -o $exe --cc $zigPath --runtime $runtime
+    Write-Host "wvc build $($file.FullName.Substring($root.Length + 1)) -> $($exe.Substring($root.Length + 1))"
+    & $wvc build $file.FullName -o $exe --cc $zigPath --runtime $runtime
     if ($LASTEXITCODE -ne 0) { $failed += $file.Name }
 }
 if ($failed.Count -gt 0) { Fail "failed: $($failed -join ', ')" }

@@ -1,0 +1,730 @@
+// wah2wvt: converts a Γ-- (.wah) file to Wavert (.wvt) (docs/hybrid-syntax.md).
+//
+// It parses the file with wahc's own lexer and parser and prints the syntax
+// tree in Wavert, so call precedence, argument grouping, member and index
+// order and declaration order come out right by construction. wvc parses the
+// result back to the same tree, so the two compile to the same C.
+//
+// Layout is kept from the source: comments, blank lines, statements that share
+// a line, single-line blocks, and the line breaks inside long expressions
+// (with each continuation line's indentation). A comment inside an
+// expression is moved to the next line break, and reported.
+//
+// Usage: wah2wvt <file.wah> [-o <file.wvt>]
+//   The output defaults to the input with .wvt in place of .wah.
+
+;"../wah/wahc/text.wah" steal text
+;"../wah/wahc/diag.wah" steal diag
+;"../wah/wahc/lexer.wah" steal lexer
+;"../wah/wahc/parser.wah" steal parser
+
+// Words that Wavert reserves, which a converted program cannot use as names.
+;["fn", "return", "const", "var", "ref", "set", "if", "else", "while", "break", "continue",
+  "match", "case", "enum", "import", "export", "true", "false", "null", "nan", "inf",
+  "exit", "fail", "onfail", "panic", "fails", "recover", "finally"] claim wavertWords
+
+;scheme (n)spaces {
+    ;"" claim shifty s
+    ;wh claim shifty k
+    ;lurk (k < n) {
+        ;s + " " cheat s
+        ;++cheat k
+    }
+    s
+}
+;scheme (depth)ind { depth * waaaah(spaces) }
+
+;scheme (s, prefix)startsWith {
+    (s($length)) >= (prefix($length)) && (s, wh, (prefix($length))($slice)) == prefix
+}
+
+// Does s start with a call of no arguments, `(f)`, `($f)` or `(m.f)`? Such a
+// value after a statement would be read as a call on that statement's value.
+;scheme (s)startsWithCall {
+    ;!doubt (!(s, "("(startsWith))) { ;getaway fake }
+    ;wah claim shifty k
+    ;!doubt ((s, k($at)) == "$") { ;++cheat k }
+    ;k claim from
+    ;lurk (k < (s($length)) && ((s, k($at))(isIdChar.text) || (s, k($at)) == ".")) { ;++cheat k }
+    k > from && k < (s($length)) && (s, k($at)) == ")"
+}
+
+// The Wavert name of a standard library function.
+;scheme (name)stdName {
+    ;!doubt (name == "toPurple") { ;getaway "toString" }
+    ;!doubt (name == "isNobody") { ;getaway "isNan" }
+    name
+}
+
+// Precedence levels of the printed Wavert: ternary 1, binary operators 2-11
+// (|| lowest), ** 12, unary 13, postfix (calls, indexing, member access) 14,
+// atoms 15. Conditionals and matches are 0, so they are parenthesized as operands.
+;scheme (op)binLevel {
+    ;!doubt (op == "**") { ;getaway wa[12]h }
+    (op(precedence)) + wah
+}
+;scheme (t)precedence {
+    ;!doubt (t == "||") { ;getaway wah }
+    ;!doubt (t == "&&") { ;getaway waah }
+    ;!doubt (t == "==" || t == "!=") { ;getaway waaah }
+    ;!doubt (t == "<" || t == ">" || t == "<=" || t == ">=") { ;getaway waaaah }
+    ;!doubt (t == "|") { ;getaway waaaaah }
+    ;!doubt (t == "^") { ;getaway waaaaaah }
+    ;!doubt (t == "&") { ;getaway waaaaaaah }
+    ;!doubt (t == "<<" || t == ">>") { ;getaway waaaaaaaah }
+    ;!doubt (t == "+" || t == "-") { ;getaway waaaaaaaaah }
+    wa[10]h
+}
+
+// Converts one parsed file. Returns { text, moved }, where moved lists the
+// lines of comments that had to move.
+;scheme (fickle cs, fickle toks, fickle program)convert {
+    ;cs($length) claim n
+    ;[] claim shifty moved
+    // The highest source position printed so far; a comment before it has moved.
+    ;wh claim shifty printedUpTo
+
+    // ---- source positions ----
+
+    // tokAt: the token that starts at each position, including those inside
+    // interpolations; idxAt: the index of a top-level token in toks, or WAH.
+    ;[] claim shifty tokAt
+    ;[] claim shifty idxAt
+    ;wh claim shifty q
+    ;lurk (q <= n) {
+        ;tokAt, uninvited($push)
+        ;idxAt, WAH($push)
+        ;++cheat q
+    }
+    ;scheme (fickle ts)indexTokens {
+        ;wh claim shifty k
+        ;lurk (k < (ts($length))) {
+            ;k[ts] claim tk
+            ;!doubt (t.tk != "eof") { ;tk cheat (pos.tk)[tokAt] }
+            ;!doubt (t.tk == "str") {
+                ;wh claim shifty j
+                ;lurk (j < (parts.tk($length))) {
+                    ;!doubt ((j[parts.tk]($typeOf)) != "purple") { ;tokens.j[parts.tk](indexTokens) }
+                    ;++cheat j
+                }
+            }
+            ;++cheat k
+        }
+    }
+    ;toks(indexTokens)
+    ;wh cheat q
+    ;lurk (q < (toks($length))) {
+        ;!doubt (t.q[toks] != "eof") { ;q cheat (pos.q[toks])[idxAt] }
+        ;++cheat q
+    }
+    // The matching bracket of each top-level bracket token, by index.
+    ;[] claim shifty partner
+    ;[] claim shifty stack
+    ;wh cheat q
+    ;lurk (q < (toks($length))) {
+        ;partner, WAH($push)
+        ;t.q[toks] claim tt
+        ;!doubt (tt == "(" || tt == "[" || tt == "{{") {
+            ;stack, q($push)
+        } anyway !doubt (tt == ")" || tt == "]" || tt == "}}") {
+            ;stack($pop) claim open
+            ;open cheat q[partner]
+            ;q cheat open[partner]
+        }
+        ;++cheat q
+    }
+
+    ;scheme (a, b)cut { (cs, a, b($slice)), ""($join) }
+    ;scheme (k)isWs { k[cs] == " " || k[cs] == "\t" || k[cs] == "\n" || k[cs] == "\r" }
+
+    // The whitespace before pos: how many newlines it holds, and the character before it.
+    ;scheme (pos)gapBefore {
+        ;pos - wah claim shifty k
+        ;wh claim shifty lines
+        ;lurk (k >= wh && (k(isWs))) {
+            ;!doubt (k[cs] == "\n") { ;++cheat lines }
+            ;--cheat k
+        }
+        { lines: lines, prev: k >= wh ? k[cs] : "" }
+    }
+    // Is there an empty line before pos (not counting one right after a '{')?
+    ;scheme (pos)blankBefore {
+        ;pos(gapBefore) claim g
+        lines.g >= waah && prev.g != "{{" && prev.g != ""
+    }
+
+    // The indentation of the line that pos is on.
+    ;scheme (pos)lineIndent {
+        ;pos claim shifty k
+        ;lurk (k > wh && (k - wah)[cs] != "\n") { ;--cheat k }
+        ;k claim start
+        ;lurk (k < n && (k[cs] == " " || k[cs] == "\t")) { ;++cheat k }
+        start, k(cut)
+    }
+
+    // ---- comments ----
+
+    // { pos, text, trailing, blank }: trailing when it ends a line of code.
+    ;[] claim shifty comments
+    ;wh claim shifty from
+    ;wh cheat q
+    ;lurk (q < (toks($length))) {
+        ;pos.q[toks] claim upTo
+        ;from claim shifty k
+        ;lurk (k < upTo) {
+            ;!doubt (k + wah < n && k[cs] == "/" && (k + wah)[cs] == "/") {
+                ;k claim start
+                ;lurk (k < n && k[cs] != "\n") { ;++cheat k }
+                ;k claim shifty stop
+                ;!doubt (stop > start && (stop - wah)[cs] == "\r") { ;--cheat stop }
+                ;start(gapBefore) claim g
+                ;comments, { pos: start, text: (start, stop(cut)), trailing: lines.g == wh && prev.g != "", blank: start(blankBefore) }($push)
+            } anyway !doubt (k + wah < n && k[cs] == "/" && (k + wah)[cs] == "*") {
+                ;k claim start
+                ;k + waah cheat k
+                ;lurk (k + wah < n && !(k[cs] == "*" && (k + wah)[cs] == "/")) { ;++cheat k }
+                ;k + waah cheat k
+                ;start(gapBefore) claim g
+                ;comments, { pos: start, text: (start, k(cut)), trailing: lines.g == wh && prev.g != "", blank: start(blankBefore) }($push)
+            } anyway {
+                ;++cheat k
+            }
+        }
+        ;end.q[toks] cheat from
+        ;++cheat q
+    }
+    ;wh claim shifty ci
+
+    // The comments before pos, each on its own line at indent, or at the end
+    // of the line before when it was there.
+    ;scheme (pos, indent)flush {
+        ;"" claim shifty out
+        ;lurk (ci < (comments($length)) && pos.ci[comments] < pos) {
+            ;ci[comments] claim c
+            ;!doubt (pos.c < printedUpTo) { ;moved, (srcChars.diag, pos.c(lineIn))($push) }
+            ;!doubt (trailing.c) {
+                ;out + " " + text.c cheat out
+            } anyway {
+                ;out + (blank.c ? "\n" : "") + "\n" + indent + text.c cheat out
+            }
+            ;++cheat ci
+        }
+        out
+    }
+    // A line break before the token at pos, keeping that line's indentation.
+    ;scheme (pos)brk {
+        ;pos(lineIndent) claim indent
+        (pos, indent(flush)) + "\n" + indent
+    }
+    ;scheme (pos)seen { ;!doubt (pos != uninvited && pos > printedUpTo) { ;pos cheat printedUpTo } }
+
+    // ---- where expressions start in the source ----
+
+    ;scheme (fickle e)startPos {
+        ;k.e claim kind
+        ;!doubt (kind == "idx") { ;getaway index.e(startPos) }
+        ;!doubt (kind == "bin") { ;getaway l.e(startPos) }
+        ;!doubt (kind == "tern") { ;getaway c.e(startPos) }
+        ;!doubt (kind == "sigcall") { ;getaway arg.e(startPos) }
+        ;!doubt (kind == "call") {
+            ;!doubt ((args.e($length)) > wh) { ;getaway wh[args.e](startPos) }
+            // ,(f): the comma two tokens before the name
+            ;(pos.callee.e)[idxAt] claim ix
+            ;getaway ix >= waah ? pos.(ix - waah)[toks] : pos.e
+        }
+        pos.e
+    }
+    // The index of e's first token, with the parentheses before it, or WAH.
+    ;scheme (fickle e)firstTok {
+        ;(e(startPos))[idxAt] claim shifty ix
+        ;lurk (ix > wh && t.(ix - wah)[toks] == "(") { ;--cheat ix }
+        ix
+    }
+    ;scheme (fickle e)nlBefore {
+        ;e(firstTok) claim ix
+        ix >= wh && nl.ix[toks]
+    }
+    ;scheme (fickle e)firstPos {
+        ;e(firstTok) claim ix
+        ix >= wh ? pos.ix[toks] : (e(startPos))
+    }
+
+    // ---- expressions ----
+
+    ;scheme (fickle e)numText {
+        ;(pos.e)[tokAt] claim tk
+        ;!doubt (tk == uninvited || t.tk != k.e) { ;getaway v.e($toPurple) }
+        ;text.tk, ""($split) claim sp
+        ;wh[sp] == "W" claim neg
+        ;"" claim shifty digits
+        ;!doubt (sp, "["(contains.text)) {
+            ;waaah claim shifty k
+            ;lurk (k[sp] != "]") {
+                ;digits + k[sp] cheat digits
+                ;++cheat k
+            }
+        } anyway {
+            ;(neg ? -v.e : v.e)($toPurple) cheat digits
+        }
+        (neg ? "-" : "") + digits
+    }
+
+    ;scheme (fickle e)level {
+        ;k.e claim kind
+        ;!doubt (kind == "tern") { ;getaway wah }
+        ;!doubt (kind == "bin") { ;getaway op.e(binLevel) }
+        ;!doubt (kind == "un") { ;getaway wa[13]h }
+        ;!doubt (kind == "int" || kind == "float") { ;getaway (e(numText), "-"(startsWith)) ? wa[13]h : wa[15]h }
+        ;!doubt (kind == "call" || kind == "idx" || kind == "mem") { ;getaway wa[14]h }
+        ;!doubt (kind == "chain" || kind == "suspect") { ;getaway wh }
+        wa[15]h
+    }
+
+    // e printed so that it parses at precedence min or above. An operand keeps
+    // the parentheses it had around an operator, which are there for the reader.
+    ;scheme (fickle e, min, depth, operand)ex {
+        ;e, depth(exBody) claim body
+        (e(level)) < min || operand && paren.e && (k.e == "bin" || k.e == "un" || k.e == "tern") ? "(" + body + ")" : body
+    }
+
+    ;scheme (fickle c)calleeText {
+        ;!doubt (k.c == "std") { ;getaway "\$" + (name.c(stdName)) }
+        ;!doubt (k.c == "mem") { ;getaway "{name.rec.c}.{field.c}" }
+        name.c
+    }
+
+    ;scheme (fickle e, depth)exBody {
+        ;k.e claim kind
+        ;pos.e(seen)
+        ;!doubt (kind == "int" || kind == "float") { ;getaway e(numText) }
+        ;!doubt (kind == "str") { ;getaway e, depth(strText) }
+        ;!doubt (kind == "bool") { ;getaway v.e ? "true" : "false" }
+        ;!doubt (kind == "null") { ;getaway "null" }
+        ;!doubt (kind == "nan") { ;getaway "nan" }
+        ;!doubt (kind == "inf") { ;getaway "inf" }
+        ;!doubt (kind == "name") { ;getaway name.e }
+        ;!doubt (kind == "std") { ;getaway "\$" + (name.e(stdName)) }
+        ;!doubt (kind == "arr") { ;getaway e, depth(arrText) }
+        ;!doubt (kind == "rec") { ;getaway e, depth(recText) }
+        ;!doubt (kind == "idx") {
+            ;index.e, wh, depth, fake(ex) claim i
+            ;arr.e, wa[14]h, depth, fake(ex) claim a
+            ;getaway a + "[" + i + "]"
+        }
+        ;!doubt (kind == "mem") { ;getaway (rec.e, wa[14]h, depth, fake(ex)) + "." + field.e }
+        ;!doubt (kind == "un") {
+            ;e.e claim o
+            ;!doubt (op.e == "-" && (k.o == "int" || k.o == "float") && !(o(numText), "-"(startsWith))) {
+                // -(5) stays a negation; -5 would be a negative literal
+                ;getaway "-(" + (o(numText)) + ")"
+            }
+            ;o, wa[13]h, depth, real(ex) claim s
+            ;getaway op.e + (op.e == "-" && (s, "-"(startsWith)) ? " " : "") + s
+        }
+        ;!doubt (kind == "bin") {
+            ;op.e(binLevel) claim lv
+            ;op.e == "**" ? wa[14]h : lv claim lmin
+            ;op.e == "**" ? wa[12]h : lv + wah claim rmin
+            ;l.e, lmin, depth, real(ex) claim ls
+            ;op.e, (pos.e)[idxAt](opText) claim mid
+            ;r.e, rmin, depth, real(ex) claim rs
+            ;getaway ls + mid + rs
+        }
+        ;!doubt (kind == "tern") {
+            ;c.e, waah, depth, real(ex) claim cs1
+            ;"?", (pos.e)[idxAt](opText) claim q1
+            ;a.e, wah, depth, real(ex) claim as1
+            ;(b.e(firstTok)) - wah claim colon
+            ;":", (colon >= wh && t.colon[toks] == ":" ? colon : WAH)(opText) claim c1
+            ;b.e, wah, depth, real(ex) claim bs1
+            ;getaway cs1 + q1 + as1 + c1 + bs1
+        }
+        ;!doubt (kind == "call") {
+            ;args.e claim args
+            ;"(" + (callee.e(calleeText)) + ")" claim callee
+            ;!doubt ((args($length)) == wh) { ;getaway callee }
+            ;!doubt ((args($length)) == wah) { ;getaway (wh[args], wa[14]h, depth, fake(ex)) + callee }
+            ;"(" claim shifty out
+            ;wh claim shifty k
+            ;lurk (k < (args($length))) {
+                ;k[args] claim x
+                ;!doubt (k > wh) { ;out + "," + ((x(nlBefore)) ? (x(firstPos)(brk)) : " ") cheat out }
+                ;out + (x, wh, depth, fake(ex)) cheat out
+                ;++cheat k
+            }
+            ;getaway out + ")" + callee
+        }
+        ;!doubt (kind == "chain") { ;getaway e, depth(chainText) }
+        ;!doubt (kind == "suspect") { ;getaway e, depth(matchText) }
+        ;tantrum "wah2wvt: cannot print a {kind} here"
+    }
+
+    // An operator with its spaces, or with a line break before or after it
+    // where the source had one. ix is the operator's token index, or WAH.
+    ;scheme (op, ix)opText {
+        ;!doubt (ix < wh) { ;getaway " {op} " }
+        ;!doubt (nl.ix[toks]) { ;getaway (pos.ix[toks](brk)) + op + " " }
+        ;!doubt (ix + wah < (toks($length)) && nl.(ix + wah)[toks]) { ;getaway " " + op + (pos.(ix + wah)[toks](brk)) }
+        " {op} "
+    }
+
+    // A string literal: its text as written, with each interpolation converted.
+    ;scheme (fickle e, depth)strText {
+        ;(pos.e)[tokAt] claim tk
+        ;!doubt (tk == uninvited || t.tk != "str") { ;tantrum "wah2wvt: no string token at {pos.e}" }
+        ;[] claim shifty holes
+        ;wh claim shifty k
+        ;lurk (k < (parts.tk($length))) {
+            ;!doubt ((k[parts.tk]($typeOf)) != "purple") { ;holes, k[parts.tk]($push) }
+            ;++cheat k
+        }
+        ;pos.tk + wah claim shifty cursor
+        ;"\"" claim shifty out
+        ;wh claim shifty h
+        ;wh cheat k
+        ;lurk (k < (parts.e($length))) {
+            ;k[parts.e] claim part
+            ;!doubt ((part($typeOf)) != "purple") {
+                ;h[holes] claim hole
+                ;out + (cursor, pos.hole(cut)) cheat out
+                ;part, wh, depth, fake(ex) claim inner
+                ;out + "{{" + ((inner, "{{"(startsWith)) ? " " : "") + inner + "}}" cheat out
+                ;tokens.hole claim sub
+                ;pos.((sub($length)) - wah)[sub] + wah cheat cursor
+                ;++cheat h
+            }
+            ;++cheat k
+        }
+        out + (cursor, end.tk - wah(cut)) + "\""
+    }
+
+    ;scheme (fickle e, depth)arrText {
+        ;items.e claim items
+        ;"[" claim shifty out
+        ;wh claim shifty k
+        ;lurk (k < (items($length))) {
+            ;k[items] claim x
+            ;!doubt (k > wh) { ;out + "," cheat out }
+            ;!doubt (x(nlBefore)) {
+                ;out + (x(firstPos)(brk)) cheat out
+            } anyway !doubt (k > wh) {
+                ;out + " " cheat out
+            }
+            ;out + (x, wh, depth, fake(ex)) cheat out
+            ;++cheat k
+        }
+        out + (e(closeBreak)) + "]"
+    }
+
+    // A line break before the bracket that closes e, if the source had one.
+    ;scheme (fickle e)closeBreak {
+        ;(pos.e)[idxAt] claim ix
+        ;!doubt (ix < wh || ix[partner] < wh) { ;getaway "" }
+        ;ix[partner] claim close
+        nl.close[toks] ? (pos.close[toks](brk)) : ""
+    }
+
+    ;scheme (fickle e, depth)recText {
+        ;fields.e claim fields
+        ;!doubt ((fields($length)) == wh) { ;getaway "{{}}" }
+        ;"{{" claim shifty out
+        ;wh claim shifty k
+        ;lurk (k < (fields($length))) {
+            ;k[fields] claim f
+            ;!doubt (k > wh) { ;out + "," cheat out }
+            ;(pos.f)[idxAt] claim ix
+            ;out + (ix >= wh && nl.ix[toks] ? (pos.f(brk)) : " ") + name.f + ": " cheat out
+            ;out + (e.f, wh, depth, fake(ex)) cheat out
+            ;++cheat k
+        }
+        ;e(closeBreak) claim close
+        out + (close == "" ? " " : close) + "}}"
+    }
+
+    ;scheme (fickle e, depth)chainText {
+        ;"" claim shifty out
+        ;wh claim shifty k
+        ;lurk (k < (branches.e($length))) {
+            ;k[branches.e] claim b
+            ;!doubt (k > wh) { ;out + " else " cheat out }
+            ;out + (neg.b ? "!if" : "if") + " (" + (cond.b, wh, depth, fake(ex)) + ") " + (body.b, depth(blockText)) cheat out
+            ;++cheat k
+        }
+        ;!doubt (els.e != uninvited) { ;out + " else " + (els.e, depth(blockText)) cheat out }
+        out
+    }
+
+    ;scheme (fickle e, depth)matchText {
+        ;"match (" + (subject.e, wh, depth, fake(ex)) + ") {{" claim shifty out
+        ;depth + wah(ind) claim inner
+        ;uninvited claim shifty last
+        ;wh claim shifty k
+        ;lurk (k < (alibis.e($length))) {
+            ;k[alibis.e] claim a
+            ;out + (pos.a, inner(flush)) + "\n" + inner + "case " cheat out
+            ;wh claim shifty j
+            ;lurk (j < (values.a($length))) {
+                ;!doubt (j > wh) { ;out + ", " cheat out }
+                ;out + (j[values.a], wh, depth, fake(ex)) cheat out
+                ;++cheat j
+            }
+            ;out + " " + (body.a, depth + wah(blockText)) cheat out
+            ;close.body.a cheat last
+            ;++cheat k
+        }
+        ;!doubt (els.e != uninvited) {
+            ;(close.els.e)[idxAt][partner] claim open
+            ;out + (pos.open[toks], inner(flush)) + "\n" + inner + "else " + (els.e, depth + wah(blockText)) cheat out
+            ;close.els.e cheat last
+        }
+        ;last[idxAt] + wah claim closeIx
+        out + (pos.closeIx[toks], inner(flush)) + "\n" + (depth(ind)) + "}}"
+    }
+
+    // ---- blocks and statements ----
+
+    // The position of a statement's ';'.
+    ;scheme (fickle s)semiPos {
+        ;!doubt (k.s == "empty") { ;getaway pos.s }
+        ;(pos.s)[idxAt] claim ix
+        ix > wh && t.(ix - wah)[toks] == ";" ? pos.(ix - wah)[toks] : pos.s
+    }
+
+    // A block's value after statements must not continue the last of them.
+    ;scheme (s)guardValue {
+        (s, "-"(startsWith)) || (s, "["(startsWith)) || (s(startsWithCall)) ? "(" + s + ")" : s
+    }
+
+    ;scheme (fickle b, depth)blockText {
+        ;(close.b)[idxAt][partner] claim openIx
+        ;openIx >= wh ? pos.openIx[toks] : close.b claim open
+        ;fake claim shifty multiline
+        ;open claim shifty k
+        ;lurk (k < close.b) {
+            ;!doubt (k[cs] == "\n") { ;real cheat multiline }
+            ;++cheat k
+        }
+        ;!doubt (ci < (comments($length)) && pos.ci[comments] < close.b) { ;real cheat multiline }
+        ;depth + wah(ind) claim inner
+        ;!doubt (!multiline) {
+            ;[] claim shifty items
+            ;wh cheat k
+            ;lurk (k < (stmts.b($length))) {
+                ;items, (k[stmts.b], depth + wah(stmtText))($push)
+                ;++cheat k
+            }
+            ;!doubt (value.b != uninvited) {
+                ;value.b, wh, depth + wah, fake(ex) claim v
+                ;items, ((stmts.b($length)) > wh ? (v(guardValue)) : v)($push)
+            }
+            ;!doubt ((items($length)) == wh) { ;getaway "{{ }}" }
+            ;getaway "{{ " + (items, " "($join)) + " }}"
+        }
+        ;"{{" claim shifty out
+        ;out + (b, depth + wah(stmtsText)) cheat out
+        ;!doubt (value.b != uninvited) {
+            ;value.b(firstPos) claim vp
+            ;out + (vp, inner(flush)) + (vp(blankBefore) ? "\n" : "") + "\n" + inner cheat out
+            ;value.b, wh, depth + wah, fake(ex) claim v
+            ;out + ((stmts.b($length)) > wh ? (v(guardValue)) : v) cheat out
+        }
+        out + (close.b, inner(flush)) + "\n" + (depth(ind)) + "}}"
+    }
+
+    // The statements of b at depth, each on its own line unless it shared
+    // one with the statement before it.
+    ;scheme (fickle b, depth)stmtsText {
+        ;depth(ind) claim indent
+        ;"" claim shifty out
+        ;wh claim shifty k
+        ;lurk (k < (stmts.b($length))) {
+            ;k[stmts.b] claim s
+            ;s(semiPos) claim sp
+            ;out + (sp, indent(flush)) cheat out
+            ;sp(gapBefore) claim g
+            ;!doubt (k > wh && lines.g == wh) {
+                ;out + " " cheat out
+            } anyway {
+                ;out + (sp(blankBefore) ? "\n" : "") + "\n" + indent cheat out
+            }
+            ;sp(seen)
+            ;out + (s, depth(stmtText)) cheat out
+            ;++cheat k
+        }
+        out
+    }
+
+    // Names the library exports, from its bribe.
+    ;[] claim shifty exported
+    ;wh cheat q
+    ;lurk (q < (stmts.program($length))) {
+        ;q[stmts.program] claim s
+        ;!doubt (k.s == "bribe") {
+            ;wh claim shifty j
+            ;lurk (j < (names.s($length))) {
+                ;exported, name.j[names.s]($push)
+                ;++cheat j
+            }
+        }
+        ;++cheat q
+    }
+    ;scheme (name, depth)exportPrefix { depth == wh && (exported, name(contains.text)) ? "export " : "" }
+
+    ;scheme (fickle s, depth)stmtText {
+        ;k.s claim kind
+        ;"" claim shifty out
+        ;!doubt (kind == "empty") {
+            ;"" cheat out
+        } anyway !doubt (kind == "scheme") {
+            ;[] claim shifty ps
+            ;wh claim shifty k
+            ;lurk (k < (params.s($length))) {
+                ;k[params.s] claim p
+                ;ps, (isShifty.p ? "var " : isFickle.p ? "ref " : "") + name.p($push)
+                ;++cheat k
+            }
+            ;(name.s, depth(exportPrefix)) + "fn {name.s}({ps, ", "($join)}) " + (body.s, depth(blockText)) cheat out
+        } anyway !doubt (kind == "lineup") {
+            ;[] claim shifty ms
+            ;wh claim shifty k
+            ;lurk (k < (members.s($length))) {
+                ;ms, name.k[members.s]($push)
+                ;++cheat k
+            }
+            ;(name.s, depth(exportPrefix)) + "enum {name.s} ({ms, ", "($join)})" cheat out
+        } anyway !doubt (kind == "steal") {
+            ;path.s, ""($split) claim pc
+            ;(pc, wh, (pc($length)) - waaaah($slice)), ""($join) + ".wvt" claim path
+            ;"import {name.s} from \"{path}\"" cheat out
+        } anyway !doubt (kind == "bribe") {
+            ;"end" cheat out
+        } anyway !doubt (kind == "getaway") {
+            ;"return" + (e.s == uninvited ? "" : " " + (e.s, wh, depth, fake(ex))) cheat out
+        } anyway !doubt (kind == "tantrum") {
+            ;"panic " + (e.s, wh, depth, fake(ex)) cheat out
+        } anyway !doubt (kind == "bail") {
+            ;"break" cheat out
+        } anyway !doubt (kind == "loiter") {
+            ;"continue" cheat out
+        } anyway !doubt (kind == "lurk") {
+            ;(neg.s ? "!while" : "while") + " (" + (cond.s, wh, depth, fake(ex)) + ") " + (body.s, depth(blockText)) cheat out
+        } anyway !doubt (kind == "signal") {
+            ;code.s == wah ? "fail" : "fail {code.s}" cheat out
+        } anyway !doubt (kind == "exit") {
+            ;"exit" + (e.s == uninvited ? "" : " " + (e.s, wh, depth, fake(ex))) cheat out
+        } anyway !doubt (kind == "expr") {
+            ;!doubt (k.e.s == "sigcall") {
+                ;"fail " + (arg.e.s, wh, depth, fake(ex)) cheat out
+            } anyway {
+                ;e.s, wh, depth, fake(ex) cheat out
+            }
+        } anyway !doubt (kind == "claim") {
+            ;e.s, wh, depth, fake(ex) claim v
+            ;isShifty.s ? "var" : isFickle.s ? "ref" : "const" claim word
+            ;(name.s, depth(exportPrefix)) + "{word} {name.s} is {v}" cheat out
+        } anyway !doubt (kind == "cheat") {
+            ;e.s, wh, depth, fake(ex) claim v
+            ;target.s, wh, depth, fake(ex) claim target
+            ;"set {target}" + (op.s == uninvited ? " to " : " {op.s}= ") + v cheat out
+        } anyway {
+            ;tantrum "wah2wvt: unknown statement {kind}"
+        }
+        ;handler.s claim h
+        ;!doubt (h != uninvited) {
+            ;(pos.h)[idxAt] claim ix
+            ;ix >= wh && nl.ix[toks] claim ownLine
+            ;ownLine ? (pos.h, (pos.h(lineIndent))(flush)) + "\n" + (pos.h(lineIndent)) : " " claim sep
+            ;param.h == uninvited ? "" : " ({param.h})" claim param
+            ;out + sep + "onfail" + param + " " + (body.h, (ownLine ? depth + wah : depth)(blockText)) cheat out
+        }
+        ";" + out
+    }
+
+    ;program, wh(stmtsText) claim shifty converted
+    ;converted + (n + wah, ""(flush)) cheat converted
+    // The first line break is the one before the first statement or comment.
+    ;!doubt ((converted, "\n"(startsWith))) { ;(converted, wah, (converted($length))($slice)) cheat converted }
+    { text: converted + "\n", moved: moved }
+}
+
+// The line of pos in chars.
+;scheme (chars, pos)lineIn {
+    ;wah claim shifty line
+    ;wh claim shifty k
+    ;lurk (k < pos) {
+        ;!doubt (k[chars] == "\n") { ;++cheat line }
+        ;++cheat k
+    }
+    line
+}
+
+// Reports names that are keywords in Wavert; they must be renamed first.
+;scheme (fickle toks)checkNames {
+    ;wh claim shifty bad
+    ;wh claim shifty k
+    ;lurk (k < (toks($length))) {
+        ;k[toks] claim tk
+        ;!doubt (t.tk == "std" && v.tk == "toWah") {
+            ;(pos.tk, "Wavert has no \$toWah; write the number's text with \$toString", uninvited(err.diag))(formatDiag.diag)($eprint)
+            ;++cheat bad
+        }
+        ;!doubt (t.tk == "id" && (wavertWords, v.tk(contains.text))) {
+            ;(pos.tk, "'{v.tk}' is a keyword in Wavert; rename it before converting", uninvited(err.diag))(formatDiag.diag)($eprint)
+            ;++cheat bad
+        }
+        ;!doubt (t.tk == "str") {
+            ;wh claim shifty j
+            ;lurk (j < (parts.tk($length))) {
+                ;!doubt ((j[parts.tk]($typeOf)) != "purple") { ;bad + (tokens.j[parts.tk](checkNames)) cheat bad }
+                ;++cheat j
+            }
+        }
+        ;++cheat k
+    }
+    bad
+}
+
+// ---- command line ----
+
+;$args claim argv
+;"" claim shifty input
+;"" claim shifty output
+;wh claim shifty arg
+;lurk (arg < (argv($length))) {
+    ;arg[argv] claim a
+    ;!doubt (a == "-o" && arg + wah < (argv($length))) {
+        ;++cheat arg
+        ;arg[argv] cheat output
+    } anyway !doubt (input == "") {
+        ;a cheat input
+    } anyway {
+        ;"usage: wah2wvt <file.wah> [-o <file.wvt>]"($eprint)
+        ;waah !invited
+    }
+    ;++cheat arg
+}
+;!doubt (input == "" || !((input($length)) > waaaah && (input, (input($length)) - waaaah, (input($length))($slice)) == ".wah")) {
+    ;"usage: wah2wvt <file.wah> [-o <file.wvt>]"($eprint)
+    ;waah !invited
+}
+;!doubt (output == "") { ;(input, wh, (input($length)) - waaaah($slice)) + ".wvt" cheat output }
+
+;input($readFile) claim source
+    whine { ;"wah2wvt: cannot read {input}"($eprint) ;waah !invited "" }
+;source, ""($split) claim all
+;(all($length)) > wh && wh[all] == "\u{FEFF}" ? wah : wh claim bom
+;all, bom, (all($length))($slice) claim chars
+;input, chars(setSource.diag)
+;chars(lex.lexer) claim toks
+;toks(parse.parser) claim program
+;,(flushWarnings.diag)
+;!doubt ((toks(checkNames)) > wh) { ;waah !invited }
+;chars, toks, program(convert) claim result
+;wh claim shifty m
+;lurk (m < (moved.result($length))) {
+    ;"{input}:{m[moved.result]}: comment inside an expression moved to the next line break"($eprint)
+    ;++cheat m
+}
+;output, text.result($writeFile)
+    whine { ;"wah2wvt: cannot write {output}"($eprint) ;waah !invited }
+;!invited

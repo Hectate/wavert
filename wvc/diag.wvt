@@ -1,0 +1,66 @@
+// wvc: Diagnostics.
+// wvc stops at the first error: it prints the warnings so far, then the error, and exits 2.
+// The checker is the exception: it reports every error it finds.
+
+// The file being worked on, and its characters. A diagnostic records them when it is made.
+;export var srcFile is ""
+;export ref srcChars is []
+;export var warnings is []
+
+// Makes file, with these characters, the one being worked on.
+;export fn setSource(file, ref chars) {
+    ;set srcFile to file
+    ;set srcChars to chars
+}
+
+;export fn warn(pos, message, hint) {
+    { severity: "warning", pos: pos, message: message, hint: hint, file: srcFile, chars: srcChars }
+}
+;export fn err(pos, message, hint) {
+    { severity: "error", pos: pos, message: message, hint: hint, file: srcFile, chars: srcChars }
+}
+
+// file:line:col: severity: message, then the hint and the source line with a caret.
+;export fn formatDiag(d) {
+    ;const chars is d.chars
+    ;var line is 1
+    ;var lineStart is 0
+    ;var k is 0
+    ;while (k < d.pos) {
+        ;if (chars[k] == "\n") {
+            ;set line += 1
+            ;set lineStart to k + 1
+        }
+        ;set k += 1
+    }
+    ;var lineEnd is lineStart
+    ;while (lineEnd < chars($length) && chars[lineEnd] != "\n") { ;set lineEnd += 1 }
+    ;if (lineEnd > lineStart && chars[lineEnd - 1] == "\r") { ;set lineEnd -= 1 }
+    ;var pad is ""
+    ;set k to lineStart
+    ;while (k < d.pos && k < lineEnd) {
+        ;set pad to pad + (chars[k] == "\t" ? "\t" : " ")
+        ;set k += 1
+    }
+    ;const text is ((chars, lineStart, lineEnd)($slice), "")($join)
+    ;var out is "{d.file}:{line}:{d.pos - lineStart + 1}: {d.severity}: {d.message}"
+    ;if (d.hint != null) { ;set out to out + "\n  hint: {d.hint}" }
+    "{out}\n    {text}\n    {pad}^"
+}
+
+;export fn flushWarnings() {
+    ;var k is 0
+    ;while (k < warnings($length)) {
+        ;warnings[k](formatDiag)($eprint)
+        ;set k += 1
+    }
+}
+
+;export fn failHint(pos, message, hint) {
+    ;(flushWarnings)
+    ;(pos, message, hint)(err)(formatDiag)($eprint)
+    ;exit 2
+}
+;export fn abort(pos, message) { ;(pos, message, null)(failHint) }
+
+;end

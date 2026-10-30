@@ -1,0 +1,877 @@
+// wvc: The checker (forked from wahc's checker.wah; Γ-- spec §5.1, §6, §7.2, §8.2, §12, §13).
+//
+// - names resolve; no shadowing; no use of a declaration before it in the same function
+// - set only on var bindings (or fields/elements of them); functions are not values; call arity
+// - enum members exist; enums are not values; matches over members are exhaustive
+// - return / break / continue / fail only where they make sense
+// - conditional chains used as values end in a plain `anyway { ... }`
+// - the entry file ends with ;exit
+//
+// Unlike the earlier phases, the checker reports every error it finds, not just the first.
+// A scope is { parent, names }, where names is a mutable array of declarations:
+// { kind, name, isShifty, isFickle, namePos, visibleAt, fnId, arity }. Functions are told
+// apart by number (fnId), since records are compared by reference.
+
+;import text from "text.wvt"
+;import diag from "diag.wvt"
+
+// The standard library: name -> arity, or "const" for constants.
+;const stdlib is [
+    { name: "print", arity: 1 }, { name: "write", arity: 1 }, { name: "eprint", arity: 1 },
+    { name: "readLine", arity: 0 },
+    { name: "readFile", arity: 1 }, { name: "writeFile", arity: 2 }, { name: "appendFile", arity: 2 },
+    { name: "fileExists", arity: 1 }, { name: "listDir", arity: 1 }, { name: "deleteFile", arity: 1 },
+    { name: "args", arity: "const" }, { name: "env", arity: 1 },
+    { name: "programPath", arity: "const" }, { name: "run", arity: 2 },
+    { name: "length", arity: 1 }, { name: "at", arity: 2 }, { name: "slice", arity: 3 },
+    { name: "code", arity: 1 }, { name: "fromCode", arity: 1 }, { name: "split", arity: 2 },
+    { name: "join", arity: 2 }, { name: "toString", arity: 1 },
+    { name: "toInt", arity: 1 }, { name: "toFloat", arity: 1 },
+    { name: "push", arity: 2 }, { name: "pop", arity: 1 }, { name: "same", arity: 2 },
+    { name: "typeOf", arity: 1 },
+    { name: "fields", arity: 1 },
+    { name: "floor", arity: 1 }, { name: "ceil", arity: 1 }, { name: "round", arity: 1 },
+    { name: "trunc", arity: 1 }, { name: "toUint32", arity: 1 }, { name: "isNan", arity: 1 }
+]
+
+// The arity of a stdlib name, "const", or null if there is no such name.
+;fn stdSig(name) {
+    ;var k is 0
+    ;while (k < stdlib($length)) {
+        ;if (stdlib[k].name == name) { ;return stdlib[k].arity }
+        ;set k += 1
+    }
+    null
+}
+
+// How a declaration or parameter binds its values (§10.4).
+;fn modeOf(x) { x.isShifty ? "shifty" : x.isFickle ? "fickle" : "" }
+
+// A declaration kind as Wavert names it, after "a": " function", "n enum", " module".
+;fn kindText(kind) { kind == "scheme" ? " function" : kind == "lineup" ? "n enum" : " {kind}" }
+
+;fn plural(n) { "{n} argument" + (n == 1 ? "" : "s") }
+
+// Statements after which a block never reaches its end (§7.2).
+;const neverCompletes is ["getaway", "tantrum", "exit", "signal", "bail", "loiter"]
+// Statements whose onfail handler's value is used (§7.2).
+;const whineValueUsed is ["claim", "cheat", "getaway", "tantrum", "exit"]
+
+// An enum as written: Enum, or module.Enum for an imported one (§4.1, §13.1).
+;fn lineupText(x) { x.k == "name" ? x.name : "{x.rec.name}.{x.field}" }
+
+// A case value's identity for duplicate detection, and its text in messages (§7.5).
+;fn alibiKey(v) {
+    ;if (v.k == "str") { ;return "str:" + v.parts[0] }
+    ;if (v.k == "mem") { ;return "mem:{v.field}.{v.rec(lineupText)}" }
+    ;if (v.k == "null") { ;return "null" }
+    "{v.k}:{v.v}"
+}
+;fn alibiText(v) {
+    ;if (v.k == "str") { ;return v.parts[0](text.quote) }
+    ;if (v.k == "mem") { ;return "{v.rec(lineupText)}.{v.field}" }
+    ;if (v.k == "null") { ;return "null" }
+    "{v.v}"
+}
+
+// Does a function body contain a ;return with a value, outside nested functions?
+;fn getsAwayWithValue(ref list) {
+    ;var i is 0
+    ;while (i < list($length)) {
+        ;const s is list[i]
+        ;if (s.handler != null && s.handler.body.stmts(getsAwayWithValue)) { ;return true }
+        ;if (s.k == "getaway" && s.e != null) { ;return true }
+        ;if (s.k == "lurk" && s.body.stmts(getsAwayWithValue)) { ;return true }
+        ;if (s.k == "expr" && s.e.k == "chain") {
+            ;var b is 0
+            ;while (b < s.e.branches($length)) {
+                ;if (s.e.branches[b].body.stmts(getsAwayWithValue)) { ;return true }
+                ;set b += 1
+            }
+            ;if (s.e.els != null && s.e.els.stmts(getsAwayWithValue)) { ;return true }
+        }
+        ;if (s.k == "expr" && s.e.k == "suspect") {
+            ;var a is 0
+            ;while (a < s.e.alibis($length)) {
+                ;if (s.e.alibis[a].body.stmts(getsAwayWithValue)) { ;return true }
+                ;set a += 1
+            }
+            ;if (s.e.els != null && s.e.els.stmts(getsAwayWithValue)) { ;return true }
+        }
+        ;set i += 1
+    }
+    false
+}
+
+// The line of pos in chars.
+;fn lineIn(chars, pos) {
+    ;var line is 1
+    ;var k is 0
+    ;while (k < pos) {
+        ;if (chars[k] == "\n") { ;set line += 1 }
+        ;set k += 1
+    }
+    line
+}
+;fn lineOf(pos) { (diag.srcChars, pos)(lineIn) }
+
+// What a library's top level may contain (§13.1).
+;const libraryTop is ["empty", "steal", "scheme", "claim", "lineup", "bribe"]
+
+// Checks the modules, in initialization order with the entry file last;
+// returns the errors (an empty array if there are none), and fills in each
+// module's exports and notLibrary. requireExit: the entry-file rule that the
+// last statement is ;exit (§13).
+;export fn check(modules, requireExit) {
+    ;var errors is []
+    ;var nextFn is 1
+    // The index of the module being checked.
+    ;var curMod is 0
+    // For the explicit-value check (§7.2): function declarations in order, as
+    // { mod, name, namePos, body }, and the first use of each one's value, as
+    // { mod, namePos, pos, useMod }, where useMod is the module of the use.
+    ;var schemes is []
+    ;var uses is []
+    // Enum declarations, as { mod, name, members }.
+    ;var lineups is []
+
+    ;fn error(pos, message, hint) { ;(errors, (pos, message, hint)(diag.err))($push) }
+
+    // Makes module m the current one, for positions in errors.
+    ;fn enter(m) {
+        ;set curMod to m
+        ;(modules[m].file, modules[m].chars)(diag.setSource)
+    }
+
+    // The members of the enum that d declares, as { name, pos }.
+    ;fn lineupMembers(d) {
+        ;var k is 0
+        ;while (k < lineups($length)) {
+            ;if (lineups[k].mod == d.mod && lineups[k].name == d.name) { ;return lineups[k].members }
+            ;set k += 1
+        }
+        null
+    }
+
+    // The first use of the value of the function declared at declPos in module mod, or null.
+    ;fn firstUse(mod, declPos) {
+        ;var k is 0
+        ;while (k < uses($length)) {
+            ;if (uses[k].mod == mod && uses[k].namePos == declPos) { ;return uses[k] }
+            ;set k += 1
+        }
+        null
+    }
+
+    // A block whose value is used must end with one, unless it never completes (§7.2).
+    ;fn requireValue(b) {
+        ;if (b.value != null) { ;return }
+        ;var last is null
+        ;var k is 0
+        ;while (k < b.stmts($length)) {
+            ;if (b.stmts[k].k != "empty") { ;set last to b.stmts[k] }
+            ;set k += 1
+        }
+        ;if (last != null && ((neverCompletes, last.k)(text.contains) || last.k == "expr" && last.e.k == "sigcall")) {
+            ;return
+        }
+        ;(b.close, "this block's value is used, but it does not produce one",
+            "end the block with its value, or with null if that is intended")(error)
+    }
+
+    ;fn newScope(parent) {
+        ;var names is []
+        { parent: parent, names: names }
+    }
+
+    // A declaration in the current module, mod. A module name's declaration
+    // (kind "module") has lib, the imported module's index; lib is null
+    // otherwise, and for a module whose import was in error, so that its uses
+    // are not reported again.
+    // mode: "shifty", "fickle" or "", how a binding binds its values (§10.4).
+    ;fn decl(kind, name, mode, namePos, visibleAt, fnId, arity) {
+        {
+            kind: kind, name: name, isShifty: mode == "shifty", isFickle: mode == "fickle", namePos: namePos, visibleAt: visibleAt, fnId: fnId, arity: arity,
+            mod: curMod, lib: null
+        }
+    }
+
+    // The declaration of name in scope itself, or null.
+    ;fn own(ref scope, name) {
+        ;var k is 0
+        ;while (k < scope.names($length)) {
+            ;if (scope.names[k].name == name) { ;return scope.names[k] }
+            ;set k += 1
+        }
+        null
+    }
+
+    // Declarations become visible at their position; functions, parameters and onfail
+    // codes are visible throughout their scope. A declaration may not reuse a
+    // name that is visible from an enclosing scope (§5.1).
+    ;fn declare(ref scope, name, d) {
+        ;const dup is (scope, name)(own)
+        ;if (dup != null) {
+            ;(d.namePos, "'{name}' is already declared in this scope (line {dup.namePos(lineOf)})", null)(error)
+            ;return
+        }
+        ;ref s is scope.parent
+        ;while (s != null) {
+            ;const outer is (s, name)(own)
+            ;if (outer != null && (outer.kind != "claim" || outer.namePos < d.namePos)) {
+                ;(d.namePos, "'{name}' shadows '{name}' from an enclosing scope (line {outer.namePos(lineOf)})",
+                    "Wavert forbids shadowing; choose another name")(error)
+                ;break
+            }
+            ;set s to s.parent
+        }
+        ;(scope.names, d)($push)
+    }
+
+    ;fn lookup(ref scope, name) {
+        ;ref s is scope
+        ;while (s != null) {
+            ;const d is (s, name)(own)
+            ;if (d != null) { ;return d }
+            ;set s to s.parent
+        }
+        null
+    }
+
+    ;fn resolve(name, pos, scope, ctx) {
+        ;const d is (scope, name)(lookup)
+        ;if (d == null) {
+            ;(pos, "unknown name '{name}'", null)(error)
+            ;return null
+        }
+        // Inside a nested function an outer declaration may be read before it runs; that is
+        // checked at runtime (temporal dead zone).
+        ;if (d.kind == "claim" && d.fnId == ctx.func.id && pos < d.visibleAt) {
+            ;(pos, "'{name}' is used before its declaration (line {d.namePos(lineOf)})", null)(error)
+        }
+        d
+    }
+
+    ;fn block(ref b, scope, ctx) {
+        ;var k is 0
+        ;while (k < b.stmts($length)) {
+            ;const s is b.stmts[k]
+            ;if (s.k == "scheme") {
+                ;const d is ("scheme", s.name, "", s.namePos, null, ctx.func.id, s.params($length))(decl)
+                ;(scope, s.name, d)(declare)
+                ;if ((scope, s.name)(own) == d) {
+                    ;(schemes, { mod: curMod, name: s.name, namePos: s.namePos, body: s.body })($push)
+                }
+            } else if (s.k == "lineup") {
+                ;const d is ("lineup", s.name, "", s.namePos, null, ctx.func.id, null)(decl)
+                ;(scope, s.name, d)(declare)
+                ;if ((scope, s.name)(own) == d) { ;(lineups, { mod: curMod, name: s.name, members: s.members })($push) }
+            } else if (s.k == "claim") {
+                ;(scope, s.name, ("claim", s.name, s(modeOf), s.namePos, s.end, ctx.func.id, null)(decl))(declare)
+            }
+            ;set k += 1
+        }
+        ;set k to 0
+        ;while (k < b.stmts($length)) {
+            ;(b.stmts[k], scope, ctx)(stmt)
+            ;set k += 1
+        }
+        ;if (b.value != null) { ;(b.value, scope, ctx)(expr) }
+    }
+
+    ;fn stmt(ref s, scope, ctx) {
+        ;const kind is s.k
+        ;if (kind == "empty" || kind == "lineup" || kind == "steal" || kind == "bribe") { ;return }
+        ;if (kind == "scheme") {
+            ;const func is { id: nextFn, top: false }
+            ;set nextFn += 1
+            ;const ps is scope(newScope)
+            ;var k is 0
+            ;while (k < s.params($length)) {
+                ;const p is s.params[k]
+                ;(ps, p.name, ("param", p.name, p(modeOf), p.pos, null, func.id, null)(decl))(declare)
+                ;set k += 1
+            }
+            ;(s.body, ps(newScope), { func: func, loops: 0 })(block)
+            ;return
+        }
+        ;if (kind == "getaway") {
+            ;if (ctx.func.top) { ;(s.pos, "'return' outside a function", null)(error) }
+            ;if (s.e != null) { ;(s.e, scope, ctx)(expr) }
+        } else if (kind == "tantrum") {
+            ;(s.e, scope, ctx)(expr)
+        } else if (kind == "bail" || kind == "loiter") {
+            ;if (ctx.loops == 0) { ;(s.pos, "'{kind == "bail" ? "break" : "continue"}' outside a loop", null)(error) }
+            ;return
+        } else if (kind == "lurk") {
+            ;(s.cond, scope, ctx)(expr)
+            ;(s.body, scope(newScope), { func: ctx.func, loops: ctx.loops + 1 })(block)
+            ;return
+        } else if (kind == "signal") {
+            ;if (ctx.func.top) { ;(s.pos, "'fail' outside a function: there is no caller to fail to", null)(error) }
+            ;return
+        } else if (kind == "exit") {
+            ;if (s.e != null) { ;(s.e, scope, ctx)(expr) }
+        } else if (kind == "expr") {
+            ;if (s.e.k == "sigcall") {
+                ;if (ctx.func.top) { ;(s.e.pos, "'fail' outside a function: there is no caller to fail to", null)(error) }
+                ;(s.e.arg, scope, ctx)(expr)
+            } else if (s.e.k == "chain") {
+                ;(s.e, scope, ctx, true)(chain)
+            } else if (s.e.k == "suspect") {
+                ;(s.e, scope, ctx, true)(checkSuspect)
+            } else if (s.e.k == "call") {
+                // The whole statement is a call, so its value is discarded.
+                ;var k is 0
+                ;while (k < s.e.args($length)) {
+                    ;(s.e.args[k], scope, ctx)(expr)
+                    ;set k += 1
+                }
+                ;(s.e, scope, false)(callee)
+            } else {
+                ;(s.e, scope, ctx)(expr)
+            }
+        } else if (kind == "claim") {
+            ;(s.e, scope, ctx)(expr)
+        } else if (kind == "cheat") {
+            ;(s.e, scope, ctx)(expr)
+            ;(s.target, scope, ctx)(lvalue)
+        }
+        ;if (s.handler != null) { ;(s, scope, ctx)(whineHandler) }
+    }
+
+    // `onfail` handles the outermost call of its statement (§8.2).
+    ;fn whineHandler(s, scope, ctx) {
+        ;const h is s.handler
+        ;if (s.e == null || s.e.k != "call") {
+            ;(h.pos, "'onfail' handles a call, but this statement's value is not a call",
+                "the call must be the outermost expression, e.g. ;const n is s(parse) onfail (c) {{ ... }}")(error)
+        }
+        ;const hs is scope(newScope)
+        ;if (h.param != null) {
+            ;(hs, h.param, ("whine", h.param, "", h.paramPos, null, ctx.func.id, null)(decl))(declare)
+        }
+        ;(h.body, hs(newScope), ctx)(block)
+        ;if ((whineValueUsed, s.k)(text.contains)) { ;h.body(requireValue) }
+    }
+
+    // A multi-way branch (§7.5). The parser has checked that each value is a
+    // literal or has the shape Enum.member or module.Enum.member; members
+    // are resolved here.
+    ;fn checkSuspect(e, scope, ctx, stmtLevel) {
+        ;(e.subject, scope, ctx)(expr)
+        // Alibi values seen so far, as { key, pos }.
+        ;var seen is []
+        // The sort of the values: "" for literals, else the enum as written
+        // (Kind, or module.Kind); null until one is known.
+        ;var sort is null
+        // The sort's declaration, for an enum.
+        ;var sortLineup is null
+        ;var a is 0
+        ;while (a < e.alibis($length)) {
+            ;const al is e.alibis[a]
+            ;var j is 0
+            ;while (j < al.values($length)) {
+                ;const v is al.values[j]
+                ;var vs is ""
+                ;if (v.k == "mem") {
+                    ;const d is (v, scope)(alibiLineup)
+                    ;set vs to d != null ? v.rec(lineupText) : null
+                    ;if (sort == null) { ;set sortLineup to d }
+                }
+                ;if (sort == null) {
+                    ;set sort to vs
+                } else if (vs != null && vs != sort) {
+                    ;const message is sort == "" || vs == "" ? "a match cannot mix literals and enum members"
+                        : "a match cannot mix members of '{sort}' and '{vs}'"
+                    ;(v.pos, message, null)(error)
+                }
+                ;const key is v(alibiKey)
+                ;var first is null
+                ;var q is 0
+                ;while (q < seen($length)) {
+                    ;if (seen[q].key == key) { ;set first to seen[q].pos }
+                    ;set q += 1
+                }
+                ;if (first != null) {
+                    ;(v.pos, "duplicate case value {v(alibiText)} (line {first(lineOf)})", null)(error)
+                } else {
+                    ;(seen, { key: key, pos: v.pos })($push)
+                }
+                ;set j += 1
+            }
+            ;(al.body, scope(newScope), ctx)(block)
+            ;if (!stmtLevel) { ;al.body(requireValue) }
+            ;set a += 1
+        }
+        ;if (e.els != null) {
+            ;(e.els, scope(newScope), ctx)(block)
+            ;if (!stmtLevel) { ;e.els(requireValue) }
+        } else if (sort != null && sort != "") {
+            // Without else, a match over an enum must handle every member.
+            ;const ms is sortLineup(lineupMembers)
+            ;var missing is []
+            ;var m is 0
+            ;while (m < ms($length)) {
+                ;const key is "mem:{ms[m].name}.{sort}"
+                ;var handled is false
+                ;var q is 0
+                ;while (q < seen($length)) {
+                    ;if (seen[q].key == key) { ;set handled to true }
+                    ;set q += 1
+                }
+                ;if (!handled) { ;(missing, "'{sort}.{ms[m].name}'")($push) }
+                ;set m += 1
+            }
+            ;if (missing($length) > 0) {
+                ;(e.pos, "match does not handle {(missing, ", ")($join)}",
+                    "add a case for each, or end the match with 'else {{ ... }}'")(error)
+            }
+        } else if (!stmtLevel) {
+            ;(e.pos, "a match used as a value must end with 'else {{ ... }}'", null)(error)
+        }
+    }
+
+    // The module declaration that x names, or null.
+    ;fn moduleNamed(ref x, scope) {
+        ;if (x.k != "name") { ;return null }
+        ;const d is (scope, x.name)(lookup)
+        d != null && d.kind == "module" ? d : null
+    }
+
+    // The declaration that module lib exports as name, or null.
+    ;fn exported(lib, name) {
+        ;const xs is modules[lib].exports
+        ;var k is 0
+        ;while (k < xs($length)) {
+            ;if (xs[k].name == name) { ;return xs[k] }
+            ;set k += 1
+        }
+        null
+    }
+
+    // The enum that x names, written Enum or module.Enum, or null. Reports nothing.
+    ;fn lineupNamed(ref x, scope) {
+        ;if (x.k == "name") {
+            ;const d is (scope, x.name)(lookup)
+            ;return d != null && d.kind == "lineup" ? d : null
+        }
+        ;if (x.k != "mem") { ;return null }
+        ;const m is (x.rec, scope)(moduleNamed)
+        ;if (m == null || m.lib == null) { ;return null }
+        ;const d is (m.lib, x.field)(exported)
+        d != null && d.kind == "lineup" ? d : null
+    }
+
+    // The declaration that module.name refers to, or null after an error
+    // (or when the module's import was already reported).
+    ;fn bribed(e, m) {
+        ;if (m.lib == null) { ;return null }
+        ;const d is (m.lib, e.field)(exported)
+        ;if (d == null) { ;(e.pos, "'{modules[m.lib].path}' does not export '{e.field}'", null)(error) }
+        d
+    }
+
+    ;fn unknownModule(x, scope) {
+        ;const message is (scope, x.name)(lookup) != null ? "'{x.name}' is not a module" : "unknown module '{x.name}'"
+        ;(x.pos, message, null)(error)
+    }
+
+    // module.name used as a value: an exported declaration (§13.1).
+    ;fn qualified(e, m) {
+        ;const d is (e, m)(bribed)
+        ;const label is "{e.rec.name}.{e.field}"
+        ;if (d != null && d.kind == "scheme") {
+            ;(e.pos, "'{label}' is a function; functions are not values", "to call it, write x({label}), or ({label}) with no arguments")(error)
+        } else if (d != null && d.kind == "lineup") {
+            ;(e.pos, "'{label}' is an enum, not a value", "its members are written {label}.member")(error)
+        }
+    }
+
+    // The enum that a case value Enum.member or module.Enum.member
+    // belongs to, or null after an error.
+    ;fn alibiLineup(v, scope) {
+        ;const x is v.rec
+        ;const d is (x, scope)(lineupNamed)
+        ;if (d != null) {
+            ;(v, d)(member)
+            ;return d
+        }
+        ;const hint is "case values are literals or enum members (Enum.member)"
+        ;if (x.k == "name") {
+            ;const message is (scope, x.name)(lookup) != null ? "'{x.name}' is not an enum" : "unknown enum '{x.name}'"
+            ;(x.pos, message, hint)(error)
+            ;return null
+        }
+        ;const m is (x.rec, scope)(moduleNamed)
+        ;if (m == null) {
+            ;(x.rec, scope)(unknownModule)
+        } else if ((x, m)(bribed) != null) {
+            ;(x.pos, "'{x(lineupText)}' is not an enum", hint)(error)
+        }
+        null
+    }
+
+    // Name.member, where Name is an enum (§4.1).
+    ;fn member(e, d) {
+        ;const ms is d(lineupMembers)
+        ;var names is []
+        ;var found is false
+        ;var k is 0
+        ;while (k < ms($length)) {
+            ;(names, ms[k].name)($push)
+            ;if (ms[k].name == e.field) { ;set found to true }
+            ;set k += 1
+        }
+        ;if (!found) {
+            ;(e.pos, "no member '{e.field}' in enum '{d.name}'", "its members are {(names, ", ")($join)}")(error)
+        }
+    }
+
+    ;fn chain(e, scope, ctx, stmtLevel) {
+        ;var k is 0
+        ;while (k < e.branches($length)) {
+            ;const b is e.branches[k]
+            ;(b.cond, scope, ctx)(expr)
+            ;(b.body, scope(newScope), ctx)(block)
+            ;if (!stmtLevel) { ;b.body(requireValue) }
+            ;set k += 1
+        }
+        ;if (e.els != null) {
+            ;(e.els, scope(newScope), ctx)(block)
+            ;if (!stmtLevel) { ;e.els(requireValue) }
+        } else if (!stmtLevel) {
+            ;(e.pos, "a conditional used as a value must end with a plain 'else {{ ... }}'", null)(error)
+        }
+    }
+
+    ;fn lvalue(ref t, scope, ctx) {
+        ;if (t.k == "name") {
+            ;const d is (t.name, t.pos, scope, ctx)(resolve)
+            ;if (d != null) {
+                ;(d, t.name, t.pos, "cannot set '{t.name}': it is not a var or ref", true)(mustBeShifty)
+                // The code generator binds the new value by the target's column of the copy table (§10.4).
+                ;if (d.isFickle) { ;(modules[curMod].fickleTargets, t.pos)($push) }
+            }
+            ;return
+        }
+        // The container that directly holds the target must be mutable (§10.9);
+        // nested containers are checked at runtime.
+        ;const isMem is t.k == "mem"
+        ;const box is isMem ? t.rec : t.arr
+        ;const what is isMem ? "a field" : "an element"
+        ;if (t.k == "idx") { ;(t.index, scope, ctx)(expr) }
+        ;if (isMem) {
+            ;if ((box, scope)(lineupNamed) != null) {
+                ;(t.pos, "cannot set '{box(lineupText)}.{t.field}': enum members are constants", null)(error)
+                ;return
+            }
+            // Only the module that declares a binding may set it (§13.1).
+            ;const m is (box, scope)(moduleNamed)
+            ;if (m != null) {
+                ;if ((t, m)(bribed) != null) {
+                    ;(t.pos, "cannot set '{box.name}.{t.field}': only '{modules[m.lib].path}' may set it", null)(error)
+                }
+                ;return
+            }
+        }
+        ;if (box.k == "name") {
+            ;const d is (box.name, box.pos, scope, ctx)(resolve)
+            ;if (d != null) {
+                ;(d, box.name, box.pos, "cannot modify {what} of '{box.name}': it is not a var", false)(mustBeShifty)
+            }
+        } else {
+            ;(box, scope, ctx)(expr)
+        }
+    }
+
+    // A set's binding must be var or ref. Through a ref binding, the
+    // value's own mutability is checked at runtime (§10.3). rebind: the set
+    // rebinds the name itself, rather than changing what it holds.
+    ;fn mustBeShifty(d, name, pos, message, rebind) {
+        ;if (d.kind == "scheme" || d.kind == "lineup" || d.kind == "module") {
+            ;(pos, "'{name}' is a{d.kind(kindText)}, not a binding", null)(error)
+        } else if (!d.isShifty && !d.isFickle) {
+            ;var hint is null
+            ;if (d.kind == "param") {
+                ;set hint to rebind ? "mark the parameter (ref {name}) to rebind it, or (var {name}) for a mutable copy"
+                    : "mark the parameter var: (var {name})"
+            } else if (d.kind == "claim") {
+                ;set hint to rebind ? "declare it with ';ref {name} is ...' to rebind it, or ';var {name} is ...' for a mutable copy"
+                    : "declare it with ';var {name} is ...'"
+            }
+            ;(pos, message, hint)(error)
+        }
+    }
+
+    ;fn unknownStd(node) {
+        ;(node.pos, "unknown standard library name '\${node.name}'",
+            "'$' is reserved for the standard library; user names have no sigil")(error)
+    }
+
+    ;fn expr(ref e, scope, ctx) {
+        ;const kind is e.k
+        ;if (kind == "int" || kind == "float" || kind == "bool" || kind == "null" || kind == "nan" || kind == "inf") {
+            ;return
+        }
+        ;if (kind == "str") {
+            ;var k is 0
+            ;while (k < e.parts($length)) {
+                ;if (e.parts[k]($typeOf) != "string") { ;(e.parts[k], scope, ctx)(expr) }
+                ;set k += 1
+            }
+            ;return
+        }
+        ;if (kind == "name") {
+            ;const d is (e.name, e.pos, scope, ctx)(resolve)
+            ;if (d != null && d.kind == "scheme") {
+                ;(e.pos, "'{e.name}' is a function; functions are not values", "to call it, write x({e.name}), or ({e.name}) with no arguments")(error)
+            } else if (d != null && d.kind == "lineup") {
+                ;(e.pos, "'{e.name}' is an enum, not a value", "its members are written {e.name}.member")(error)
+            } else if (d != null && d.kind == "module") {
+                ;(e.pos, "'{e.name}' is a module, not a value", "what it exports is written {e.name}.name")(error)
+            }
+            ;return
+        }
+        ;if (kind == "std") {
+            ;const sig is e.name(stdSig)
+            ;if (sig == null) {
+                ;e(unknownStd)
+            } else if (sig != "const") {
+                ;(e.pos, "'\${e.name}' is a function; call it with (\${e.name})", null)(error)
+            }
+            ;return
+        }
+        ;if (kind == "arr") {
+            ;var k is 0
+            ;while (k < e.items($length)) {
+                ;(e.items[k], scope, ctx)(expr)
+                ;set k += 1
+            }
+            ;return
+        }
+        ;if (kind == "rec") {
+            ;var k is 0
+            ;while (k < e.fields($length)) {
+                ;(e.fields[k].e, scope, ctx)(expr)
+                ;set k += 1
+            }
+            ;return
+        }
+        ;if (kind == "idx") {
+            ;(e.index, scope, ctx)(expr)
+            ;(e.arr, scope, ctx)(expr)
+            ;return
+        }
+        // A field label is not a binding, so only the record side is resolved
+        // (§10.8), unless that side names an enum (§4.1) or a module (§13.1).
+        ;if (kind == "mem") {
+            ;const lin is (e.rec, scope)(lineupNamed)
+            ;if (lin != null) {
+                ;(e, lin)(member)
+                ;return
+            }
+            ;const m is (e.rec, scope)(moduleNamed)
+            ;if (m != null) { ;(e, m)(qualified) } else { ;(e.rec, scope, ctx)(expr) }
+            ;return
+        }
+        ;if (kind == "un") {
+            ;(e.e, scope, ctx)(expr)
+            ;return
+        }
+        ;if (kind == "bin") {
+            ;(e.l, scope, ctx)(expr)
+            ;(e.r, scope, ctx)(expr)
+            ;return
+        }
+        ;if (kind == "tern") {
+            ;(e.c, scope, ctx)(expr)
+            ;(e.a, scope, ctx)(expr)
+            ;(e.b, scope, ctx)(expr)
+            ;return
+        }
+        ;if (kind == "call") {
+            ;var k is 0
+            ;while (k < e.args($length)) {
+                ;(e.args[k], scope, ctx)(expr)
+                ;set k += 1
+            }
+            ;(e, scope, true)(callee)
+            ;return
+        }
+        ;if (kind == "sigcall") {
+            ;(e.pos, "'fail' is a statement: ;fail c", null)(error)
+            ;return
+        }
+        ;if (kind == "suspect") {
+            ;(e, scope, ctx, false)(checkSuspect)
+            ;return
+        }
+        ;if (kind == "chain") {
+            ;(e, scope, ctx, false)(chain)
+            ;return
+        }
+        ;panic "checker: unhandled node {kind}"
+    }
+
+    // used: whether the call's value is used (it is unless the call is a whole statement).
+    ;fn callee(e, scope, used) {
+        ;const c is e.callee
+        ;const n is e.args($length)
+        ;if (c.k == "std") {
+            ;const sig is c.name(stdSig)
+            ;if (sig == null) { ;c(unknownStd) ;return }
+            ;if (sig == "const") { ;(c.pos, "'\${c.name}' is a constant, not a function", null)(error) ;return }
+            ;if (sig != n) { ;(c.pos, "'\${c.name}' takes {sig(plural)}, got {n}", null)(error) }
+            ;return
+        }
+        ;ref d is null
+        ;var label is ""
+        ;if (c.k == "mem") {
+            // (module.name): a function an imported module exports (§13.1)
+            ;set label to "{c.rec.name}.{c.field}"
+            ;const m is (c.rec, scope)(moduleNamed)
+            ;if (m == null) { ;(c.rec, scope)(unknownModule) ;return }
+            ;set d to (c, m)(bribed)
+            ;if (d == null) { ;return }
+        } else {
+            ;set label to c.name
+            ;set d to (scope, c.name)(lookup)
+            ;if (d == null) { ;(c.pos, "unknown function '{c.name}'", null)(error) ;return }
+        }
+        ;if (d.kind != "scheme") {
+            ;const hint is n == 0 ? "({label}) is a call with no arguments; to use the value, remove the parentheses"
+                : "calls are postfix: the function comes last, e.g. x(f)"
+            ;(c.pos, "'{label}' is not a function", hint)(error)
+            ;return
+        }
+        ;if (d.arity != n) { ;(c.pos, "'{label}' takes {d.arity(plural)}, got {n}", null)(error) }
+        // An imported function's uses are recorded under its library's declaration.
+        ;if (used && (d.mod, d.namePos)(firstUse) == null) {
+            ;(uses, { mod: d.mod, namePos: d.namePos, pos: c.pos, useMod: curMod })($push)
+        }
+    }
+
+    // Each import declares a module name, visible throughout the file like a
+    // function name (§13.1).
+    ;fn stealNames(m, scope) {
+        ;const steals is modules[m].steals
+        ;var seen is []
+        ;var k is 0
+        ;while (k < steals($length)) {
+            ;const node is steals[k].node
+            ;const lib is steals[k].lib
+            ;set k += 1
+            ;const path is modules[lib].path
+            ;var usable is lib
+            ;if ((seen, lib)(text.contains)) {
+                ;(node.pathPos, "'{path}' is already imported", null)(error)
+                ;set usable to null
+            } else if (modules[lib].notLibrary) {
+                ;(node.pathPos, "'{path}' is not a library: it ends with ;exit", null)(error)
+                ;set usable to null
+            }
+            ;(seen, lib)($push)
+            ;const d is {
+                kind: "module", name: node.name, isShifty: false, isFickle: false, namePos: node.namePos, visibleAt: null,
+                fnId: null, arity: null, mod: curMod, lib: usable
+            }
+            ;(scope, node.name, d)(declare)
+        }
+    }
+
+    // A library's top level, and its exports: the bribe that ;end becomes (§13.1).
+    ;fn libraryRules(m, scope, isEntry, last) {
+        ;const program is modules[m].program
+        ;var k is 0
+        ;while (k < program.stmts($length)) {
+            ;const s is program.stmts[k]
+            ;set k += 1
+            // last is a copy (a var binding copies a record), so statements are compared by position.
+            ;if (s.k == "bribe" && (isEntry || s.pos != last.pos)) {
+                ;(s.pos, "only a library ends with ';end'", "a program ends with ;exit")(error)
+            } else if (!isEntry && !(libraryTop, s.k)(text.contains)) {
+                ;(s.pos, "a library's top level may contain only import, fn, const, var, ref and enum declarations",
+                    "move other statements into a function")(error)
+            }
+        }
+        ;if (isEntry) { ;return }
+        ;if (last == null || last.k != "bribe") {
+            ;(program.end, "a library must end with ;end", "mark what it exports with 'export', and end it with ;end")(error)
+            ;return
+        }
+        ;var exports is []
+        ;set k to 0
+        ;while (k < last.names($length)) {
+            ;const n is last.names[k]
+            ;set k += 1
+            ;const d is (scope, n.name)(own)
+            ;if (d == null) {
+                ;(n.pos, "cannot export '{n.name}': it is not declared at the top level", null)(error)
+            } else if (d.kind == "module") {
+                ;(n.pos, "cannot export '{n.name}': it is a module", null)(error)
+            } else {
+                ;(exports, d)($push)
+            }
+        }
+        ;set modules[m].exports to exports
+    }
+
+    ;fn checkModule(m, isEntry) {
+        ;m(enter)
+        ;const program is modules[m].program
+        ;var last is null
+        ;var k is 0
+        ;while (k < program.stmts($length)) {
+            ;if (program.stmts[k].k != "empty") { ;set last to program.stmts[k] }
+            ;set k += 1
+        }
+        // An imported file that is not a library is reported where it is imported.
+        ;if (!isEntry && last != null && last.k == "exit") {
+            ;set modules[m].notLibrary to true
+            ;return
+        }
+        ;const scope is null(newScope)
+        ;(m, scope)(stealNames)
+        ;({ stmts: program.stmts, value: null }, scope, { func: topFn, loops: 0 })(block)
+        ;(m, scope, isEntry, last)(libraryRules)
+    }
+
+    ;const topFn is { id: 0, top: true }
+    ;const entry is modules($length) - 1
+    ;var mi is 0
+    ;while (mi < modules($length)) {
+        ;(mi, mi == entry)(checkModule)
+        ;set mi += 1
+    }
+    // A function whose value is used must be able to produce one (§7.2).
+    ;var si is 0
+    ;while (si < schemes($length)) {
+        ;const sc is schemes[si]
+        ;const use is (sc.mod, sc.namePos)(firstUse)
+        ;if (use != null && sc.body.value == null && !sc.body.stmts(getsAwayWithValue)) {
+            ;sc.mod(enter)
+            ;const um is use.useMod
+            ;const where is um == sc.mod ? "line {use.pos(lineOf)}" : "{modules[um].file} line {(modules[um].chars, use.pos)(lineIn)}"
+            ;(sc.namePos, "'{sc.name}' never produces a value, but its value is used ({where})",
+                "end the function with its value, or with null if that is intended")(error)
+        }
+        ;set si += 1
+    }
+    ;entry(enter)
+    ;const program is modules[entry].program
+    ;if (requireExit) {
+        ;var last is null
+        ;var k is 0
+        ;while (k < program.stmts($length)) {
+            ;if (program.stmts[k].k != "empty") { ;set last to program.stmts[k] }
+            ;set k += 1
+        }
+        ;if (last == null || last.k != "exit") {
+            ;(program.end, "a program must end with ;exit", "end the program with ;exit, or a library with ;end")(error)
+        }
+    }
+    errors
+}
+
+;end

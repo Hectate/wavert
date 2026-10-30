@@ -1,0 +1,18 @@
+;ref i is 0
+;while (i < 11) {
+    ;ref prime is i >= 2
+    ;ref d is 2
+    ;while (prime && d * d <= i) {
+        ;if (i % d == 0) { ;set prime to false }
+        ;set d to d + 1
+    }
+    ;if (prime) {
+        ;"PRIME ("($write)
+        ;i($write)
+        ;")"($print)
+    } else {
+        ;i($print)
+    }
+    ;set i to i + 1
+}
+;exit

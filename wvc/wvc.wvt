@@ -1,0 +1,189 @@
+// wvc: the Wavert compiler, written in Wavert (docs/hybrid-syntax.md).
+//
+// It began as a fork of wahc, the Γ-- compiler, with a Wavert front end:
+// lexer.wvt and parser.wvt read Wavert and produce wahc's syntax tree, so the
+// checker and the code generators (codegen.wvt for JavaScript, codegen_c.wvt
+// for C) are wahc's, with Wavert wording in their messages. loader.wvt loads
+// the modules of the program being compiled. This file is the command line.
+//
+// Section numbers (§) in the comments refer to the Γ-- spec, wah/wah-spec.md:
+// Wavert changes its syntax and names, not its semantics.
+//
+// Usage: wvc <file.wvt> [--target c|js] [-o <out>] [--runtime <runtime>]
+//        wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]
+//        wvc (--tokens | --ast) <file.wvt>
+
+;import txt from "text.wvt"
+;import diag from "diag.wvt"
+;import lexer from "lexer.wvt"
+;import parser from "parser.wvt"
+;import checker from "checker.wvt"
+;import codegen from "codegen.wvt"
+;import codegenC from "codegen_c.wvt"
+;import dump from "dump.wvt"
+;import loader from "loader.wvt"
+
+// ---- Command line ----
+
+;const usage is "usage:\n" +
+    "  wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>]\n" +
+    "  wvc <file.wvt> --target js [-o <out.js>] [--runtime <wvt.js>]\n" +
+    "  wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]\n" +
+    "  wvc --tokens <file.wvt>\n" +
+    "  wvc --ast <file.wvt>"
+
+;fn die() {
+    ;usage($eprint)
+    ;exit 2
+}
+
+// Reads file into srcFile and srcChars, dropping a byte-order mark.
+;fn load(file) {
+    ;const text is file($readFile)
+        onfail { ;"wvc: cannot read {file}"($eprint) ;exit 2 }
+    ;const chars is (text, "")($split)
+    ;const bom is chars($length) > 0 && chars[0] == "\u{FEFF}" ? 1 : 0
+    ;(file, (chars, bom, chars($length))($slice))(diag.setSource)
+}
+
+;const argv is $args
+;var mode is ""
+;var input is ""
+;var output is ""
+// The target, the runtime path and the C compiler, "" until given.
+;var target is ""
+;var runtimePath is ""
+;var cc is ""
+;var arg is 0
+;while (arg < argv($length)) {
+    ;const a is argv[arg]
+    ;if (arg == 0 && a == "build") {
+        ;set mode to a
+    } else if (a == "--tokens" || a == "--ast") {
+        ;set mode to a
+    } else if (a == "-o" || a == "--runtime" || a == "--target" || a == "--cc") {
+        ;set arg += 1
+        ;if (arg >= argv($length)) { ;(die) }
+        ;if (a == "-o") {
+            ;set output to argv[arg]
+        } else if (a == "--runtime") {
+            ;set runtimePath to argv[arg]
+        } else if (a == "--cc") {
+            ;set cc to argv[arg]
+        } else if (argv[arg] == "js" || argv[arg] == "c") {
+            ;set target to argv[arg]
+        } else {
+            ;(die)
+        }
+    } else if (input != "" || a($length) > 0 && (a, 0)($at) == "-") {
+        ;(die)
+    } else {
+        ;set input to a
+    }
+    ;set arg += 1
+}
+;const inspect is mode == "--tokens" || mode == "--ast"
+;if (input == "" || inspect && (output != "" || runtimePath != "" || target != "")
+    || mode == "build" && target != "" || mode != "build" && cc != "") { ;(die) }
+
+;fn onWindows() {
+    ;const os is "OS"($env)
+        onfail { "" }
+    os == "Windows_NT"
+}
+;const dotWvt is input($length) >= 4 && (input, -4, input($length))($slice) == ".wvt"
+;if (mode == "build") {
+    ;set target to "c"
+    ;if (cc == "") { ;set cc to "ZIG"($env) onfail { "zig" } }
+    // The program: the input without .wvt, as an .exe on Windows.
+    ;if (output == "" && !dotWvt) {
+        ;"wvc: {input} does not end with .wvt, so name the program with -o"($eprint)
+        ;exit 2
+    }
+    ;if (output == "") { ;set output to (input, 0, -4)($slice) + ((onWindows) ? ".exe" : "") }
+}
+;if (target == "") { ;set target to "c" }
+;const runtimeGiven is runtimePath != ""
+;if (!runtimeGiven) { ;set runtimePath to target == "c" ? "runtime/wvt.c" : "runtime/wvt.js" }
+
+// The text of path, or null if it cannot be read.
+;fn tryRead(path) {
+    ;const text is path($readFile)
+        onfail { null }
+    text
+}
+
+// The directory of $programPath, with a trailing separator.
+;fn programDir() {
+    ;const cs is ($programPath, "")($split)
+    ;var k is cs($length) - 1
+    ;while (k >= 0 && cs[k] != "/" && cs[k] != "\\") { ;set k -= 1 }
+    ((cs, 0, k + 1)($slice), "")($join)
+}
+
+// The runtime: the one given, else the default path from the current
+// directory, then from where wvc is, so a native wvc runs from anywhere: in
+// the repository's root, or one level down (wvc/wvc.exe).
+;fn readRuntime() {
+    ;const text is runtimePath(tryRead)
+    ;if (text != null || runtimeGiven) { ;return text }
+    ;const dir is (programDir)
+    ;const here is (dir + runtimePath)(tryRead)
+    here != null ? here : (dir + "../" + runtimePath)(tryRead)
+}
+
+;input(load)
+// --tokens and --ast show the input file alone, without the libraries it imports.
+;if (mode == "--tokens") {
+    ;const tokens is diag.srcChars(lexer.lex)
+    ;(diag.flushWarnings)
+    ;(tokens, "")(dump.dumpTokens)
+    ;exit
+}
+;if (mode == "--ast") {
+    ;const program is diag.srcChars(lexer.lex)(parser.parse)
+    ;(diag.flushWarnings)
+    ;(program, "")(dump.dumpValue)($print)
+    ;exit
+}
+;const modules is (diag.srcFile, diag.srcChars)(loader.loadProgram)
+;const problems is (modules, true)(checker.check)
+;if (problems($length) > 0) {
+    ;(diag.flushWarnings)
+    ;var p is 0
+    ;while (p < problems($length)) {
+        ;problems[p](diag.formatDiag)($eprint)
+        ;set p += 1
+    }
+    ;exit 2
+}
+;const runtime is (readRuntime)
+;if (runtime == null) {
+    ;"wvc: cannot read {runtimePath}"($eprint)
+    ;exit 2
+}
+;const code is target == "c" ? (modules, runtime)(codegenC.generateC) : (modules, runtime)(codegen.generate)
+;(diag.flushWarnings)
+;if (mode != "build") {
+    ;if (output == "") { ;set output to (dotWvt ? (input, 0, -4)($slice) : input) + ".{target}" }
+    ;(output, code)($writeFile)
+        onfail { ;"wvc: cannot write {output}"($eprint) ;exit 2 }
+    ;exit
+}
+
+// build: the C goes beside the program, then a C compiler builds it. Zig is
+// called as `zig cc`; any other compiler gets the flags directly.
+;const dotExe is output($length) >= 4 && (output, -4, output($length))($slice)(txt.toLower) == ".exe"
+;const cFile is (dotExe ? (output, 0, -4)($slice) : output) + ".c"
+;(cFile, code)($writeFile)
+    onfail { ;"wvc: cannot write {cFile}"($eprint) ;exit 2 }
+;const parts is (((cc, "\\")($split), "/")($join), "/")($split)
+;const ccName is parts[-1](txt.toLower)
+;const flags is ["-O2", "-o", output, cFile]
+;const status is (cc, ccName == "zig" || ccName == "zig.exe" ? ["cc", "-O2", "-o", output, cFile] : flags)($run)
+    onfail { ;"wvc: cannot run {cc}: install Zig (https://ziglang.org), or name a C compiler with --cc"($eprint) ;exit 2 }
+;if (status != 0) {
+    ;"wvc: {cc} failed with exit code {status}"($eprint)
+    ;exit 2
+}
+;exit
