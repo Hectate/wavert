@@ -6,7 +6,7 @@
 // array, read and written through getCell and setCell. Each turn clears the
 // screen with an ANSI escape sequence and draws the room again.
 //
-// Arrow keys or h, j, k, l move; q or Escape quits.
+// Arrow keys or w, a, s, d move; q or Escape quits.
 //
 // Usage: wvc build examples/walk.wvt, then run it in a terminal.
 
