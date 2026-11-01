@@ -17,7 +17,7 @@
 // Node kinds that evaluate without calling anything.
 ;const plainKinds is ["int", "float", "bool", "null", "nan", "inf", "name", "std"]
 // Stdlib functions that can fail (§12.1).
-;const signalers is ["readLine", "readKey", "terminalSize", "get", "remove", "readFile", "writeFile", "appendFile", "listDir", "deleteFile", "env", "run", "toInt", "toFloat"]
+;const signalers is ["readLine", "readKey", "waitKey", "terminalSize", "get", "remove", "readFile", "writeFile", "appendFile", "listDir", "deleteFile", "env", "run", "toInt", "toFloat"]
 
 // How an expression's evaluation interacts with others (see seq).
 ;const constK is 0 // a constant: nothing can change it

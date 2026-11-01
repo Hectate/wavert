@@ -2127,27 +2127,140 @@ static int console_key(wv *out) {
 }
 #endif
 
-static wv std_readKey(void) {
-  key_start();
-  key_apply(1);
+// The next key, waiting for it: 1 with *out set, 0 if it was discarded, -1 at
+// the end of input.
+static int next_key(wv *out) {
   // Waiting: a terminal waits only briefly for the rest of an escape sequence,
   // and does not wait for a "\n" after "\r", since Enter sends "\r" alone.
   int wait = K_WAIT, brief = key_tty ? K_BRIEF : K_WAIT, crlf = key_tty ? K_HAVE : K_WAIT;
 #ifdef _WIN32
   if (key_tty) wait = brief = crlf = K_HAVE; // only text left over from $readLine
+  if (key_tty && in_pos == in_n) return console_key(out);
 #endif
+  return byte_key(out, wait, brief, crlf);
+}
+
+static wv std_readKey(void) {
+  key_start();
+  key_apply(1);
   for (;;) {
     wv k;
-    int r;
-#ifdef _WIN32
-    if (key_tty && in_pos == in_n) r = console_key(&k);
-    else
-#endif
-    r = byte_key(&k, wait, brief, crlf);
+    int r = next_key(&k);
     if (r < 0) return rt_std_fail("$readKey");
     if (r > 0) return k;
   }
 }
+
+// ---- waiting and the clock (§12.2, §12.8) ----
+// Times are milliseconds on a monotonic clock. A wait ends at a deadline, and
+// is recomputed after each wake-up, so a signal or a stray console event only
+// makes it wait again for what is left.
+
+static int64_t mono_ms(void) {
+#ifdef _WIN32
+  static LARGE_INTEGER f;
+  if (!f.QuadPart) QueryPerformanceFrequency(&f);
+  LARGE_INTEGER t;
+  QueryPerformanceCounter(&t);
+  return t.QuadPart / f.QuadPart * 1000 + t.QuadPart % f.QuadPart * 1000 / f.QuadPart;
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+static int64_t clock_start; // mono_ms() when the program started
+
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+// A timer set to go off in ms, or NULL if there is none. It is a
+// high-resolution timer where Windows has them (10 1803 and later), so short
+// waits are not rounded up to the 15.6 ms system tick.
+static HANDLE wait_timer(int64_t ms) {
+  static HANDLE t;
+  if (!t) t = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  if (!t) t = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+  LARGE_INTEGER due = { .QuadPart = -ms * 10000 }; // relative, in 100 ns units
+  if (t && !SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE)) return NULL;
+  return t;
+}
+#endif
+
+// Waits for up to ms (at most INT32_MAX); it may end early.
+static void sleep_for(int64_t ms) {
+#ifdef _WIN32
+  HANDLE t = wait_timer(ms);
+  if (t) WaitForSingleObject(t, INFINITE);
+  else Sleep((DWORD)ms);
+#else
+  struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000 };
+  nanosleep(&ts, NULL);
+#endif
+}
+
+// Waits for up to ms (at most INT32_MAX) for stdin to have something to read,
+// or to end: 1 if it does, 0 if not (it may give up early).
+static int input_wait(int64_t ms) {
+#ifdef _WIN32
+  if (key_tty) {
+    if (key_repeats > 0) return 1;
+    HANDLE t = ms > 0 ? wait_timer(ms) : NULL, hs[2] = { key_in, t };
+    DWORD r = t ? WaitForMultipleObjects(2, hs, FALSE, INFINITE) : WaitForSingleObject(key_in, (DWORD)ms);
+    return r == WAIT_OBJECT_0;
+  }
+  // Pipes cannot be waited on, so they are polled; files and devices are always ready.
+  HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+  if (GetFileType(h) != FILE_TYPE_PIPE) return 1;
+  int64_t end = mono_ms() + ms;
+  for (;;) {
+    DWORD avail;
+    if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) || avail > 0) return 1; // data, or the end
+    if (mono_ms() >= end) return 0;
+    Sleep(1);
+  }
+#else
+  struct pollfd p = { .fd = 0, .events = POLLIN };
+  return poll(&p, 1, (int)ms) > 0;
+#endif
+}
+
+// Whether a key can be read without waiting past the deadline end: 1 if input
+// is there or has ended, 0 if end comes first.
+static int key_ready(int64_t end) {
+  rt_flush(); // what the program drew appears before it waits
+  for (;;) {
+    if (in_pos < in_n || in_end) return 1;
+    int64_t left = end - mono_ms();
+    if (input_wait(left <= 0 ? 0 : left > INT32_MAX ? INT32_MAX : left)) return 1;
+    if (mono_ms() >= end) return 0;
+  }
+}
+
+static wv std_waitKey(wv x) {
+  int64_t ms = an_int(x, "$waitKey");
+  key_start();
+  key_apply(1);
+  int64_t end = mono_ms() + (ms > 0 ? ms : 0);
+  for (;;) {
+    if (!key_ready(end)) return RT_NULL;
+    wv k;
+    int r = next_key(&k);
+    if (r < 0) return rt_std_fail("$waitKey");
+    if (r > 0) return k;
+  }
+}
+
+static wv std_sleep(wv x) {
+  int64_t ms = an_int(x, "$sleep");
+  rt_flush();
+  int64_t end = mono_ms() + (ms > 0 ? ms : 0);
+  for (int64_t left; (left = end - mono_ms()) > 0;) sleep_for(left > INT32_MAX ? INT32_MAX : left);
+  return RT_NULL;
+}
+
+static wv std_elapsed(void) { return rt_i(mono_ms() - clock_start); }
 
 // Reads a whole file; returns 0 on failure.
 static int read_file(const wstr *path, char **data, int64_t *n) {
@@ -3025,6 +3138,7 @@ static void *rt_thread(void *arg) {
 
 // The program runs on a thread with a large stack, since functions recurse deeply.
 int main(int argc, char **argv) {
+  clock_start = mono_ms();
   rt_argc = argc;
   rt_argv = argv;
   size_t stack = (size_t)1 << 30;

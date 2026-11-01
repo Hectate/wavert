@@ -59,6 +59,14 @@ export function run(source, { files = {}, input = '', args = [] } = {}) {
   return { out: r.stdout, err: c.err + r.stderr, code: r.status };
 }
 
+// Builds source, which must compile cleanly; returns the program's path.
+export function buildProgram(source) {
+  const dir = writeFiles({ 'main.wvt': source });
+  const c = wvc(['main.wvt', '-o', 'main.c', '--runtime', runtimeC], { cwd: dir });
+  if (c.code !== 0 || c.err !== '') throw new Error(`wvc failed:\n${c.err}`);
+  return zigBuild(join(dir, 'main.c'), join(dir, `main${exe}`));
+}
+
 // The diagnostics wvc gives for source, or '' if it compiles.
 export function diagnostics(source, files = {}) {
   const dir = writeFiles({ ...files, 'main.wvt': source });

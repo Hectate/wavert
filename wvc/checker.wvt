@@ -19,7 +19,7 @@
 ;const stdlib is [
     { name: "print", arity: 1 }, { name: "write", arity: 1 }, { name: "eprint", arity: 1 },
     { name: "readLine", arity: 0 }, { name: "readKey", arity: 0 },
-    { name: "terminal", arity: 0 }, { name: "terminalSize", arity: 0 },
+    { name: "waitKey", arity: 1 }, { name: "terminal", arity: 0 }, { name: "terminalSize", arity: 0 },
     { name: "readFile", arity: 1 }, { name: "writeFile", arity: 2 }, { name: "appendFile", arity: 2 },
     { name: "fileExists", arity: 1 }, { name: "listDir", arity: 1 }, { name: "deleteFile", arity: 1 },
     { name: "args", arity: "const" }, { name: "env", arity: 1 },
@@ -36,7 +36,7 @@
     { name: "fields", arity: 1 },
     { name: "floor", arity: 1 }, { name: "ceil", arity: 1 }, { name: "round", arity: 1 },
     { name: "trunc", arity: 1 }, { name: "toUint32", arity: 1 }, { name: "isNan", arity: 1 },
-    { name: "time", arity: 0 },
+    { name: "time", arity: 0 }, { name: "elapsed", arity: 0 }, { name: "sleep", arity: 1 },
     { name: "newRandom", arity: 1 }, { name: "random", arity: 2 }, { name: "randomFloat", arity: 1 }
 ]
 

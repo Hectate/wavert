@@ -63,7 +63,7 @@ Run `npm test` here (Node ≥ 22.3). The tests need [Zig](https://ziglang.org), 
 | `examples.test.js` | Every example prints what it should. |
 | `syntax.test.js` | Wavert's syntax and what it means: precedence, argument grouping, declarations, `set`, `match`, `fail`/`onfail`, modules. |
 | `errors.test.js` | The diagnostics for common mistakes. |
-| `stdlib.test.js` | The standard library of Drafts 0.2 to 0.4: `$readKey` on redirected input, `$terminal` and `$terminalSize` on pipes, `$time`, random generators against the specification's test vectors, maps and sorting. |
+| `stdlib.test.js` | The standard library of Drafts 0.2 to 0.5: `$readKey` and `$waitKey` on redirected input and open pipes, `$terminal` and `$terminalSize` on pipes, `$time`, `$elapsed` and `$sleep`, random generators against the specification's test vectors, maps and sorting. |
 | `gc.test.js` | The native runtime's garbage collector: memory stays flat in a long loop, and collecting on every allocation (`WVT_GC_STRESS=1`) changes no output. |
 | `spec.test.js` | The complete programs in [../docs/wavert-spec.md](../docs/wavert-spec.md) compile, and its §14 example runs. |
 | `grammar.test.js` | The VS Code grammar ([../editors/vscode](../editors/vscode)) agrees with the lexer's keywords, the stdlib table and the number syntax. |

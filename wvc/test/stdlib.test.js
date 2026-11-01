@@ -1,10 +1,11 @@
-// The standard library added in Drafts 0.2 to 0.4: $readKey on redirected
-// input and the terminal (§12.2), $time, random generators (§12.8), maps
-// (§10.11) and sorting (§10.6).
+// The standard library added in Drafts 0.2 to 0.5: $readKey and $waitKey on
+// redirected input and the terminal (§12.2), $time, $elapsed, $sleep, random
+// generators (§12.8), maps (§10.11) and sorting (§10.6).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { noZig, readRepo, run } from './helpers.js';
+import { spawn } from 'node:child_process';
+import { buildProgram, noZig, readRepo, run } from './helpers.js';
 
 const skip = noZig;
 
@@ -432,4 +433,111 @@ test('the code generator knows which stdlib functions fail', () => {
   const signalers = JSON.parse(/;const signalers is (\[[^\]]*\])/.exec(readRepo('wvc/codegen_c.wvt'))[1]);
   const fails = [...readRepo('docs/wavert-spec.md').matchAll(/^\| `\$(\w+)` \|.*\bFails\b/gm)].map((m) => m[1]);
   assert.deepEqual([...signalers].sort(), [...fails, 'toInt', 'toFloat'].sort());
+});
+
+// ---- Draft 0.5: waiting for a key, the clock and sleeping (§12.2, §12.8) ----
+
+// Runs program with stdin a pipe that stays open until the test closes it.
+// Each time the output so far ends with a line in steps, that step's action is
+// called with the child's stdin. Resolves with the output and the exit code,
+// and when the first output and the exit came (ms since the start).
+function converse(program, steps = {}) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const child = spawn(program, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = '', err = '', first = null;
+    const done = new Set();
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      first ??= { chunk, at: Date.now() - start };
+      out += chunk;
+      for (const [line, action] of Object.entries(steps)) {
+        if (!done.has(line) && out.includes(line + '\n')) { done.add(line); action(child.stdin); }
+      }
+    });
+    child.stderr.on('data', (chunk) => { err += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => resolve({ out, err, code, first, end: Date.now() - start }));
+  });
+}
+
+test('$waitKey times out with null, and returns keys as they come', { skip, timeout: 30000 }, async () => {
+  const program = buildProgram(`
+;var t is ($elapsed)
+;const a is 50($waitKey)
+;"none: {a == null} {($elapsed) - t >= 50}"($print)
+;set t to ($elapsed)
+;const b is 20000($waitKey)
+;"got {b} {($elapsed) - t < 15000}"($print)
+;const c is (-5)($waitKey)
+;"negative: {c == null}"($print)
+;const y is 20000($waitKey)
+;const z is 0($waitKey)
+;const n is 0($waitKey)
+;"{y} {z} {n == null}"($print)
+;const d is 20000($waitKey)
+    onfail { "end" }
+;d($print)
+;exit
+`);
+  // Each line must appear while the program waits, so output is flushed before waiting.
+  const r = await converse(program, {
+    'none: true true': (stdin) => stdin.write('x'),
+    'negative: true': (stdin) => stdin.write('yz'),
+    'y z true': (stdin) => stdin.end(),
+  });
+  assert.deepEqual({ out: r.out, err: r.err, code: r.code },
+    { out: 'none: true true\ngot x true\nnegative: true\ny z true\nend\n', err: '', code: 0 });
+});
+
+test('$waitKey on a file returns each key at once, then fails', { skip }, () => {
+  const r = runMain(`
+;var keys is []
+;var more is true
+;while (more) {
+    ;const k is 10000($waitKey)
+        onfail { ;set more to false
+        "" }
+    ;if (more) { ;(keys, k == null ? "null" : k)($push) }
+}
+;(keys, " ")($join)($print)
+;exit
+`, 'a\x1b[Bb');
+  assert.deepEqual(r, { out: 'a down b\n', err: '', code: 0 });
+  assert.match(runMain(';0($waitKey)($print)\n;exit\n').err, /unhandled fail \(code 1\) from '\$waitKey'/);
+});
+
+test('$elapsed starts near 0 and $sleep pauses', { skip }, () => {
+  assert.equal(output(`
+;const start is ($elapsed)
+;"{start($typeOf)} {start >= 0 && start < 1000}"($print)
+;100($sleep)
+;(($elapsed) - start >= 100)($print)
+;const t is ($elapsed)
+;(-50)($sleep)
+;0($sleep)
+;(($elapsed) - t < 50)($print)
+;var last is ($elapsed)
+;var ok is true
+;var i is 0
+;while (i < 10000) {
+    ;const now is ($elapsed)
+    ;if (now < last) { ;set ok to false }
+    ;set last to now
+    ;set i += 1
+}
+;ok($print)`), lines('int true', 'true', 'true', 'true'));
+});
+
+test('$sleep shows what was written before pausing', { skip, timeout: 30000 }, async () => {
+  const r = await converse(buildProgram(';"a"($write)\n;500($sleep)\n;"b"($print)\n;exit\n'));
+  assert.equal(r.out, 'ab\n');
+  assert.equal(r.first.chunk, 'a');
+  assert.ok(r.end - r.first.at >= 300, `"a" came ${r.first.at} ms in, the exit ${r.end} ms in`);
+});
+
+test('$waitKey and $sleep need an int', { skip }, () => {
+  assert.equal(panicOf(';"x"($sleep)'), 'type error: $sleep expects an int, got string');
+  assert.equal(panicOf(';1.5($waitKey)'), 'type error: $waitKey expects an int, got float');
 });

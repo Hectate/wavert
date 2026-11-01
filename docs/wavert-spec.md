@@ -1,4 +1,4 @@
-# Wavert Language Specification (Draft 0.4)
+# Wavert Language Specification (Draft 0.5)
 
 > Draft 0.1 was the first Wavert specification. Wavert is derived from Γ-- ([wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). It changes Γ--'s syntax and names and keeps its semantics; [hybrid-syntax.md](hybrid-syntax.md) gives the reasons for each change. Section numbers follow the Γ-- specification, so a reference such as §10.4 means the same topic in both.
 >
@@ -7,6 +7,8 @@
 > Draft 0.3 adds maps (§10.11) and sorting (§10.6), and drops the lint on string-literal keys (§2.8), which are normal for maps.
 >
 > Draft 0.4 adds `$terminal` and `$terminalSize` (§12.2), which tell whether stdin and stdout are terminals and how big the terminal is.
+>
+> Draft 0.5 adds waiting for a key with a timeout (`$waitKey`, §12.2), a monotonic clock (`$elapsed`) and `$sleep` (§12.8), so a program can animate between key presses.
 
 ## 1. Overview
 
@@ -803,6 +805,7 @@ Standard semantics throughout.
 | `$eprint` | `;x($eprint)` | stderr, then a newline |
 | `$readLine` | `;($readLine)` | One line of stdin, without its line ending. Fails at the end of input. |
 | `$readKey` | `;($readKey)` | One key press from stdin, without echo and without waiting for Enter (below). Fails at the end of input. |
+| `$waitKey` | `;ms($waitKey)` | Like `$readKey`, but waits at most `ms` milliseconds: `null` if no key comes in time (below). Fails at the end of input. |
 | `$terminal` | `;($terminal)` | Whether stdin and stdout are terminals, as a record `{ input, output }` of booleans (below). |
 | `$terminalSize` | `;($terminalSize)` | The size of the terminal on stdout, as a record `{ width, height }` of ints (below). Fails if stdout is not a terminal. |
 
@@ -898,6 +901,27 @@ Standard semantics throughout.
 
 Because redirected input is decoded the same way, a program that reads keys can be tested with a file: `"jjl\u{1B}[A\n"` is `"j"`, `"j"`, `"l"`, `"up"`, `"enter"`.
 
+**Waiting for a key.** `ms($waitKey)` returns a key as soon as one comes, or `null` once `ms` milliseconds have passed without one, so a program can animate between keys. To tick at a steady rate however fast keys come, wait until a deadline taken from `$elapsed` (§12.8):
+```
+;var frame is 0
+;var next is ($elapsed) + 150
+;while (true) {
+    ;"\u{1B}[H{["*", "+"][frame % 2]} a torch flickers; q quits"($write)
+    ;const key is (next - ($elapsed))($waitKey)
+        onfail { "q" }
+    ;if (key == "q") { ;break }
+    ;if (key == null) {
+        ;set frame += 1
+        ;set next += 150
+    }
+}
+;exit
+```
+- `ms` is an int. A negative `ms` counts as `0`, so `0($waitKey)` returns a key that is already waiting, or `null`, and a frame that runs late does not wait.
+- The timeout covers waiting for a key to start. A key that has started is read whole, as `$readKey` reads it, so in a terminal a lone Escape can add its 50 ms to the wait.
+- `$waitKey` shares its input, key mode and decoding with `$readKey`. Output written with `$write` appears before it waits.
+- When stdin is a file, the next key is always there at once, so `$waitKey` never returns `null`: it returns each key in turn, then fails at the end of input.
+
 **Terminal state.** When stdin is a terminal, the first `$readKey` call turns off echo and line buffering, and they stay off until the program ends. Keys pressed while the program is busy are kept for the next `$readKey` and are not shown.
 - Output is not affected: `"\n"` still starts a new line at the left edge.
 - `$readLine` and `$run` restore the normal terminal while they run, and turn key mode back on afterwards. `$readKey` and `$readLine` share one input buffer, so keys read ahead are never lost.
@@ -950,9 +974,9 @@ Paths are strings. A relative path is relative to the current directory. `/` wor
 | `$readLine`, `$readKey`, `$terminal`, `$terminalSize` | 0 | | `$slice` | 3 |
 | `$readFile`, `$fileExists`, `$listDir`, `$deleteFile` | 1 | | `$length`, `$code`, `$fromCode`, `$pop` | 1 |
 | `$writeFile`, `$appendFile` | 2 | | `$toString`, `$toInt`, `$toFloat` | 1 |
-| `$env` | 1 | | `$floor`, `$ceil`, `$round`, `$trunc`, `$toUint32`, `$isNan` | 1 |
+| `$env`, `$waitKey`, `$sleep` | 1 | | `$floor`, `$ceil`, `$round`, `$trunc`, `$toUint32`, `$isNan` | 1 |
 | `$run` | 2 | | `$typeOf`, `$fields` | 1 |
-| `$args`, `$programPath` | constant | | `$time` | 0 |
+| `$args`, `$programPath` | constant | | `$time`, `$elapsed` | 0 |
 | `$newRandom`, `$randomFloat` | 1 | | `$random` | 2 |
 | `$sort`, `$reverse` | 1 | | `$sortBy` | 2 |
 | `$keys`, `$values` | 1 | | `$get`, `$has`, `$remove` | 2 |
@@ -965,6 +989,8 @@ Paths are strings. A relative path is relative to the current directory. `/` wor
 | Builtin | Call | Notes |
 |---|---|---|
 | `$time` | `;($time)` | Milliseconds since 1970-01-01 00:00 UTC, as an int. |
+| `$elapsed` | `;($elapsed)` | Milliseconds since the program started, as an int. Never decreases. |
+| `$sleep` | `;ms($sleep)` | Pauses for `ms` milliseconds. |
 | `$newRandom` | `;seed($newRandom)` | A new random number generator, started from an int seed. |
 | `$random` | `;(rng, n)($random)` | A uniformly random int from 0 to `n - 1`. Advances `rng`. |
 | `$randomFloat` | `;rng($randomFloat)` | A uniformly random float from `0.0` up to, but not including, `1.0`. Advances `rng`. |
@@ -976,7 +1002,12 @@ Paths are strings. A relative path is relative to the current directory. `/` wor
 ```
 
 **`$time`**
-- It reads the system clock, which can be adjusted while a program runs, so a later call may return a smaller value. Use it for seeds and timestamps, not for measuring short intervals.
+- It reads the system clock, which can be adjusted while a program runs, so a later call may return a smaller value. Use it for seeds and timestamps, and `$elapsed` for measuring intervals.
+
+**`$elapsed` and `$sleep`**
+- `$elapsed` reads a monotonic clock, which nothing adjusts, so `($elapsed) - before` is the time since `before` was read. It is near `0` when the program starts.
+- `ms($sleep)` pauses for at least `ms` milliseconds; a negative `ms` counts as `0`. The system may resume the program a little later, typically within a millisecond or two.
+- Output written so far appears before the pause. Keys pressed during it are kept for the next `$readKey` or `$waitKey`, as when the program is busy.
 
 **Generators**
 - A generator is an ordinary **mutable record** with four fields, `s0`, `s1`, `s2` and `s3`, each an int from 0 to 2^32 − 1. `$newRandom` is the only stdlib function that returns a mutable value, because `$random` and `$randomFloat` advance the generator in place.
@@ -1140,6 +1171,7 @@ More examples are in [examples/](../examples/).
   - On POSIX, key mode clears `ECHO`, `ICANON`, `IEXTEN`, `IXON` and `ICRNL`, and keeps `ISIG` and `OPOST`, so Ctrl+C and Ctrl+Z still raise signals and output keeps its newline handling. Handlers for `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT` and `SIGPIPE` restore the terminal and raise the signal again with its default action. The handler for `SIGTSTP` restores the terminal, stops the program with the default action, and reapplies key mode when the program resumes.
   - On Windows, key mode clears `ENABLE_ECHO_INPUT` and `ENABLE_LINE_INPUT` and keeps `ENABLE_PROCESSED_INPUT`. Keys come from `ReadConsoleInputW` key-down events and are mapped by virtual-key code and character.
   - A stream is a terminal when `isatty` is true for it on POSIX, and when `GetConsoleMode` succeeds for it on Windows. The size comes from `ioctl` with `TIOCGWINSZ` on POSIX, and from the window rectangle of `GetConsoleScreenBufferInfo` on Windows.
+- **Waiting and the clock (§12.2, §12.8).** `$elapsed` reads `CLOCK_MONOTONIC` on POSIX and `QueryPerformanceCounter` on Windows. On POSIX, `$waitKey` waits with `poll` and `$sleep` with `nanosleep`. On Windows they wait on a high-resolution waitable timer, so short waits are not rounded up to the 15.6 ms system tick; `$waitKey` waits on the console input handle together with it, and checks a pipe with `PeekNamedPipe` every millisecond, since pipes cannot be waited on.
 - **Editor support.** [editors/vscode/](../editors/vscode/) has syntax highlighting and snippets for VS Code.
 - **Tests.** `wvc/test` runs every example, checks this specification's syntax and diagnostics, and checks the bootstrap fixed point.
 
@@ -1158,8 +1190,7 @@ More examples are in [examples/](../examples/).
 - Composite map keys, such as a pair of ints, which would need structural equality for keys.
 - A pipeline operator `|>`. It is a syntax error today, so it can be added later without breaking code. Postfix calls already read as a pipeline; revisit after counting real inside-out chains.
 - A type test operator. It should not be spelled `is`, which is a contextual keyword in declarations (§2.5).
-- More terminal support: waiting for a key with a timeout, and mouse input. Today `$readKey` always blocks.
-- A monotonic clock for measuring intervals, and a way to sleep.
+- More terminal support: mouse input.
 
 **Rejected**
 - Methods or uniform call syntax: `.` stays member access only, and calls stay postfix (§10.8).
