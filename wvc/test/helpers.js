@@ -12,7 +12,6 @@ export const zig = process.env.ZIG || 'zig';
 export const noZig = spawnSync(zig, ['version']).status === 0 ? false : 'Zig not found (set ZIG to its path)';
 export const exe = process.platform === 'win32' ? '.exe' : '';
 export const runtimeC = join(root, 'runtime/wvt.c');
-export const runtimeJs = join(root, 'runtime/wvt.js');
 export const readRepo = (path) => readFileSync(join(root, path), 'utf8');
 
 // A fresh temporary directory.
@@ -48,21 +47,22 @@ export function writeFiles(files) {
   return dir;
 }
 
-// Compiles source (the entry file main.wvt, with libraries in files) to
-// JavaScript and runs it with node: { out, err, code }, or the compile error
-// as { err, code: 2, compileError: true }.
+// Compiles source (the entry file main.wvt, with libraries in files) to C,
+// builds it and runs it with input (a string or a Buffer): { out, err, code },
+// or the compile error as { err, code: 2, compileError: true }.
 export function run(source, { files = {}, input = '', args = [] } = {}) {
   const dir = writeFiles({ ...files, 'main.wvt': source });
-  const c = wvc(['main.wvt', '--target', 'js', '-o', 'main.js', '--runtime', runtimeJs], { cwd: dir });
+  const c = wvc(['main.wvt', '-o', 'main.c', '--runtime', runtimeC], { cwd: dir });
   if (c.code !== 0) return { out: '', err: c.err, code: c.code, compileError: true };
-  const r = spawnSync(process.execPath, [join(dir, 'main.js'), ...args], { encoding: 'utf8', input });
+  const program = zigBuild(join(dir, 'main.c'), join(dir, `main${exe}`));
+  const r = spawnSync(program, args, { encoding: 'utf8', input });
   return { out: r.stdout, err: c.err + r.stderr, code: r.status };
 }
 
 // The diagnostics wvc gives for source, or '' if it compiles.
 export function diagnostics(source, files = {}) {
   const dir = writeFiles({ ...files, 'main.wvt': source });
-  return wvc(['main.wvt', '--target', 'js', '-o', 'main.js', '--runtime', runtimeJs], { cwd: dir }).err;
+  return wvc(['main.wvt', '-o', 'main.c', '--runtime', runtimeC], { cwd: dir }).err;
 }
 
 // Every example program, as repo-relative paths; libraries are in examples/modules.

@@ -1,6 +1,5 @@
 // Wavert native runtime, forked from Γ--'s runtime/wah.c (wah/runtime). This file is inlined
-// verbatim at the top of every program compiled with --target c, the
-// counterpart of runtime/wvt.js.
+// verbatim at the top of every program wvc compiles.
 // It needs a GNU C compiler (clang or gcc; `zig cc` is clang).
 //
 // Values: a 16-byte tagged wv. int -> int64_t (checked to ±(2^53-1)),
@@ -1059,7 +1058,7 @@ static wv rt_mod(wv a, wv b) {
   bad2("%", a, b);
 }
 // ** on floats: fdlibm's __ieee754_pow, which V8 uses for Math.pow and **,
-// so every backend gets the same bits. It also gives JavaScript's NaN results
+// so results match JavaScript's bit for bit (§11.2). It also gives JavaScript's NaN results
 // for 1 ** nan and 1 ** inf, where C's pow returns 1.
 static inline int32_t dhi(double x) { uint64_t b; memcpy(&b, &x, 8); return (int32_t)(b >> 32); }
 static inline uint32_t dlo(double x) { uint64_t b; memcpy(&b, &x, 8); return (uint32_t)b; }

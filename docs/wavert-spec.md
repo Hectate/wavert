@@ -468,7 +468,7 @@ Wavert has two error mechanisms: a **fail** is an expected failure that only the
 
 ### 9.1 Semantics
 - A string is a sequence of Unicode code points. `$length`, `$at` and `$slice` count code points.
-- The storage encoding is a backend detail (UTF-8 in the C backend, UTF-16 in the JavaScript backend).
+- The storage encoding is a backend detail (UTF-8 in the C backend).
 - Strings are immutable. A binding holding one can be rebound with `set` as usual.
 
 ### 9.2 Operators
@@ -811,7 +811,7 @@ Standard semantics throughout.
 
 **Broken pipe.** If a write to stdout or stderr fails because its reader has gone away (as in `prog | head -1`), the program ends at once and prints nothing more, following the Unix convention for `SIGPIPE`:
 - Where the host has signals and leaves `SIGPIPE` at its default, the program is killed by it, and shells report status 141 (128 + 13).
-- Elsewhere (Windows, or a host that ignores `SIGPIPE`, such as Node) the program exits with code 141.
+- Elsewhere (Windows, or a host that ignores `SIGPIPE`) the program exits with code 141.
 - It is not a panic or a fail, so nothing can handle it.
 
 **Terminal output.** Output is written unchanged, so ANSI (VT100 and xterm) escape sequences written with `\u{1B}` control a terminal: `;"\u{1B}[2J\u{1B}[H"($write)` clears the screen and moves the cursor to the top left. On Windows the runtime turns on virtual terminal processing for the console at startup, so these sequences work there too.
@@ -907,7 +907,7 @@ Paths are strings. A relative path is relative to the current directory. `/` wor
 | `$run` | `;(program, args)($run)` | Runs another program and waits for it. Returns its exit code. Fails if it cannot be started. |
 | exit | `;exit`, `;exit code` | See §13. |
 
-`$programPath` is the file the host started: for a native build, the executable; for the JavaScript backend, the compiled `.js` file. Its separators are the platform's own. It is useful for finding files installed next to a program.
+`$programPath` is the file the host started: for a native build, the executable. Its separators are the platform's own. It is useful for finding files installed next to a program.
 
 `$run`:
 - `program` is a string. If it contains no path separator, it is looked up on `PATH`. On Windows, `.com` and `.exe` are tried as well.
@@ -1104,8 +1104,8 @@ More examples are in [examples/](../examples/).
 ## 15. Implementation
 
 - **Compiler.** `wvc` ([wvc/](../wvc/)) is written in Wavert and compiles itself. [wvc/wvc.c](../wvc/wvc.c) is `wvc` compiled to C, the bootstrap seed: a C compiler is enough to build it, and the built `wvc` compiles its own sources back to the same file (the fixed point). It was bootstrapped from Γ--; see [hybrid-syntax.md](hybrid-syntax.md#bootstrap-status).
-- **Backends.** `wvc` compiles to C (the default) and to JavaScript (`--target js`). Programs behave the same on both: the same output, the same exit codes and the same error messages.
-  - Each output is a single file with its runtime inlined: [runtime/wvt.c](../runtime/wvt.c) or [runtime/wvt.js](../runtime/wvt.js). The JavaScript output runs with plain `node`.
+- **Backend.** `wvc` compiles to C. Where this specification says every backend behaves the same, it binds any future backend to the C backend's behaviour.
+  - The output is a single file with its runtime, [runtime/wvt.c](../runtime/wvt.c), inlined.
   - The C output needs a GNU C compiler (clang or gcc; `zig cc` works on every platform) for statement expressions, which carry conditionals and `match` used as values.
 - **C backend notes.**
   - Values are a 16-byte tagged struct. Strings are UTF-8. Enum members are pointers to static structs.
@@ -1119,11 +1119,8 @@ More examples are in [examples/](../examples/).
 - **Key input (§12.2).**
   - On POSIX, key mode clears `ECHO`, `ICANON`, `IEXTEN`, `IXON` and `ICRNL`, and keeps `ISIG` and `OPOST`, so Ctrl+C and Ctrl+Z still raise signals and output keeps its newline handling. Handlers for `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT` and `SIGPIPE` restore the terminal and raise the signal again with its default action. The handler for `SIGTSTP` restores the terminal, stops the program with the default action, and reapplies key mode when the program resumes.
   - On Windows, key mode clears `ENABLE_ECHO_INPUT` and `ENABLE_LINE_INPUT` and keeps `ENABLE_PROCESSED_INPUT`. Keys come from `ReadConsoleInputW` key-down events and are mapped by virtual-key code and character.
-- **JavaScript backend notes.** Ints are JavaScript numbers and floats are wrapped, so `/`, `==` and interpolation follow §11.2. Frozen arrays and records use `Object.freeze`, mutable records `Object.seal`. Records are null-prototype objects with mangled field names. Maps are JavaScript `Map`s, which keep insertion order; mutable ones are tracked in a `WeakSet`. Sorting uses `Array.prototype.sort`, which is stable. A fail is thrown and caught at each call that has `onfail`.
-  - `$readKey` uses `process.stdin.setRawMode` and synchronous reads. Node's raw mode also turns off signals, so Ctrl+C ends the program only while `$readKey` is waiting, when the runtime reads it as U+0003, and Ctrl+Z is discarded. The escape-sequence wait is the bytes that arrive in the same read.
-  - `$random` uses `Math.imul` and `>>> 0` for the 32-bit arithmetic.
 - **Editor support.** [editors/vscode/](../editors/vscode/) has syntax highlighting and snippets for VS Code.
-- **Tests.** `wvc/test` runs every example on both backends, checks this specification's syntax and diagnostics, and checks the bootstrap fixed point.
+- **Tests.** `wvc/test` runs every example, checks this specification's syntax and diagnostics, and checks the bootstrap fixed point.
 
 ---
 

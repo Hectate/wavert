@@ -1,9 +1,9 @@
 // Checks converted files against their Γ-- originals (docs/hybrid-syntax.md,
 // "Verification"): each .wvt file must parse to the same syntax tree as its
 // .wah original, apart from positions and parentheses, and each program must
-// compile to the same C and JavaScript. Both compilers are given Wavert's
-// runtime, so the only difference allowed is the standard library functions
-// that Wavert renamed ($toPurple is $toString, $isNobody is $isNan).
+// compile to the same C. Both compilers are given Wavert's runtime, so the
+// only difference allowed is the standard library functions that Wavert
+// renamed ($toPurple is $toString, $isNobody is $isNan).
 //
 // Usage: node tools/verify.mjs <wahc> <wvc> <dir.wah> <dir.wvt> [file.wah ...]
 //   Compares every .wah file under dir.wah (or just the files named) with the
@@ -19,9 +19,7 @@ if (!wvtDir) {
   console.error('usage: node tools/verify.mjs <wahc> <wvc> <dir.wah> <dir.wvt> [file.wah ...]');
   process.exit(2);
 }
-const runtime = new URL('../runtime/', import.meta.url);
-const runtimeC = join(runtime.pathname.replace(/^\/([A-Za-z]:)/, '$1'), 'wvt.c');
-const runtimeJs = join(runtime.pathname.replace(/^\/([A-Za-z]:)/, '$1'), 'wvt.js');
+const runtimeC = new URL('../runtime/wvt.c', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
 const tmp = mkdtempSync(join(tmpdir(), 'wvt-verify-'));
 
 const walk = (dir) => readdirSync(dir).flatMap((f) => {
@@ -53,19 +51,17 @@ const fields = { isShifty: 'isVar', isFickle: 'isRef', alibis: 'cases' };
 const runtimeNames = {
   rt_tantrum: 'rt_panic', rt_no_alibi: 'rt_no_case', rt_signal: 'rt_fail_with', rt_sigcode: 'rt_failcode',
   RT_NOBODY: 'RT_NAN', RT_EVERYBODY: 'RT_INF', wah_main: 'wvt_main',
-  '$rt.tantrum': '$rt.panic', '$rt.lineup': '$rt.makeEnum', '$rt.noAlibi': '$rt.noCase', '$rt.signal': '$rt.failWith',
-  '$rt.Wah': '$rt.Fail', '$rt.NOBODY': '$rt.NAN', '$rt.EVERYBODY': '$rt.INF',
 };
 
 // Γ-- output with Wavert's names for the renamed standard library functions,
 // and a --ast dump with wvc's node names and values spelled as wvc prints them.
 const lookup = (map, w) => (Object.hasOwn(map, w) ? map[w] : w);
 const renamed = (text) => text
-  .replace(/(\$rt\.)?\b\w+\b/g, (w) => lookup(runtimeNames, w))
+  .replace(/\b\w+\b/g, (w) => lookup(runtimeNames, w))
   .replace(/^(\s*k: ")(\w+)"$/gm, (m, key, k) => `${key}${lookup(kinds, k)}"`)
   .replace(/^(\s*)(\w+):/gm, (m, sp, f) => `${sp}${lookup(fields, f)}:`)
-  .replace(/(\bstd_|\$std\.|\bname: ")toPurple\b/g, '$1toString')
-  .replace(/(\bstd_|\$std\.|\bname: ")isNobody\b/g, '$1isNan')
+  .replace(/(\bstd_|\bname: ")toPurple\b/g, '$1toString')
+  .replace(/(\bstd_|\bname: ")isNobody\b/g, '$1isNan')
   .replace(/^(\s*\w+: )(uninvited|real|fake)$/gm, (m, key, v) => key + { uninvited: 'null', real: 'true', fake: 'false' }[v]);
 
 const files = only.length ? only : walk(wahDir);
@@ -84,21 +80,21 @@ for (const wah of files) {
   }
   const isProgram = /^\s*;\s*(\w+\s*)?!invited\s*(\/\/.*)?$/m.test(readFileSync(wah, 'utf8').trimEnd().split('\n').reverse().find((l) => l.trim() && !l.trim().startsWith('//')) ?? '');
   if (isProgram) {
-    for (const [target, rt] of [['c', runtimeC], ['js', runtimeJs]]) {
-      const outA = join(tmp, `a.${target}`), outB = join(tmp, `b.${target}`);
-      const ra = run(wahc, [wah, '--target', target, '-o', outA, '--runtime', rt]);
-      const rb = run(wvc, [wvt, '--target', target, '-o', outB, '--runtime', rt]);
-      if (ra.code !== 0 || rb.code !== 0) { problems.push(`--target ${target} failed:\n${ra.err}${rb.err}`); continue; }
+    const outA = join(tmp, 'a.c'), outB = join(tmp, 'b.c');
+    const ra = run(wahc, [wah, '--target', 'c', '-o', outA, '--runtime', runtimeC]);
+    const rb = run(wvc, [wvt, '-o', outB, '--runtime', runtimeC]);
+    if (ra.code !== 0 || rb.code !== 0) problems.push(`compiling to C failed:\n${ra.err}${rb.err}`);
+    else {
       // wvc registers a program's globals with the collector, which wahc predates.
       const wvtOut = readFileSync(outB, 'utf8').replace(/^ {2}rt_roots\(.*\);\n/m, '');
-      if (renamed(readFileSync(outA, 'utf8')) !== wvtOut) problems.push(`--target ${target}: the output differs`);
+      if (renamed(readFileSync(outA, 'utf8')) !== wvtOut) problems.push('the C differs');
     }
   }
   if (problems.length) {
     failed++;
     console.log(`FAIL ${rel}\n  ${problems.join('\n  ')}`);
   } else {
-    console.log(`ok   ${rel}${isProgram ? ' (C and JavaScript identical)' : ''}`);
+    console.log(`ok   ${rel}${isProgram ? ' (C identical)' : ''}`);
   }
 }
 console.log(failed ? `${failed} of ${files.length} failed` : `all ${files.length} match`);

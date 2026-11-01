@@ -2,14 +2,14 @@
 //
 // It began as a fork of wahc, the Γ-- compiler, with a Wavert front end:
 // lexer.wvt and parser.wvt read Wavert and produce wahc's syntax tree, so the
-// checker and the code generators (codegen.wvt for JavaScript, codegen_c.wvt
-// for C) are wahc's, with Wavert wording in their messages. loader.wvt loads
-// the modules of the program being compiled. This file is the command line.
+// checker and the C code generator (codegen_c.wvt) are wahc's, with Wavert
+// wording in their messages. loader.wvt loads the modules of the program being
+// compiled. This file is the command line.
 //
 // Section numbers (§) in the comments refer to the Wavert specification,
 // docs/wavert-spec.md.
 //
-// Usage: wvc <file.wvt> [--target c|js] [-o <out>] [--runtime <runtime>]
+// Usage: wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>]
 //        wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]
 //        wvc (--tokens | --ast) <file.wvt>
 
@@ -18,7 +18,6 @@
 ;import lexer from "lexer.wvt"
 ;import parser from "parser.wvt"
 ;import checker from "checker.wvt"
-;import codegen from "codegen.wvt"
 ;import codegenC from "codegen_c.wvt"
 ;import dump from "dump.wvt"
 ;import loader from "loader.wvt"
@@ -27,7 +26,6 @@
 
 ;const usage is "usage:\n" +
     "  wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>]\n" +
-    "  wvc <file.wvt> --target js [-o <out.js>] [--runtime <wvt.js>]\n" +
     "  wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]\n" +
     "  wvc --tokens <file.wvt>\n" +
     "  wvc --ast <file.wvt>"
@@ -50,8 +48,7 @@
 ;var mode is ""
 ;var input is ""
 ;var output is ""
-// The target, the runtime path and the C compiler, "" until given.
-;var target is ""
+// The runtime path and the C compiler, "" until given.
 ;var runtimePath is ""
 ;var cc is ""
 ;var arg is 0
@@ -61,19 +58,15 @@
         ;set mode to a
     } else if (a == "--tokens" || a == "--ast") {
         ;set mode to a
-    } else if (a == "-o" || a == "--runtime" || a == "--target" || a == "--cc") {
+    } else if (a == "-o" || a == "--runtime" || a == "--cc") {
         ;set arg += 1
         ;if (arg >= argv($length)) { ;(die) }
         ;if (a == "-o") {
             ;set output to argv[arg]
         } else if (a == "--runtime") {
             ;set runtimePath to argv[arg]
-        } else if (a == "--cc") {
-            ;set cc to argv[arg]
-        } else if (argv[arg] == "js" || argv[arg] == "c") {
-            ;set target to argv[arg]
         } else {
-            ;(die)
+            ;set cc to argv[arg]
         }
     } else if (input != "" || a($length) > 0 && (a, 0)($at) == "-") {
         ;(die)
@@ -83,8 +76,7 @@
     ;set arg += 1
 }
 ;const inspect is mode == "--tokens" || mode == "--ast"
-;if (input == "" || inspect && (output != "" || runtimePath != "" || target != "")
-    || mode == "build" && target != "" || mode != "build" && cc != "") { ;(die) }
+;if (input == "" || inspect && (output != "" || runtimePath != "") || mode != "build" && cc != "") { ;(die) }
 
 ;fn onWindows() {
     ;const os is "OS"($env)
@@ -93,7 +85,6 @@
 }
 ;const dotWvt is input($length) >= 4 && (input, -4, input($length))($slice) == ".wvt"
 ;if (mode == "build") {
-    ;set target to "c"
     ;if (cc == "") { ;set cc to "ZIG"($env) onfail { "zig" } }
     // The program: the input without .wvt, as an .exe on Windows.
     ;if (output == "" && !dotWvt) {
@@ -102,9 +93,8 @@
     }
     ;if (output == "") { ;set output to (input, 0, -4)($slice) + ((onWindows) ? ".exe" : "") }
 }
-;if (target == "") { ;set target to "c" }
 ;const runtimeGiven is runtimePath != ""
-;if (!runtimeGiven) { ;set runtimePath to target == "c" ? "runtime/wvt.c" : "runtime/wvt.js" }
+;if (!runtimeGiven) { ;set runtimePath to "runtime/wvt.c" }
 
 // The text of path, or null if it cannot be read.
 ;fn tryRead(path) {
@@ -162,10 +152,10 @@
     ;"wvc: cannot read {runtimePath}"($eprint)
     ;exit 2
 }
-;const code is target == "c" ? (modules, runtime)(codegenC.generateC) : (modules, runtime)(codegen.generate)
+;const code is (modules, runtime)(codegenC.generateC)
 ;(diag.flushWarnings)
 ;if (mode != "build") {
-    ;if (output == "") { ;set output to (dotWvt ? (input, 0, -4)($slice) : input) + ".{target}" }
+    ;if (output == "") { ;set output to (dotWvt ? (input, 0, -4)($slice) : input) + ".c" }
     ;(output, code)($writeFile)
         onfail { ;"wvc: cannot write {output}"($eprint) ;exit 2 }
     ;exit

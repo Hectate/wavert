@@ -1,4 +1,4 @@
-// wvc: The C code generator, for --target c (forked from wahc's codegen_c.wah,
+// wvc: The C code generator (forked from wahc's codegen_c.wah,
 // a port of wah/js/src/codegen_c.js: see there for the design).
 //
 // Syntax tree records have fixed shapes, so what the analysis finds is kept

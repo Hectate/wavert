@@ -1,5 +1,5 @@
-// Wavert syntax and its meaning (docs/hybrid-syntax.md), run through the
-// JavaScript backend.
+// Wavert syntax and its meaning (docs/hybrid-syntax.md), each program built
+// and run natively.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

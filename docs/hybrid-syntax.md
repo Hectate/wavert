@@ -203,5 +203,5 @@ Decisions made during the implementation, beyond this document:
 - A call binds tighter than unary minus, as in C-family languages: `-5(abs)` is `-(5(abs))`, and `(-5)(abs)` calls `abs` with -5. The converter writes the parentheses.
 - A negative number is a literal: the parser folds `-` applied to a number literal, so `case -1` works and the syntax tree matches Γ--'s `WAH`. `-(5)` stays a negation.
 - Runtime messages call non-`var` arrays and records *frozen*: `cannot modify a frozen array`.
-- `wvc`'s default target is C. `--target js` is still available.
+- `wvc`'s default target is C. The JavaScript backend (`--target js`) was kept for a while, then removed so that new features are written once.
 - The syntax tree kept `wahc`'s node kinds (`scheme`, `claim`, `lineup`, `suspect`, …) through the bootstrap. They were renamed afterwards (`fn`, `decl`, `enum`, `match`, …), as were the runtime's internal names (`rt_tantrum` → `rt_panic`), with the generated code checked to be unchanged. `tools/verify.mjs` maps `wahc`'s names when it compares.

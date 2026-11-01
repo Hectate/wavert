@@ -1,10 +1,10 @@
-// Every example runs, natively and on Node, and prints what it should.
+// Every example runs and prints what it should.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { exe, examples, noZig, root, runtimeC, runtimeJs, tempDir, wvc, zigBuild } from './helpers.js';
+import { exe, examples, noZig, root, runtimeC, tempDir, wvc, zigBuild } from './helpers.js';
 
 const skip = noZig;
 const lines = (...xs) => xs.map((x) => x + '\n').join('');
@@ -69,15 +69,10 @@ for (const file of examples()) {
   test(file, { skip }, () => {
     const { input = '', args = [], out } = expected[file] ?? {};
     const dir = tempDir();
-    for (const [target, rt] of [['c', runtimeC], ['js', runtimeJs]]) {
-      const code = join(dir, `out.${target}`);
-      const c = wvc([file, '--target', target, '-o', code, '--runtime', rt]);
-      assert.deepEqual({ err: c.err, code: c.code }, { err: '', code: 0 }, `${file} --target ${target}`);
-      const [cmd, cmdArgs] = target === 'c'
-        ? [zigBuild(code, join(dir, `out${exe}`)), args]
-        : [process.execPath, [code, ...args]];
-      const r = spawnSync(cmd, cmdArgs, { encoding: 'utf8', input });
-      assert.deepEqual({ out: r.stdout, err: r.stderr, code: r.status }, { out, err: '', code: 0 }, `${file} --target ${target}`);
-    }
+    const code = join(dir, 'out.c');
+    const c = wvc([file, '-o', code, '--runtime', runtimeC]);
+    assert.deepEqual({ err: c.err, code: c.code }, { err: '', code: 0 });
+    const r = spawnSync(zigBuild(code, join(dir, `out${exe}`)), args, { encoding: 'utf8', input });
+    assert.deepEqual({ out: r.stdout, err: r.stderr, code: r.status }, { out, err: '', code: 0 });
   });
 }

@@ -1,6 +1,6 @@
 // tools/wah2wvt.wah, the Γ-- to Wavert converter: it is built with wahc from
 // the imported Γ-- toolchain (wah/), and its output must parse to the same
-// syntax tree and compile to the same code as the original (tools/verify.mjs).
+// syntax tree and compile to the same C as the original (tools/verify.mjs).
 
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -27,7 +27,7 @@ function convert(input, output) {
   return { err: r.stderr, code: r.status };
 }
 
-test('the Γ-- examples convert to Wavert that compiles to the same code', { skip }, () => {
+test('the Γ-- examples convert to Wavert that compiles to the same C', { skip }, () => {
   const out = join(dir, 'examples');
   mkdirSync(join(out, 'modules'), { recursive: true });
   const from = join(root, 'wah/examples');

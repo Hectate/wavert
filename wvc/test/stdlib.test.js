@@ -1,30 +1,19 @@
-// The standard library added in Draft 0.2, natively and on Node: $readKey on
-// redirected input (§12.2), $time, and random generators (§12.8). Both
-// backends must give the same output.
+// The standard library added in Drafts 0.2 and 0.3: $readKey on redirected
+// input (§12.2), $time, random generators (§12.8), maps (§10.11) and sorting
+// (§10.6).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
-import { exe, noZig, readRepo, runtimeC, runtimeJs, wvc, writeFiles, zigBuild } from './helpers.js';
+import { noZig, readRepo, run } from './helpers.js';
 
 const skip = noZig;
 
-// Runs source on both backends with input (a string or a Buffer); returns the
-// native { out, err, code }, after checking that the two agree unless same is false.
-function runBoth(source, input = '', { same = true } = {}) {
-  const dir = writeFiles({ 'main.wvt': source });
-  const results = [];
-  for (const [target, rt] of [['c', runtimeC], ['js', runtimeJs]]) {
-    const code = join(dir, `main.${target}`);
-    const c = wvc(['main.wvt', '--target', target, '-o', code, '--runtime', rt], { cwd: dir });
-    assert.deepEqual({ err: c.err, code: c.code }, { err: '', code: 0 }, `--target ${target}`);
-    const [cmd, args] = target === 'c' ? [zigBuild(code, join(dir, `main${exe}`)), []] : [process.execPath, [code]];
-    const r = spawnSync(cmd, args, { encoding: 'utf8', input });
-    results.push({ out: r.stdout, err: r.stderr, code: r.status });
-  }
-  if (same) assert.deepEqual(results[1], results[0], 'C and JavaScript differ');
-  return results[0];
+// Runs source, which must compile cleanly, with input (a string or a Buffer):
+// { out, err, code }.
+function runMain(source, input = '') {
+  const r = run(source, { input });
+  assert.ok(!r.compileError, r.err);
+  return { out: r.out, err: r.err, code: r.code };
 }
 
 // Every key in the input, one per line, then "end".
@@ -42,7 +31,7 @@ const readKeys = `
 ;exit
 `;
 const keysOf = (input) => {
-  const r = runBoth(readKeys, Buffer.isBuffer(input) ? input : Buffer.from(input, 'utf8'));
+  const r = runMain(readKeys, Buffer.isBuffer(input) ? input : Buffer.from(input, 'utf8'));
   assert.equal(r.code, 0, r.err);
   const lines = r.out.split('\n');
   assert.deepEqual(lines.slice(-2), ['end', '']);
@@ -88,7 +77,7 @@ test('escape and alt', { skip }, () => {
 });
 
 test('$readKey and $readLine share their input', { skip }, () => {
-  const r = runBoth(`
+  const r = runMain(`
 ;($readKey)($print)
 ;($readLine)($print)
 ;($readKey)($print)
@@ -102,14 +91,14 @@ test('$readKey and $readLine share their input', { skip }, () => {
 });
 
 test('$readKey at the end of input is an unhandled fail', { skip }, () => {
-  const r = runBoth(';($readKey)($print)\n;exit\n');
+  const r = runMain(';($readKey)($print)\n;exit\n');
   assert.equal(r.code, 1);
   assert.match(r.err, /unhandled fail \(code 1\) from '\$readKey'/);
 });
 
 test('$time is the time in milliseconds', { skip }, () => {
   const before = Date.now();
-  const r = runBoth(';const t is ($time)\n;"{t($typeOf)} {t}"($print)\n;exit\n', '', { same: false });
+  const r = runMain(';const t is ($time)\n;"{t($typeOf)} {t}"($print)\n;exit\n');
   const [type, t] = r.out.trim().split(' ');
   assert.equal(type, 'int');
   assert.ok(Number(t) >= before - 1000 && Number(t) <= Date.now() + 1000, t);
@@ -121,7 +110,7 @@ const vectors = [...readRepo('docs/wavert-spec.md').matchAll(/^\| `(-?\d+)` \| (
 
 test('random generators match the test vectors in the specification', { skip }, () => {
   assert.equal(vectors.length, 4);
-  const r = runBoth(`
+  const r = runMain(`
 ;fn show(seed) {
     ;var rng is seed($newRandom)
     ;const state is "{rng.s0}, {rng.s1}, {rng.s2}, {rng.s3}"
@@ -139,7 +128,7 @@ ${vectors.map((v) => `;(${v.seed})(show)`).join('\n')}
 });
 
 test('a generator is a record that can be saved, restored and replayed', { skip }, () => {
-  const r = runBoth(`
+  const r = runMain(`
 ;var rng is 7($newRandom)
 ;(rng($fields), ",")($join)($print)
 ;rng($typeOf)($print)
@@ -164,7 +153,7 @@ test('a generator is a record that can be saved, restored and replayed', { skip 
 });
 
 test('$random draws every value of a small range evenly', { skip }, () => {
-  const r = runBoth(`
+  const r = runMain(`
 ;var rng is 2026($newRandom)
 ;var counts is [0, 0, 0]
 ;var i is 0
@@ -181,7 +170,7 @@ test('$random draws every value of a small range evenly', { skip }, () => {
 
 test('misusing a generator panics', { skip }, () => {
   const panic = (code) => {
-    const r = runBoth(`${code}\n;exit\n`);
+    const r = runMain(`${code}\n;exit\n`);
     assert.equal(r.code, 1, code);
     return /uncaught panic: (.*)/.exec(r.err)[1];
   };
@@ -200,16 +189,16 @@ test('misusing a generator panics', { skip }, () => {
 
 // ---- Draft 0.3: maps (§10.11) and sorting (§10.6) ----
 
-// The output of a program that must run without error on both backends.
+// The output of a program that must run without error.
 function output(source) {
-  const r = runBoth(`${source}\n;exit\n`);
+  const r = runMain(`${source}\n;exit\n`);
   assert.equal(r.err, '', source);
   assert.equal(r.code, 0, source);
   return r.out;
 }
-// The message of the panic that source ends with, on both backends.
+// The message of the panic that source ends with.
 function panicOf(source) {
-  const r = runBoth(`${source}\n;exit\n`);
+  const r = runMain(`${source}\n;exit\n`);
   assert.equal(r.code, 1, source);
   return /uncaught panic: (.*)/.exec(r.err)[1];
 }
@@ -326,7 +315,7 @@ test('misusing a map panics', { skip }, () => {
   assert.equal(panicOf(';panic [1: "a", 2: [:]]'), '[1: "a", 2: [:]]');
   assert.equal(panicOf(';([1: 2] < [1: 2])($print)'), "type error: '<' cannot order map values");
   assert.equal(panicOf(';"x"[1]($print)'), 'type error: indexing needs an array, a map or a record, got string (use $at for a string)');
-  const r = runBoth(';const m is [1: 2]\n;(m, 5)($get)($print)\n;exit\n');
+  const r = runMain(';const m is [1: 2]\n;(m, 5)($get)($print)\n;exit\n');
   assert.equal(r.code, 1);
   assert.match(r.err, /unhandled fail \(code 1\) from '\$get'/);
 });
