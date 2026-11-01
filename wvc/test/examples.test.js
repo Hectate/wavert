@@ -2,7 +2,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { exe, examples, libDir, noZig, root, runtimeC, tempDir, wvc, zigBuild } from './helpers.js';
 
@@ -83,6 +84,15 @@ const expected = {
     out: lines('operator ;', 'keyword const', 'name s', 'name is', 'string "World"', 'operator ;', 'string "Hello, {s}"',
       'operator (', 'stdlib $print', 'operator )', 'operator ;', 'keyword exit', '12 tokens'),
   },
+  // Every puzzle solved in turn, with a space after each to go on: the
+  // shortest solutions, which keep the puzzles solvable as they are changed.
+  'samples/crates.wvt': {
+    args: [join(root, 'samples/crates-puzzles')],
+    input: ['d', 'dsasd', 'sdwasaawdwdsddwa', 'wdaaawwddswdddsssaawa', 'dddwwwwasswaaawass'].join(' ') + ' ',
+    out: new RegExp('^crates: puzzle 1 of 5: First push\\n\\n#####\\n#@\\$\\.#\\n#####\\n\\nmoves 0 [^\\n]*\\n\\n'
+      + ['1 move', '5 moves', '16 moves', '21 moves', '18 moves'].map((m) => `[\\s\\S]*Solved in ${m}!`).join('')
+      + '[\\s\\S]*\\nAll 5 puzzles solved\\.\\n$'),
+  },
 };
 
 test('every example and sample has an expected output', () => {
@@ -104,3 +114,74 @@ for (const file of examples()) {
     else assert.equal(r.stdout, out);
   });
 }
+
+test('samples/crates.wvt: undo, restart, moving between puzzles, and bad puzzle files', { skip }, () => {
+  const dir = tempDir();
+  const c = wvc(['samples/crates.wvt', '-o', join(dir, 'crates.c'), '--runtime', runtimeC, '--lib', libDir]);
+  assert.deepEqual({ err: c.err, code: c.code }, { err: '', code: 0 });
+  const program = zigBuild(join(dir, 'crates.c'), join(dir, `crates${exe}`));
+  const play = (folder, input) => {
+    const r = spawnSync(program, [folder], { encoding: 'utf8', input });
+    return { out: r.stdout, err: r.stderr, code: r.status };
+  };
+  // The status and message lines of each frame.
+  const status = (out) => out.split('\n').filter((l) => /^(crates:|moves|\w.* (here|undo|puzzle)$|Goodbye)/.test(l));
+  const r = play(join(root, 'samples/crates-puzzles'), 'nduuxrppq');
+  assert.deepEqual(status(r.out), [
+    'crates: puzzle 1 of 5: First push', 'moves 0    u undo  r restart  n/p puzzle  q quit',
+    'crates: puzzle 2 of 5: Around the pillar', 'moves 0    u undo  r restart  n/p puzzle  q quit',
+    'crates: puzzle 2 of 5: Around the pillar', 'moves 1    u undo  r restart  n/p puzzle  q quit',
+    'crates: puzzle 2 of 5: Around the pillar', 'moves 0    u undo  r restart  n/p puzzle  q quit',
+    'crates: puzzle 2 of 5: Around the pillar', 'moves 0    u undo  r restart  n/p puzzle  q quit', 'nothing to undo',
+    'crates: puzzle 2 of 5: Around the pillar', 'moves 0    u undo  r restart  n/p puzzle  q quit', 'x does nothing here',
+    'crates: puzzle 2 of 5: Around the pillar', 'moves 0    u undo  r restart  n/p puzzle  q quit',
+    'crates: puzzle 1 of 5: First push', 'moves 0    u undo  r restart  n/p puzzle  q quit',
+    'crates: puzzle 1 of 5: First push', 'moves 0    u undo  r restart  n/p puzzle  q quit', 'this is the first puzzle',
+    'Goodbye.',
+  ]);
+  // Files with mistakes are reported and skipped; other files are ignored.
+  const folder = join(dir, 'puzzles');
+  mkdirSync(folder);
+  const files = {
+    'a.txt': '; title: Good\n#####\n#@$.#\n#####\n',
+    'b.txt': '; nothing\n\n',
+    'c.txt': '#####\n#@$x#\n#####\n',
+    'd.txt': '#####\n# $.#\n#####\n',
+    'e.txt': '######\n#@$$.#\n######\n',
+    'f.txt': '#####\n#@@.#\n#####\n',
+    'notes.md': 'not a puzzle',
+  };
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(folder, name), text);
+  const bad = play(folder, 'q');
+  assert.equal(bad.err, lines(
+    'crates: b.txt is skipped: there is no puzzle in it',
+    "crates: c.txt is skipped: row 2 has 'x', which is not part of a puzzle",
+    'crates: d.txt is skipped: there is no player (@ or +)',
+    'crates: e.txt is skipped: it has 2 crates and 1 target; they must match, and there must be some',
+    'crates: f.txt is skipped: there is more than one player (@ or +)'));
+  assert.match(bad.out, /^crates: puzzle 1 of 1: Good\n/);
+  const none = play(join(dir, 'no-such-folder'), '');
+  assert.equal(none.code, 2);
+  assert.match(none.err, /^crates: cannot read the puzzle folder .*no-such-folder\n$/);
+});
+
+test('samples/crates.wvt: a message stays on screen while the game ticks', { skip, timeout: 30000 }, async () => {
+  const dir = tempDir();
+  const c = wvc(['samples/crates.wvt', '-o', join(dir, 'crates.c'), '--runtime', runtimeC, '--lib', libDir]);
+  assert.deepEqual({ err: c.err, code: c.code }, { err: '', code: 0 });
+  const program = zigBuild(join(dir, 'crates.c'), join(dir, `crates${exe}`));
+  // stdin stays open with nothing to read, so $waitKey times out and the game
+  // draws a frame each tick.
+  const child = spawn(program, [join(root, 'samples/crates-puzzles')], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let out = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { out += chunk; });
+  child.stdin.write('d');
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  child.stdin.end();
+  await new Promise((resolve) => child.on('close', resolve));
+  // Every frame from the solving move on shows the message, ticks included.
+  const frames = out.split('crates: puzzle').slice(2);
+  assert.ok(frames.length >= 3, `only ${frames.length} frames after the move`);
+  for (const f of frames) assert.match(f, /Solved in 1 move!/);
+});

@@ -44,7 +44,7 @@ The language is specified in [docs/wavert-spec.md](docs/wavert-spec.md). The rea
 | [runtime/](runtime/) | `wvt.c`, the runtime that compiled programs inline. |
 | [lib/](lib/) | The standard library written in Wavert: general helpers that any program imports with `;import grid from "$lib/grid.wvt"`. |
 | [examples/](examples/) | Short programs, each showing one feature: Hello World, echo, FizzBuzz, records, `match`, enums, modules, `ref` bindings, maps, records as map keys, telling kinds of record apart, the standard library, sorting, files, processes, keys, random numbers, the terminal, pausing, and animating between key presses. |
-| [samples/](samples/) | Larger programs that combine features: a Wavert tokenizer written in Wavert, and walking around a room with the keyboard. |
+| [samples/](samples/) | Larger programs that combine features: a Wavert tokenizer written in Wavert, walking around a room with the keyboard, and Crates, a crate-pushing puzzle game in colour whose puzzles are text files in `samples/crates-puzzles/`. |
 | [src/](src/) | Programs, built by `build.ps1`. |
 | [build.ps1](build.ps1) | Builds every program in `src\` into `bin\` with `wvc` and Zig. |
 | [editors/vscode/](editors/vscode/) | VS Code syntax highlighting and snippets. |

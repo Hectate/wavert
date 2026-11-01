@@ -1,0 +1,310 @@
+// crates: push every crate onto a target.
+//
+// A puzzle game for the terminal that combines several features:
+// - Puzzles are text files, found with $listDir and read with $readFile; a
+//   file with a mistake is reported and skipped.
+// - The board is a grid of terrain (lib/grid.wvt), with the crates in a map
+//   keyed by position (§10.11).
+// - It is drawn in layers with lib/view.wvt: in colour in a terminal, with
+//   targets that shimmer while the game waits for a key ($waitKey), and as
+//   plain text when the output is not a terminal ($terminal).
+// - Undo keeps the earlier states in an array.
+//
+// Arrow keys, h j k l or w a s d move; u undoes, r restarts, n and p go to the
+// next and previous puzzle, and q or Escape quits.
+//
+// Usage: wvc build samples/crates.wvt, then run it in a terminal. The puzzles
+// are in crates-puzzles/ next to the program, or in the folder given as its
+// argument.
+//
+// A puzzle file uses the usual text layout: # wall, a space floor, . target,
+// $ crate, * crate on a target, @ player, + player on a target. A line that
+// starts with ; is a comment, and "; title: ..." names the puzzle.
+
+;import grid from "$lib/grid.wvt"
+;import view from "$lib/view.wvt"
+;import text from "$lib/text.wvt"
+;import math from "$lib/math.wvt"
+
+;enum Terrain (floor, wall, target)
+
+// ---- Reading puzzles ----
+
+// What is wrong with the puzzle that parse last failed on.
+;var problem is ""
+
+// n of word, such as "1 crate" or "2 crates".
+;fn count(n, word) { "{n} {word}{n == 1 ? "" : "s"}" }
+
+// The puzzle in the text of a puzzle file, as { title, terrain, crates,
+// player }; crates is a map from each crate's position to true. Fails, with
+// problem saying why, if the text is not a puzzle.
+;fn parse(content) {
+    ;var title is ""
+    ;var lines is []
+    ;const all is (((content, "\r\n")($split), "\n")($join), "\n")($split)
+    ;var i is 0
+    ;while (i < all($length)) {
+        ;const line is all[i]
+        ;if ((line, "; title:")(text.startsWith)) {
+            ;set title to (line, 8, line($length))($slice)(text.trim)
+        } else if (!(line, ";")(text.startsWith)) {
+            ;(lines, line)($push)
+        }
+        ;set i += 1
+    }
+    ;while (lines($length) > 0 && lines[-1](text.trim) == "") { ;lines($pop) }
+    ;if (lines($length) == 0) {
+        ;set problem to "there is no puzzle in it"
+        ;fail
+    }
+    ;var width is 0
+    ;set i to 0
+    ;while (i < lines($length)) {
+        ;if (lines[i]($length) > width) { ;set width to lines[i]($length) }
+        ;set i += 1
+    }
+    ;var terrain is (width, lines($length), Terrain.floor)(grid.new)
+    ;var crates is [:]
+    ;var player is null
+    ;var targets is 0
+    ;var y is 0
+    ;while (y < lines($length)) {
+        ;const cs is (lines[y], "")($split)
+        ;var x is 0
+        ;while (x < cs($length)) {
+            ;const p is (x, y)(grid.pos)
+            ;const c is cs[x]
+            ;if (c == "#") { ;(terrain, p, Terrain.wall)(grid.putAt) }
+            ;if (c == "." || c == "*" || c == "+") {
+                ;(terrain, p, Terrain.target)(grid.putAt)
+                ;set targets += 1
+            }
+            ;if (c == "$" || c == "*") { ;set crates[p] to true }
+            ;if (c == "@" || c == "+") {
+                ;if (player != null) {
+                    ;set problem to "there is more than one player (@ or +)"
+                    ;fail
+                }
+                ;set player to p
+            }
+            ;if (!(c == "#" || c == " " || c == "." || c == "$" || c == "*" || c == "@" || c == "+")) {
+                ;set problem to "row {y + 1} has '{c}', which is not part of a puzzle"
+                ;fail
+            }
+            ;set x += 1
+        }
+        ;set y += 1
+    }
+    ;if (player == null) {
+        ;set problem to "there is no player (@ or +)"
+        ;fail
+    }
+    ;if (crates($length) == 0 || crates($length) != targets) {
+        ;set problem to "it has {(crates($length), "crate")(count)} and {(targets, "target")(count)}; they must match, and there must be some"
+        ;fail
+    }
+    // Frozen, so that playing a puzzle never changes the one that was read.
+    ;const frozenCrates is crates
+    { title: title, terrain: terrain(grid.copy), crates: frozenCrates, player: player }
+}
+
+// The folder of puzzles: the program's argument, else crates-puzzles/ next
+// to the program.
+;fn folder() {
+    ;if ($args($length) > 0) { ;return $args[0] }
+    ;const cs is ($programPath, "")($split)
+    ;var k is cs($length) - 1
+    ;while (k >= 0 && cs[k] != "/" && cs[k] != "\\") { ;set k -= 1 }
+    ((cs, 0, k + 1)($slice), "")($join) + "crates-puzzles"
+}
+
+;const dir is (folder)
+;const names is dir($listDir)
+    onfail { ;"crates: cannot read the puzzle folder {dir}"($eprint) ;exit 2 }
+;var puzzles is []
+;var n is 0
+;while (n < names($length)) {
+    ;const name is names[n]
+    ;set n += 1
+    ;if (!(name, ".txt")(text.endsWith)) { ;continue }
+    ;const content is (dir + "/" + name)($readFile)
+        onfail { ;"crates: cannot read {name}"($eprint) ;continue }
+    ;const puzzle is content(parse)
+        onfail { ;"crates: {name} is skipped: {problem}"($eprint) ;continue }
+    ;(puzzles, puzzle)($push)
+}
+;if (puzzles($length) == 0) {
+    ;"crates: there are no puzzles in {dir}"($eprint)
+    ;exit 2
+}
+
+// ---- Playing ----
+
+;var index is 0
+;var terrain is puzzles[0].terrain
+;var crates is puzzles[0].crates
+;var player is puzzles[0].player
+;var moves is 0
+;var history is []    // { player, crates, moves } before each move, for undo
+;var solved is false
+;var message is ""
+
+// Starts puzzle i afresh.
+;fn start(i) {
+    ;set index to i
+    ;set terrain to puzzles[i].terrain
+    ;set crates to puzzles[i].crates
+    ;set player to puzzles[i].player
+    ;set moves to 0
+    ;set history to []
+    ;set solved to false
+}
+
+;fn isWall(p) {
+    ;const t is (terrain, p)(grid.at)
+        onfail { Terrain.wall }
+    t == Terrain.wall
+}
+
+// Moves the player by dx, dy, pushing a crate if there is one and the cell
+// beyond it is free.
+;fn move(dx, dy) {
+    ;const to is (player.x + dx, player.y + dy)(grid.pos)
+    ;if (to(isWall)) { ;return }
+    ;const pushing is (crates, to)($has)
+    ;const beyond is (to.x + dx, to.y + dy)(grid.pos)
+    ;if (pushing && (beyond(isWall) || (crates, beyond)($has))) { ;return }
+    // A frozen snapshot: crates changes after this.
+    ;const before is crates
+    ;(history, { player: player, crates: before, moves: moves })($push)
+    ;if (pushing) {
+        ;(crates, to)($remove)
+        ;set crates[beyond] to true
+    }
+    ;set player to to
+    ;set moves += 1
+}
+
+;fn undo() {
+    ;if (history($length) == 0) {
+        ;set message to "nothing to undo"
+        ;return
+    }
+    ;const last is history($pop)
+    ;set player to last.player
+    ;set crates to last.crates
+    ;set moves to last.moves
+}
+
+// Whether every crate is on a target.
+;fn allPlaced() {
+    ;const ps is crates($keys)
+    ;var i is 0
+    ;while (i < ps($length)) {
+        ;if ((terrain, ps[i])(grid.at) != Terrain.target) { ;return false }
+        ;set i += 1
+    }
+    true
+}
+
+// ---- Drawing ----
+
+;const tty is ($terminal).output
+;const tiles is [
+    Terrain.floor: " ",
+    Terrain.wall: { glyph: "#", fg: view.Color.gray },
+    Terrain.target: { glyph: ".", fg: [view.Color.yellow, view.Color.brightYellow] }
+]
+;const looseCrate is { glyph: "$", fg: view.Color.brightYellow }
+;const placedCrate is { glyph: "*", fg: view.Color.brightGreen }
+;const me is { glyph: "@", fg: view.Color.brightCyan }
+
+// Each line of the screen, followed in a terminal by clearing the rest of
+// the line, since a frame is drawn over the last one.
+;fn say(line) { ;(line + (tty ? "\u{1B}[K" : ""))($print) }
+
+;fn draw(tick) {
+    ;var shown is [:]
+    ;const ps is crates($keys)
+    ;var i is 0
+    ;while (i < ps($length)) {
+        ;set shown[ps[i]] to (terrain, ps[i])(grid.at) == Terrain.target ? placedCrate : looseCrate
+        ;set i += 1
+    }
+    ;var here is [:]
+    ;set here[player] to me
+    ;const layers is [(terrain, tiles)(view.gridLayer), (shown, [:])(view.mapLayer), (here, [:])(view.mapLayer)]
+    ;var rows is []
+    ;if (tty) {
+        ;const size is ($terminalSize)
+            onfail { { width: 80, height: 24 } }
+        ;const window is (player, size.width, (size.height - 5, 3)(math.max), terrain)(view.follow)
+        ;set rows to (layers, window, null, null, [:], null, tick)(view.colorRows)
+        ;"\u{1B}[H"($write)
+    } else {
+        ;set rows to (layers, { x: 0, y: 0, width: terrain.width, height: terrain.height }, null, null, [:], 0)(view.rows)
+    }
+    ;const title is puzzles[index].title
+    ;"crates: puzzle {index + 1} of {puzzles($length)}{title == "" ? "" : ": " + title}"(say)
+    ;""(say)
+    ;set i to 0
+    ;while (i < rows($length)) {
+        ;rows[i](say)
+        ;set i += 1
+    }
+    ;""(say)
+    ;"moves {moves}    u undo  r restart  n/p puzzle  q quit"(say)
+    ;message(say)
+}
+
+;if (tty) { ;"\u{1B}[2J"($write) }
+;var tick is 0
+;var playing is true
+;while (playing) {
+    ;tick(draw)
+    // Wait a quarter of a second for a key, so that the targets shimmer; the
+    // end of input quits.
+    ;const key is 250($waitKey)
+        onfail { "q" }
+    ;if (key == null) {
+        ;set tick += 1
+        ;continue
+    }
+    // A message stays until the next key, however many ticks that takes.
+    ;set message to ""
+    ;if (solved && key != "q" && key != "escape") {
+        ;if (index + 1 < puzzles($length)) {
+            ;(index + 1)(start)
+        } else {
+            ;set playing to false
+        }
+        ;continue
+    }
+    ;match (key) {
+        case "left", "h", "a" { ;(-1, 0)(move) }
+        case "right", "l", "d" { ;(1, 0)(move) }
+        case "up", "k", "w" { ;(0, -1)(move) }
+        case "down", "j", "s" { ;(0, 1)(move) }
+        case "u" { ;(undo) }
+        case "r" { ;index(start) }
+        case "n" {
+            ;if (index + 1 < puzzles($length)) { ;(index + 1)(start) } else { ;set message to "this is the last puzzle" }
+        }
+        case "p" {
+            ;if (index > 0) { ;(index - 1)(start) } else { ;set message to "this is the first puzzle" }
+        }
+        case "q", "escape" { ;set playing to false }
+        else { ;set message to "{key} does nothing here" }
+    }
+    ;if (playing && !solved && (allPlaced)) {
+        ;set solved to true
+        ;set message to "Solved in {(moves, "move")(count)}! Press a key for the next puzzle."
+    }
+}
+;if (solved && index + 1 == puzzles($length)) {
+    ;"All {puzzles($length)} puzzles solved."($print)
+} else {
+    ;"Goodbye."($print)
+}
+;exit
