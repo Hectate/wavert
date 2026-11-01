@@ -342,3 +342,119 @@ test('dice: notation, check and exact odds', { skip }, () => {
   lines('0.4166666666666667 42% 100% 0% 3%', '>99% >99% <1% <1%', '42% 50% 1.0', 'bad 0% 100% <1% >99% 50%'));
   assert.equal(panicOf(diceProgram(';(2, 0)(dice.odds)')), 'dice.odds: cannot roll 2d0');
 });
+
+// ---- text.wvt ----
+
+const textProgram = (body) => `;import text from "$lib/text.wvt"\n${body}`;
+
+test('text: repeat and padding', { skip }, () => {
+  assert.equal(out(textProgram(`
+;"[{("ab", 3)(text.repeat)}] [{("ab", 0)(text.repeat)}] [{("ab", -2)(text.repeat)}] [{(7, 2)(text.repeat)}]"($print)
+;"[{("HP", 6)(text.padRight)}{(42, 4)(text.padLeft)}] [{("ab", 7)(text.center)}] [{("ab", 6)(text.center)}]"($print)
+// Already as wide as asked, or wider: unchanged.
+;"[{("toolong", 3)(text.padLeft)}] [{("toolong", 3)(text.padRight)}] [{("toolong", 3)(text.center)}] [{("é😀", 4)(text.padLeft)}]"($print)`)),
+  lines('[ababab] [] [] [77]', '[HP      42] [  ab   ] [  ab  ]', '[toolong] [toolong] [toolong] [  é😀]'));
+});
+
+test('text: trim, searching and replacing', { skip }, () => {
+  assert.equal(out(textProgram(`
+;"[{"  hi there \\t\\r\\n"(text.trim)}] [{" \\n "(text.trim)}] [{"x"(text.trim)}]"($print)
+;"{("north gate", "north")(text.startsWith)} {("north gate", "gate")(text.startsWith)} {("north gate", "gate")(text.endsWith)} {("x", "")(text.endsWith)} {("", "x")(text.startsWith)}"($print)
+;const missing is ("abc", "z")(text.indexOf)
+    onfail { "none" }
+;"{("north gate", "gate")(text.indexOf)} {("aaa", "a")(text.indexOf)} {("abc", "")(text.indexOf)} {missing} {("a😀b", "b")(text.indexOf)}"($print)
+;"{("north gate", "th g")(text.contains)} {("north gate", "x")(text.contains)}"($print)
+;"{("a-b--c", "-", "+")(text.replace)} {("abc", "", "+")(text.replace)} {("aaa", "aa", "b")(text.replace)} {(1010, 0, 2)(text.replace)}"($print)`)),
+  lines('[hi there] [] [x]', 'true false true true false', '6 0 0 none 2', 'true false', 'a+b++c abc ba 1212'));
+});
+
+test('text: ASCII case', { skip }, () => {
+  assert.equal(out(textProgram(`
+;"{"Hello, Wörld! az AZ @[\`{{"(text.toUpper)}"($print)
+;"{"Hello, WÖRLD! az AZ @[\`{{"(text.toLower)}"($print)`)),
+  lines('HELLO, WöRLD! AZ AZ @[`{', 'hello, wÖrld! az az @[`{'));
+});
+
+test('text: wrap', { skip }, () => {
+  const wrap = (s, w) => out(textProgram(`;((${JSON.stringify(s)}, ${w})(text.wrap), "|")($join)($print)`)).trimEnd();
+  assert.equal(wrap('the quick brown fox jumps over the lazy dog', 10), 'the quick|brown fox|jumps over|the lazy|dog');
+  assert.equal(wrap('abcdefghijkl and more', 5), 'abcde|fghij|kl|and|more');
+  assert.equal(wrap('first\n\nthird   with  spaces', 20), 'first||third with spaces');
+  assert.equal(wrap('one\r\ntwo', 9), 'one|two');
+  assert.equal(wrap('', 5), '');
+  assert.equal(wrap('abc', 0), 'a|b|c');
+  assert.equal(wrap('exactly ten', 11), 'exactly ten');
+});
+
+// ---- arrays.wvt ----
+
+const arraysProgram = (body) => `;import arrays from "$lib/arrays.wvt"\n${body}`;
+
+test('arrays: finding and counting, by contents', { skip }, () => {
+  assert.equal(out(arraysProgram(`
+;const recs is [{ x: 1 }, { x: 2 }, { x: 1 }, [1, 2]]
+;const missing is (recs, { x: 9 })(arrays.indexOf)
+    onfail { "none" }
+;"{(recs, { x: 2 })(arrays.indexOf)} {(recs, [1, 2])(arrays.indexOf)} {missing} {(recs, { x: 1 })(arrays.count)} {([], 1)(arrays.count)}"($print)
+;"{(recs, { x: 1 })(arrays.contains)} {(recs, { x: 9 })(arrays.contains)} {([1, 1.0], 1)(arrays.count)}"($print)`)),
+  lines('1 3 none 2 0', 'true false 2'));
+});
+
+test('arrays: range, filled and concat', { skip }, () => {
+  assert.equal(out(arraysProgram(`
+;fn show(ref xs) { "[{(xs, ",")($join)}]" }
+;"{(0, 5)(arrays.range)(show)} {(3, 0)(arrays.range)(show)} {(2, 2)(arrays.range)(show)} {(-2, 1)(arrays.range)(show)}"($print)
+;"{(3, "x")(arrays.filled)(show)} {(0, "x")(arrays.filled)(show)} {(-1, "x")(arrays.filled)(show)}"($print)
+;const a is [1, 2]
+;const both is (a, [3])(arrays.concat)
+;"{both(show)} {a(show)} {([], [])(arrays.concat)(show)}"($print)`)),
+  lines('[0,1,2,3,4] [3,2,1] [] [-2,-1,0]', '[x,x,x] [] []', '[1,2,3] [1,2] []'));
+});
+
+test('arrays: removeAt and insertAt', { skip }, () => {
+  assert.equal(out(arraysProgram(`
+;var pack is ["sword", "rope", "lamp"]
+;const a is (pack, 1)(arrays.removeAt)
+;const b is (pack, -1)(arrays.removeAt)
+;const c is (pack, 5)(arrays.removeAt)
+    onfail { "none" }
+;const d is (pack, -2)(arrays.removeAt)
+    onfail { "none" }
+;"{a} {b} {c} {d} {(pack, ",")($join)}"($print)
+;(pack, 0, "map")(arrays.insertAt)
+;(pack, 2, "end")(arrays.insertAt)
+;(pack, -1, "mid")(arrays.insertAt)
+;(pack, 9, "no")(arrays.insertAt)
+    onfail { null }
+;(pack, -9, "no")(arrays.insertAt)
+    onfail { null }
+;(pack, ",")($join)($print)
+;var empty is []
+;(empty, 0, "only")(arrays.insertAt)
+;"{(empty, 0)(arrays.removeAt)} {empty($length)}"($print)`)),
+  lines('rope lamp none none sword', 'map,sword,mid,end', 'only 0'));
+  assert.equal(panicOf(arraysProgram(';const xs is [1, 2]\n;fn f(ref a) { ;(a, 0)(arrays.removeAt) }\n;xs(f)')), 'cannot modify a frozen array');
+});
+
+// ---- maps.wvt ----
+
+test('maps: getOr, add and pushTo', { skip }, () => {
+  assert.equal(out(`;import maps from "$lib/maps.wvt"
+;import grid from "$lib/grid.wvt"
+;var kills is [:]
+;(kills, "orc", 1)(maps.add)
+;const n is (kills, "orc", 2)(maps.add)
+;(kills, "rat", -1)(maps.add)
+;"{n} {(kills, "rat", 0)(maps.getOr)} {(kills, "bat", 0)(maps.getOr)} {(kills($keys), ",")($join)}"($print)
+;var items is [:]
+;(items, (3, 4)(grid.pos), "coin")(maps.pushTo)
+;(items, (3, 4)(grid.pos), "gem")(maps.pushTo)
+;(items, (0, 0)(grid.pos), "rock")(maps.pushTo)
+;"{(items[(3, 4)(grid.pos)], ",")($join)} {(items[(0, 0)(grid.pos)], ",")($join)} {items($length)}"($print)
+// A frozen array already at the key is copied before the push.
+;var piles is ["a": ["x"]]
+;const before is piles["a"]
+;(piles, "a", "y")(maps.pushTo)
+;"{(piles["a"], ",")($join)} {(before, ",")($join)}"($print)`),
+  lines('3 -1 0 orc,rat', 'coin,gem rock 2', 'x,y x'));
+});

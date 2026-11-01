@@ -1,0 +1,163 @@
+// text: string helpers.
+//
+// ;import text from "$lib/text.wvt"
+// ;("HP", 6)(text.padRight) + (42, 4)(text.padLeft)   // "HP      42"
+// ;("the quick brown fox", 10)(text.wrap)           // ["the quick", "brown fox"]
+// ;const at is ("north gate", "gate")(text.indexOf)
+//     onfail { -1 }
+//
+// Strings are sequences of code points (§9.1), and every position, length and
+// width here counts code points. A value given as text is converted as
+// interpolation converts it (§9.3), so a number can be padded too.
+//
+// The conversion is written s($toString), which says what it does. The
+// interpolation "{s}" gives the same string, is shorter, and can be relied on
+// just as well.
+
+// s repeated n times; "" if n is 0 or less.
+;export fn repeat(s, n) {
+    ;var parts is []
+    ;var i is 0
+    ;while (i < n) {
+        ;(parts, s($toString))($push)
+        ;set i += 1
+    }
+    (parts, "")($join)
+}
+
+// n spaces; "" if n is 0 or less.
+;fn spaces(n) { (" ", n)(repeat) }
+
+// s with spaces before it to make it width long; s itself if it is that long
+// already.
+;export fn padLeft(s, width) {
+    ;const t is s($toString)
+    (width - t($length))(spaces) + t
+}
+
+// s with spaces after it to make it width long; s itself if it is that long
+// already.
+;export fn padRight(s, width) {
+    ;const t is s($toString)
+    t + (width - t($length))(spaces)
+}
+
+// s with spaces on both sides to make it width long, the odd one after; s
+// itself if it is that long already.
+;export fn center(s, width) {
+    ;const t is s($toString)
+    ;const before is ((width - t($length)) / 2)($floor)
+    before(spaces) + t + (width - t($length) - before)(spaces)
+}
+
+;fn isSpace(c) { c == " " || c == "\t" || c == "\n" || c == "\r" }
+
+// s without the spaces, tabs and line endings at its start and end.
+;export fn trim(s) {
+    ;const cs is (s($toString), "")($split)
+    ;var a is 0
+    ;while (a < cs($length) && cs[a](isSpace)) { ;set a += 1 }
+    ;var b is cs($length)
+    ;while (b > a && cs[b - 1](isSpace)) { ;set b -= 1 }
+    ((cs, a, b)($slice), "")($join)
+}
+
+// Whether s starts with part. Every string starts with "".
+;export fn startsWith(s, part) {
+    ;const t is s($toString)
+    ;const p is part($toString)
+    p($length) <= t($length) && (t, 0, p($length))($slice) == p
+}
+
+// Whether s ends with part. Every string ends with "".
+;export fn endsWith(s, part) {
+    ;const t is s($toString)
+    ;const p is part($toString)
+    p($length) <= t($length) && (t, t($length) - p($length), t($length))($slice) == p
+}
+
+// The position of the first part in s. Fails if s does not contain part.
+// "" is at 0.
+;export fn indexOf(s, part) {
+    ;const t is s($toString)
+    ;const p is part($toString)
+    ;var i is 0
+    ;while (i + p($length) <= t($length)) {
+        ;if ((t, i, i + p($length))($slice) == p) { ;return i }
+        ;set i += 1
+    }
+    ;fail
+}
+
+// Whether s contains part.
+;export fn contains(s, part) {
+    ;const i is (s, part)(indexOf)
+        onfail { -1 }
+    i >= 0
+}
+
+// s with every from replaced by to. With from "", s is returned unchanged.
+;export fn replace(s, from, to) {
+    ;const f is from($toString)
+    ;if (f == "") { ;return s($toString) }
+    ((s($toString), f)($split), to($toString))($join)
+}
+
+// s with each code point from lo to hi moved by shift.
+;fn shiftRange(s, lo, hi, shift) {
+    ;var cs is (s($toString), "")($split)
+    ;var i is 0
+    ;while (i < cs($length)) {
+        ;const c is cs[i]($code)
+        ;if (c >= lo && c <= hi) { ;set cs[i] to (c + shift)($fromCode) }
+        ;set i += 1
+    }
+    (cs, "")($join)
+}
+
+// s with the ASCII letters a to z made capitals. Other letters are unchanged.
+;export fn toUpper(s) { (s, 97, 122, -32)(shiftRange) }
+
+// s with the ASCII letters A to Z made small. Other letters are unchanged.
+;export fn toLower(s) { (s, 65, 90, 32)(shiftRange) }
+
+// s as lines of at most width, broken between words, such as for a message
+// log. Line breaks in s are kept, a word longer than a line is broken where
+// the line ends, and runs of spaces become one. A width below 1 counts as 1.
+;export fn wrap(s, width) {
+    ;const w is width < 1 ? 1 : width
+    ;const paragraphs is (((s($toString), "\r\n")($split), "\n")($join), "\n")($split)
+    ;var out is []
+    ;var p is 0
+    ;while (p < paragraphs($length)) {
+        ;const words is (paragraphs[p], " ")($split)
+        ;var line is ""
+        ;var k is 0
+        ;while (k < words($length)) {
+            ;var word is words[k]
+            ;set k += 1
+            ;if (word == "") { ;continue }
+            ;while (word($length) > w) {
+                ;if (line != "") {
+                    ;(out, line)($push)
+                    ;set line to ""
+                }
+                ;(out, (word, 0, w)($slice))($push)
+                ;set word to (word, w, word($length))($slice)
+            }
+            ;if (line == "") {
+                ;set line to word
+            } else if (line($length) + 1 + word($length) <= w) {
+                ;set line to line + " " + word
+            } else {
+                ;(out, line)($push)
+                ;set line to word
+            }
+        }
+        ;(out, line)($push)
+        ;set p += 1
+    }
+    out
+}
+
+;end

@@ -1,0 +1,122 @@
+// arrays: array helpers. For maps, see maps.wvt.
+//
+// ;import arrays from "$lib/arrays.wvt"
+// ;(0, 5)(arrays.range)                      // [0, 1, 2, 3, 4]
+// ;(["orc", "rat", "orc"], "orc")(arrays.count)   // 2
+// ;var pack is ["sword", "rope", "lamp"]
+// ;const dropped is (pack, 1)(arrays.removeAt)    // "rope"; pack is ["sword", "lamp"]
+//
+// Elements compare with $same (§10.5), so arrays and records in an array are
+// found by their contents. An index may be negative, counting from the end,
+// as in xs[i].
+
+// The index of the first element of xs that is the same as x. Fails if there
+// is none.
+;export fn indexOf(ref xs, x) {
+    ;var i is 0
+    ;while (i < xs($length)) {
+        ;if ((xs[i], x)($same)) { ;return i }
+        ;set i += 1
+    }
+    ;fail
+}
+
+// Whether xs has an element that is the same as x.
+;export fn contains(ref xs, x) {
+    ;const i is (xs, x)(indexOf)
+        onfail { -1 }
+    i >= 0
+}
+
+// The number of elements of xs that are the same as x.
+;export fn count(ref xs, x) {
+    ;var n is 0
+    ;var i is 0
+    ;while (i < xs($length)) {
+        ;if ((xs[i], x)($same)) { ;set n += 1 }
+        ;set i += 1
+    }
+    n
+}
+
+// The ints from a up to b, not including b, in either direction: (0, 3) is
+// [0, 1, 2], and (3, 0) is [3, 2, 1]. [] if a and b are equal.
+;export fn range(a, b) {
+    ;const step is a < b ? 1 : -1
+    ;var out is []
+    ;var i is a
+    ;while (i != b) {
+        ;(out, i)($push)
+        ;set i += step
+    }
+    out
+}
+
+// An array of n elements, each v; [] if n is 0 or less. v is shared by every
+// element, so for a mutable array in each, push a new one each time instead.
+;export fn filled(n, v) {
+    ;var out is []
+    ;var i is 0
+    ;while (i < n) {
+        ;(out, v)($push)
+        ;set i += 1
+    }
+    out
+}
+
+// A new array of the elements of a, then those of b.
+;export fn concat(ref a, ref b) {
+    ;var out is []
+    ;var i is 0
+    ;while (i < a($length)) {
+        ;(out, a[i])($push)
+        ;set i += 1
+    }
+    ;set i to 0
+    ;while (i < b($length)) {
+        ;(out, b[i])($push)
+        ;set i += 1
+    }
+    out
+}
+
+// The index i of xs as a position from the start, or -1 if there is no such
+// element.
+;fn position(ref xs, i) {
+    ;const k is i < 0 ? xs($length) + i : i
+    k >= 0 && k < xs($length) ? k : -1
+}
+
+// Removes element i of xs, a mutable array, and returns it; the elements after
+// it move down one. Fails, changing nothing, if there is no element i.
+;export fn removeAt(ref xs, i) {
+    ;const k is (xs, i)(position)
+    ;if (k < 0) { ;fail }
+    ;const removed is xs[k]
+    ;var j is k
+    ;while (j < xs($length) - 1) {
+        ;set xs[j] to xs[j + 1]
+        ;set j += 1
+    }
+    ;xs($pop)
+    removed
+}
+
+// Inserts x into xs, a mutable array, so that it becomes element i; the
+// elements from i on move up one. i may be xs($length), to add x at the end,
+// and -1 puts x before the last element. Fails, changing nothing, if i is
+// beyond either end.
+;export fn insertAt(ref xs, i, x) {
+    ;const n is xs($length)
+    ;const k is i < 0 ? n + i : i
+    ;if (k < 0 || k > n) { ;fail }
+    ;(xs, x)($push)
+    ;var j is n
+    ;while (j > k) {
+        ;set xs[j] to xs[j - 1]
+        ;set j -= 1
+    }
+    ;set xs[k] to x
+}
+
+;end

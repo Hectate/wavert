@@ -1,0 +1,36 @@
+// maps: map helpers. For arrays, see arrays.wvt.
+//
+// ;import maps from "$lib/maps.wvt"
+// ;var kills is [:]
+// ;(kills, "orc", 1)(maps.add)                  // kills is ["orc": 1]
+// ;(kills, "rat", 0)(maps.getOr)                // 0, as "rat" is not there
+// ;var items is [:]
+// ;(items, (3, 4)(grid.pos), "coin")(maps.pushTo)   // a pile of items at 3,4
+//
+// The maps these change are mutable: hold them in var bindings (§10.11).
+
+// The value of key k in m, or otherwise if m has no key k.
+;export fn getOr(ref m, k, otherwise) {
+    ;const v is (m, k)($get)
+        onfail { otherwise }
+    v
+}
+
+// Adds n to the number at key k of m, starting from 0 if m has no key k, as
+// for counting; returns the new number.
+;export fn add(ref m, k, n) {
+    ;const total is (m, k, 0)(getOr) + n
+    ;set m[k] to total
+    total
+}
+
+// Adds x to the end of the array at key k of m, starting a new array if m has
+// no key k, as for a pile of items at a position.
+;export fn pushTo(ref m, k, x) {
+    ;var list is (m, k)($get)
+        onfail { [] }
+    ;(list, x)($push)
+    ;set m[k] to list
+}
+
+;end
