@@ -678,7 +678,7 @@
             ;return "s" + (e.parts($length) == 0 ? "" : e.parts[0])
         }
         ;if (e.k == "float" || e.k == "nan" || e.k == "inf" || e.k == "null") {
-            ;(e.pos, "a map key must be an int, a string, a boolean or an enum member", null)(diag.failHint)
+            ;(e.pos, "a map key must be an int, a string, a boolean, an enum member or a record", null)(diag.failHint)
         }
         null
     }

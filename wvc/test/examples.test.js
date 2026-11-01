@@ -36,6 +36,7 @@ const expected = {
   'examples/files.wvt': { out: lines('first line', 'second line', 'listed: true', 'exists: false', 'cannot read it now') },
   'examples/fizzbuzz.wvt': { out: lines(...fizzbuzz, '1.5') },
   'examples/hello.wvt': { out: lines('Hello, World') },
+  'examples/kinds.wvt': { out: lines('an orc, with 5 hp', 'a ring, worth 30 gold') },
   'examples/keys.wvt': {
     input: 'a?\x1b[A\x13q',
     out: lines('press keys; q quits', 'a: a character', '?: a character', 'up: a named key', 'ctrl+s: a named key'),
@@ -48,6 +49,7 @@ const expected = {
     out: lines('text.wvt: initialized', 'shapes.wvt: initialized', 'modules.wvt: running', 'a circle has 0 corners',
       'a triangle has 3 corners', 'a square has 4 corners', '7 corners in all'),
   },
+  'examples/positions.wvt': { out: lines('orc', 'false', 'orc at 3,4', 'rat at -2,7') },
   'examples/process.wvt': {
     out: lines('hello, stranger', 'child: given 2 arguments: child, two words', 'the child exited with 3'),
   },

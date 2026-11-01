@@ -308,9 +308,9 @@ test('misusing a map panics', { skip }, () => {
   assert.equal(panicOf(';var m is ["a": 2]\n;set m["b"] += 1'), 'no key "b" in map');
   assert.equal(panicOf(';const m is [1: 2]\n;fn f(ref x) { ;set x[1] to 3 }\n;m(f)'), 'cannot modify a frozen map');
   assert.equal(panicOf(';const m is [1: 2]\n;fn f(ref x) { ;(x, 1)($remove) }\n;m(f)'), 'cannot modify a frozen map with $remove');
-  assert.equal(panicOf(';var m is [1: 2]\n;set m[1.5] to 3'), 'type error: a map key must be an int, a string, a boolean or an enum member, got float');
-  assert.equal(panicOf(';const k is [1]\n;const m is [k: 2]'), 'type error: a map key must be an int, a string, a boolean or an enum member, got array');
-  assert.equal(panicOf(';const m is [1: 2]\n;(m, null)($has)'), 'type error: a map key must be an int, a string, a boolean or an enum member, got null');
+  assert.equal(panicOf(';var m is [1: 2]\n;set m[1.5] to 3'), 'type error: a map key must be an int, a string, a boolean, an enum member or a record, got float');
+  assert.equal(panicOf(';const k is [1]\n;const m is [k: 2]'), 'type error: a map key must be an int, a string, a boolean, an enum member or a record, got array');
+  assert.equal(panicOf(';const m is [1: 2]\n;(m, null)($has)'), 'type error: a map key must be an int, a string, a boolean, an enum member or a record, got null');
   assert.equal(panicOf(';[1, 2]($keys)'), 'type error: $keys expects a map, got array');
   assert.equal(panicOf(';[1: 2]($print)'), 'type error: cannot convert map to text; convert it explicitly');
   assert.equal(panicOf(';panic [1: "a", 2: [:]]'), '[1: "a", 2: [:]]');
@@ -540,4 +540,79 @@ test('$sleep shows what was written before pausing', { skip, timeout: 30000 }, a
 test('$waitKey and $sleep need an int', { skip }, () => {
   assert.equal(panicOf(';"x"($sleep)'), 'type error: $sleep expects an int, got string');
   assert.equal(panicOf(';1.5($waitKey)'), 'type error: $waitKey expects an int, got float');
+});
+
+// ---- Draft 0.6: records as map keys (§10.11) ----
+
+test('record keys compare by contents, in any field order', { skip }, () => {
+  assert.equal(output(`
+;enum Kind (orc, rat)
+;var m is [{ x: 3, y: 4 }: "orc"]
+;m[{ y: 4, x: 3 }]($print)
+;set m[{ x: 3, y: 4 }] to "troll"
+;set m[{ x: -1, y: 0 }] to "rat"
+;set m[{ kind: Kind.orc, id: 7, name: "Grub", boss: true }] to "named"
+;"{m($length)} {m[{ x: 3, y: 4 }]} {m[{ name: "Grub", id: 7, boss: true, kind: Kind.orc }]}"($print)
+// Names are part of the key, and so is every field.
+;([(m, { col: 3, row: 4 })($has), (m, { x: 3, y: 4, z: 0 })($has), (m, { x: 3 })($has), (m, 3)($has)], " ")($join)($print)
+// Two records built alike are equal keys, but == stays reference equality.
+;const a is { x: 3, y: 4 }
+;const b is { x: 3, y: 4 }
+;"{a == b} {(m, a)($has)} {(m, b)($has)}"($print)
+;const keys is m($keys)
+;"{keys[0].x},{keys[0].y} {keys[1].x},{keys[1].y} {keys[0]($typeOf)}"($print)
+;(m, { y: 0, x: -1 })($remove)($print)
+;m($length)($print)`), lines('orc', '3 troll named', 'false false false false', 'false true true', '3,4 -1,0 record', 'rat', '2'));
+});
+
+test('a mutable record key is snapshotted when it is added', { skip }, () => {
+  assert.equal(output(`
+;var pos is { x: 1, y: 1 }
+;var m is [:]
+;set m[pos] to "here"
+;set pos.x to 2
+;"{(m, { x: 1, y: 1 })($has)} {(m, pos)($has)} {m($keys)[0].x}"($print)
+// The stored key is frozen; setting an existing key keeps it.
+;set m[{ x: 1, y: 1 }] to "still"
+;var stored is m($keys)[0]
+;set stored.x to 9
+;"{m[{ x: 1, y: 1 }]} {m($length)}"($print)
+// A map literal and $same agree on record keys.
+;const p is [{ x: 1 }: "a", { x: 1 }: "b"]
+;"{p($length)} {p[{ x: 1 }]} {([{ x: 1, y: 2 }: 0], [{ y: 2, x: 1 }: 0])($same)}"($print)`),
+  lines('true false 1', 'still 1', '1 b true'));
+});
+
+test('many record keys added and removed', { skip }, () => {
+  assert.equal(output(`
+;var m is [:]
+;var y is 0
+;while (y < 60) {
+    ;var x is 0
+    ;while (x < 60) {
+        ;set m[{ x: x, y: y }] to x * y
+        ;set x += 1
+    }
+    ;set y += 1
+}
+;set y to 0
+;while (y < 60) {
+    ;if (y % 2 == 1) {
+        ;var x is 0
+        ;while (x < 60) {
+            ;(m, { y: y, x: x })($remove)
+            ;set x += 1
+        }
+    }
+    ;set y += 1
+}
+;"{m($length)} {m[{ x: 59, y: 58 }]} {(m, { x: 0, y: 1 })($has)}"($print)`), lines('1800 3422 false'));
+});
+
+test('record keys must be flat', { skip }, () => {
+  assert.equal(panicOf(';var m is [:]\n;set m[{ x: 1.5 }] to 0'), "type error: field 'x' of a map key must be an int, a string, a boolean or an enum member, got float");
+  assert.equal(panicOf(';var m is [:]\n;set m[{ at: { x: 1 } }] to 0'), "type error: field 'at' of a map key must be an int, a string, a boolean or an enum member, got record");
+  assert.equal(panicOf(';const m is [{ a: [1] }: 0]'), "type error: field 'a' of a map key must be an int, a string, a boolean or an enum member, got array");
+  assert.equal(panicOf(';const m is [1: 2]\n;(m, { x: null })($get)'), "type error: field 'x' of a map key must be an int, a string, a boolean or an enum member, got null");
+  assert.equal(panicOf(';const m is [{ x: 1 }: 2]\n;m[{ x: 2 }]($print)'), 'no key {x: 2} in map');
 });

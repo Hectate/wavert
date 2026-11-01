@@ -64,8 +64,8 @@ const cases = [
   // map literals
   [';const m is ["a": 1, "a": 2]\n;exit\n', '1:22: error: duplicate key in map literal'],
   [';const m is [1: 1, -1: 2, 1: 3]\n;exit\n', '1:27: error: duplicate key in map literal'],
-  [';const m is [1.5: 1]\n;exit\n', '1:14: error: a map key must be an int, a string, a boolean or an enum member'],
-  [';const m is [null: 1]\n;exit\n', '1:14: error: a map key must be an int, a string, a boolean or an enum member'],
+  [';const m is [1.5: 1]\n;exit\n', '1:14: error: a map key must be an int, a string, a boolean, an enum member or a record'],
+  [';const m is [null: 1]\n;exit\n', '1:14: error: a map key must be an int, a string, a boolean, an enum member or a record'],
   [';const m is [1: 2, 3]\n;exit\n', "1:21: error: expected ':' after a key in the map literal, found ']' | map literals are written [key: value, ...]"],
   [';const m is [1: 2,]\n;exit\n', '1:18: error: trailing comma in map literal'],
   [';const m is [:1]\n;exit\n', "1:15: error: expected ']' after '[:', found '1' | an empty map is written [:]"],

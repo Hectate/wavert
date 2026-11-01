@@ -1,4 +1,4 @@
-# Wavert Language Specification (Draft 0.5)
+# Wavert Language Specification (Draft 0.6)
 
 > Draft 0.1 was the first Wavert specification. Wavert is derived from Γ-- ([wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). It changes Γ--'s syntax and names and keeps its semantics; [hybrid-syntax.md](hybrid-syntax.md) gives the reasons for each change. Section numbers follow the Γ-- specification, so a reference such as §10.4 means the same topic in both.
 >
@@ -9,6 +9,8 @@
 > Draft 0.4 adds `$terminal` and `$terminalSize` (§12.2), which tell whether stdin and stdout are terminals and how big the terminal is.
 >
 > Draft 0.5 adds waiting for a key with a timeout (`$waitKey`, §12.2), a monotonic clock (`$elapsed`) and `$sleep` (§12.8), so a program can animate between key presses.
+>
+> Draft 0.6 allows records as map keys, compared by their contents (§10.11), and documents telling kinds of record apart with an enum field (§10.10).
 
 ## 1. Overview
 
@@ -562,6 +564,7 @@ A copy happens **only when mutability changes**:
 ### 10.5 Equality
 - `==` is reference equality for arrays, records and maps.
 - `;(a, b)($same)` is deep structural equality; elements compare with `==`. It also recurses into records (§10.10) and maps (§10.11).
+- Map keys compare with `$same`, so a record used as a key is found by its contents (§10.11).
 
 ### 10.6 Array stdlib
 ```
@@ -642,6 +645,23 @@ A copy happens **only when mutability changes**:
 - Records have no interpolation conversion (§9.3), so `;node($print)` panics.
 - `;node($typeOf)` is `"record"`.
 - `;node($fields)` returns a frozen array of the field names, in literal order.
+
+**Kinds of record.** Records have no types: every record's `$typeOf` is `"record"`, and nothing ties a record to the literal that made it. To tell kinds of record apart, give each a field holding a member of an enum (§4.1), conventionally named `kind`:
+```
+;enum Kind (monster, item)
+;const orc is { kind: Kind.monster, hp: 5 }
+;const coin is { kind: Kind.item, value: 1 }
+;fn describe(thing) {
+    match (thing.kind) {
+        case Kind.monster { "a monster with {thing.hp} hp" }
+        case Kind.item { "an item worth {thing.value}" }
+    }
+}
+;orc(describe)($print)
+;exit
+```
+- A `match` on the field must handle every kind (§7.5), so adding a kind is a compile error until every such match handles it.
+- Comparing shapes instead, with `;(a($fields)($sort), b($fields)($sort))($same)`, works but is not the convention: two kinds can share a shape, and one kind's shape can grow.
 - Array and string builtins (`$length`, `$at`, `$slice`, ...) panic on a record.
 
 ### 10.11 Maps
@@ -670,11 +690,22 @@ A map holds values under keys, and keys can be added and removed. A record's fie
 - Map literals are frozen.
 
 **Keys**
-- A key is an int, a string, a boolean or an enum member. Any other key panics: `type error: a map key must be an int, a string, a boolean or an enum member, got float`.
+- A key is an int, a string, a boolean, an enum member, or a record whose fields all hold ints, strings, booleans or enum members. Any other key panics: `type error: a map key must be an int, a string, a boolean, an enum member or a record, got float`, or for a field, `type error: field 'pos' of a map key must be an int, a string, a boolean or an enum member, got record`.
   - Floats are excluded, as they are from `match` (§7.5): float equality makes poor keys.
-  - Arrays, records, maps and `null` are excluded. Arrays and records compare by reference (§10.5), so two arrays built alike would be two different keys.
-  - For a grid position, use an int such as `y * width + x`.
-- Keys compare with `==`, so one map may hold keys of several types: `1`, `"1"` and `true` are three different keys.
+  - Arrays, maps and `null` are excluded, and so are records with fields that hold them, or that hold records.
+- Keys compare with `$same` (§10.10), so one map may hold keys of several types: `1`, `"1"` and `true` are three different keys.
+- **Records as keys** compare by their contents, not by reference: the same field names, in any order, with the same values. This is the one place where two records built alike are equal; `==` on records stays reference equality (§10.5).
+  ```
+  ;var monsters is [:]
+  ;set monsters[{ x: 3, y: 4 }] to "orc"
+  ;monsters[{ y: 4, x: 3 }]($print)          // orc
+  ;(monsters, { x: 3, y: 5 })($has)($print)  // false
+  ;exit
+  ```
+  - The field names are part of the key, so `{ x: 3, y: 4 }`, `{ col: 3, row: 4 }` and `{ x: 3, y: 4, z: 0 }` are three different keys. Positions and other kinds of key can share a map without colliding.
+  - A key's shape identifies what it is, so keys need no `kind` field (§10.10); the convention is for values. To keep a map's keys the same shape, build them with one function, such as `;fn pos(x, y) { { x: x, y: y } }`, rather than writing the literal at each use.
+  - A key is stored frozen. A mutable record used as a new key is snapshotted when it is added (§10.4), so changing the record later does not change the key. `$keys` gives the stored records.
+  - Each lookup with a record literal builds a record. For a dense grid, an array indexed by `y * width + x` is faster than a map.
 
 **Order**
 - A map keeps its keys in **insertion order**: the order in which they were first added.
@@ -1161,6 +1192,7 @@ More examples are in [examples/](../examples/), each showing one feature, and [s
 - **C backend notes.**
   - Values are a 16-byte tagged struct. Strings are UTF-8. Enum members are pointers to static structs.
   - A map is an array of entries in insertion order with a hash index of them. A removed entry is marked, and the entries are compacted when the array is full.
+  - A record key's hash is the sum of a hash for each field, made from the field's interned name and its value, so field order does not change it.
   - Sorting is a merge sort, with insertion sort for runs of up to 16 elements. Any stable sort gives the same result, since the comparison is fixed (§10.6).
   - Memory is reclaimed by a mark-and-sweep garbage collector, which never moves objects. It finds references on the C stack and in registers conservatively, by treating every word that points into an object as a reference, so the generated code needs no bookkeeping beyond registering its globals. Collections happen during allocation, when the program has allocated as much as was live after the last one (at least 8 MiB).
   - Functions are C functions. The bindings a nested function uses live in a frame struct on the C stack, reached through an `up` pointer; that is enough because a nested function never outlives the call that contains it (§16).
@@ -1187,7 +1219,8 @@ More examples are in [examples/](../examples/), each showing one feature, and [s
 - Functions as values and closures. Today a nested function never outlives the call that contains it, so the native backend needs no heap-allocated closures. If functions become values, `(name)` at the start of an expression would become ambiguous (§6.2) and must be revisited.
 - Static types, written `;const x: int is 5`. They must decide the type of a computed field read `rec[k]` (§10.8).
 - Destructuring, written `;const [a, b] is pair`.
-- Composite map keys, such as a pair of ints, which would need structural equality for keys.
+- Records with nested records as map keys. A key must not change while it is in a map, and snapshots are shallow (§10.4), so this would need a deep freeze.
+- Looking up a key written as a record literal without building the record.
 - A pipeline operator `|>`. It is a syntax error today, so it can be added later without breaking code. Postfix calls already read as a pipeline; revisit after counting real inside-out chains.
 - A type test operator. It should not be spelled `is`, which is a contextual keyword in declarations (§2.5).
 - More terminal support: mouse input.

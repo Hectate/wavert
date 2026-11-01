@@ -1,0 +1,24 @@
+// Records as map keys: things found by where they are.
+//
+// A record whose fields hold ints, strings, booleans or enum members can be a
+// map key. Keys compare by contents: two records with the same field names
+// and values are the same key, whatever the order of their fields.
+//
+// Usage: wvc build examples/positions.wvt
+
+;var monsters is [:]
+;set monsters[{ x: 3, y: 4 }] to "orc"
+;set monsters[{ x: -2, y: 7 }] to "rat"
+
+// A new record built alike finds the same entry.
+;monsters[{ y: 4, x: 3 }]($print)
+;(monsters, { x: 0, y: 0 })($has)($print)
+
+// The keys are records, so their fields are there to read.
+;const keys is monsters($keys)
+;var i is 0
+;while (i < keys($length)) {
+    ;"{monsters[keys[i]]} at {keys[i].x},{keys[i].y}"($print)
+    ;set i += 1
+}
+;exit

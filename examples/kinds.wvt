@@ -1,0 +1,28 @@
+// Kinds of record: telling records apart with an enum field.
+//
+// Records have no types: $typeOf is "record" for every one. By convention,
+// each record carries a field named kind holding a member of an enum, and a
+// match on it handles each kind. The match must list every member, so adding
+// a kind is a compile error until every such match handles it.
+//
+// Usage: wvc build examples/kinds.wvt
+
+;enum Kind (monster, item)
+
+;fn describe(thing) {
+    match (thing.kind) {
+        case Kind.monster { "{thing.name}, with {thing.hp} hp" }
+        case Kind.item { "{thing.name}, worth {thing.value} gold" }
+    }
+}
+
+;const things is [
+    { kind: Kind.monster, name: "an orc", hp: 5 },
+    { kind: Kind.item, name: "a ring", value: 30 }
+]
+;var i is 0
+;while (i < things($length)) {
+    ;things[i](describe)($print)
+    ;set i += 1
+}
+;exit

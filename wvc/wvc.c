@@ -1417,22 +1417,45 @@ static wv *computed(wv k, wv r) {
 
 // ---- maps (§10.11) ----
 
+// A key is a scalar (an int, a string, a boolean or an enum member), or a flat
+// record: one whose fields all hold scalars.
+static int scalar_key(wv k) { return k.tag == T_INT || k.tag == T_STR || k.tag == T_BOOL || k.tag == T_MEM; }
 static void key_ok(wv k) {
-  if (k.tag != T_INT && k.tag != T_STR && k.tag != T_BOOL && k.tag != T_MEM) {
-    rt_fail("type error: a map key must be an int, a string, a boolean or an enum member, got %s", type_name(k));
+  if (k.tag == T_REC) {
+    for (int64_t i = 0; i < k.r->n; i++) {
+      if (scalar_key(k.r->vals[i])) continue;
+      sb b = { 0 };
+      sb_puts(&b, "type error: field '");
+      sb_putn(&b, k.r->keys[i]->data, k.r->keys[i]->bytes);
+      sb_puts(&b, "' of a map key must be an int, a string, a boolean or an enum member, got ");
+      sb_puts(&b, type_name(k.r->vals[i]));
+      rt_fail_sb(&b);
+    }
+    return;
+  }
+  if (!scalar_key(k)) {
+    rt_fail("type error: a map key must be an int, a string, a boolean, an enum member or a record, got %s", type_name(k));
   }
 }
-static uint64_t key_hash(wv k) {
-  uint64_t h;
-  switch (k.tag) {
-    case T_STR: return hash_bytes(k.s->data, k.s->bytes);
-    case T_INT: h = (uint64_t)k.i; break;
-    case T_BOOL: h = (uint64_t)k.b + 0x51ED27; break;
-    default: h = (uint64_t)(uintptr_t)k.m; break;
-  }
+static uint64_t mix64(uint64_t h) {
   h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ULL; // splitmix64's finalizer
   h ^= h >> 27; h *= 0x94D049BB133111EBULL;
   return h ^ (h >> 31);
+}
+static uint64_t key_hash(wv k) {
+  switch (k.tag) {
+    case T_STR: return hash_bytes(k.s->data, k.s->bytes);
+    case T_INT: return mix64((uint64_t)k.i);
+    case T_BOOL: return mix64((uint64_t)k.b + 0x51ED27);
+    case T_REC: {
+      // Field order is ignored (§10.11), so the fields' hashes are summed.
+      // Field names are interned, so a name is hashed by its address.
+      uint64_t h = (uint64_t)k.r->n;
+      for (int64_t i = 0; i < k.r->n; i++) h += mix64((uint64_t)(uintptr_t)k.r->keys[i] ^ key_hash(k.r->vals[i]));
+      return mix64(h);
+    }
+    default: return mix64((uint64_t)(uintptr_t)k.m);
+  }
 }
 static int key_eq(wv a, wv b) {
   if (a.tag != b.tag) return 0;
@@ -1440,6 +1463,16 @@ static int key_eq(wv a, wv b) {
     case T_INT: return a.i == b.i;
     case T_STR: return str_eq(a.s, b.s);
     case T_BOOL: return a.b == b.b;
+    case T_REC:
+      // The same field names, in any order, with equal values: $same (§10.10).
+      if (a.r == b.r) return 1;
+      if (a.r->n != b.r->n) return 0;
+      for (int64_t i = 0; i < a.r->n; i++) {
+        int64_t j = 0;
+        while (j < b.r->n && b.r->keys[j] != a.r->keys[i]) j++;
+        if (j == b.r->n || !key_eq(a.r->vals[i], b.r->vals[j])) return 0;
+      }
+      return 1;
     default: return a.m == b.m;
   }
 }
@@ -1480,6 +1513,9 @@ static void map_rehash(wmap *m, int64_t cap) {
 static void map_put(wmap *m, wv k, wv v) {
   int64_t at = map_find(m, k);
   if (at >= 0) { m->e[at].val = v; return; }
+  // A mutable record key is snapshotted, so that changing the record later
+  // cannot change the key; shallow is enough, since its fields are scalars.
+  if (k.tag == T_REC && k.r->is_mut) k = rec_copy(k.r, 0);
   if (m->len == m->cap) map_rehash(m, m->n * 2 > m->cap ? m->cap * 2 : m->cap);
   int64_t j = key_hash(k) & (m->icap - 1);
   while (m->idx[j] >= 0) j = (j + 1) & (m->icap - 1);
@@ -3469,7 +3505,7 @@ static const wstr S304 = { 32, 32, 1, 0, "trailing comma in record literal" };
 static const wstr S305 = { 37, 37, 1, 0, "expected ',' or '}' in record literal" };
 static const wstr S306 = { 1, 1, 1, 0, "i" };
 static const wstr S307 = { 1, 1, 1, 0, "s" };
-static const wstr S308 = { 63, 63, 1, 0, "a map key must be an int, a string, a boolean or an enum member" };
+static const wstr S308 = { 73, 73, 1, 0, "a map key must be an int, a string, a boolean, an enum member or a record" };
 static const wstr S309 = { 28, 28, 1, 0, "duplicate key in map literal" };
 static const wstr S310 = { 43, 43, 1, 0, "expected ':' after a key in the map literal" };
 static const wstr S311 = { 42, 42, 1, 0, "map literals are written [key: value, ...]" };
