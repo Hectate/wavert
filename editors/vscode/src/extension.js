@@ -59,13 +59,14 @@ function describeBuiltin(name, b) {
 const escape = (text) => text.replace(/([\\*_[\]#<>])/g, '\\$1');
 
 // Adds documentation to md: lines that are Wavert statements (starting with
-// ';') become code blocks, and the rest prose.
+// ';'), with the indented lines that continue them, become code blocks, and
+// the rest prose.
 function appendDoc(md, text) {
   const lines = text.split('\n');
   for (let i = 0; i < lines.length; ) {
     const code = lines[i].startsWith(';');
-    let j = i;
-    while (j < lines.length && lines[j].startsWith(';') === code) j++;
+    let j = i + 1;
+    while (j < lines.length && (code ? /^(;|\s+\S)/.test(lines[j]) : !lines[j].startsWith(';'))) j++;
     const chunk = lines.slice(i, j).join('\n');
     if (code) md.appendCodeblock(chunk, 'wavert');
     else md.appendMarkdown(escape(chunk) + '\n\n');

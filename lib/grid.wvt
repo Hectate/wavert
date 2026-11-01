@@ -4,10 +4,17 @@
 // ;var map is (40, 20, ".")(grid.new)
 // ;(map, 3, 4, "#")(grid.put)
 // ;const blast is ((3, 4)(grid.pos), 2)(grid.circle)
-// ;(map, (map, blast)(grid.within), "*")(grid.fill)
+// ;(map, blast, "*")(grid.fill)
+// ;const t is (map, 50, 4)(grid.get)
+//     onfail { "#" }
 // ;(map(grid.rows), "\n")($join)($print)
 //
 // x grows to the right and y downward, as on a screen: (0, 0) is the top left.
+//
+// Off the grid: a function for one cell (get, put, at, putAt, index, posOf)
+// fails there, so the caller decides what it means, with onfail: a wall, or
+// nothing to do. A function for an area (fill, valuesAt, cellsAt) uses only
+// the area's positions that are on the grid.
 //
 // A grid is a record { width, height, cells }, with cells in rows, one value
 // per cell, of any kind. Keep one grid per kind of thing (terrain, what the
@@ -26,8 +33,8 @@
 //
 // An area is an array of positions, such as the cells in a box or within a
 // blast's radius. It is not a copy of the cells: read and write the grid
-// through it with valuesAt and fill. Shapes list their positions row by row,
-// and may reach outside the grid; within keeps the ones on it.
+// through it with valuesAt, cellsAt and fill. Shapes list their positions row
+// by row, and may reach outside the grid.
 
 ;import math from "math.wvt"
 
@@ -106,39 +113,47 @@
 // Whether x, y is on g.
 ;export fn inside(ref g, x, y) { x >= 0 && x < g.width && y >= 0 && y < g.height }
 
-// The index of x, y in g.cells; panics, naming the function what, if it is
-// not on g.
-;fn slot(ref g, x, y, what) {
-    ;if (!(g, x, y)(inside)) { ;panic "grid.{what}: ({x}, {y}) is outside the {g.width} x {g.height} grid" }
+// The index of x, y in g.cells, row by row. Fails if x, y is not on g.
+;export fn index(ref g, x, y) {
+    ;if (!(g, x, y)(inside)) { ;fail }
     y * g.width + x
 }
 
-// The index of x, y in g.cells, row by row. Panics if it is not on g.
-;export fn index(ref g, x, y) { (g, x, y, "index")(slot) }
-
-// The position of index i in g.cells. Panics if there is no such cell.
+// The position of index i in g.cells. Fails if there is no such cell.
 ;export fn posOf(ref g, i) {
-    ;if (i < 0 || i >= g.width * g.height) { ;panic "grid.posOf: {i} is not a cell of the {g.width} x {g.height} grid" }
+    ;if (i < 0 || i >= g.width * g.height) { ;fail }
     (i % g.width, (i, g.width)(math.div))(pos)
 }
 
-// The value of the cell at x, y. Panics if it is not on g.
-;export fn get(ref g, x, y) { g.cells[(g, x, y, "get")(slot)] }
+// The value of the cell at x, y. Fails if x, y is not on g.
+;export fn get(ref g, x, y) {
+    ;const i is (g, x, y)(index)
+        onfail { ;fail }
+    g.cells[i]
+}
 
-// Sets the cell at x, y to v. Panics if it is not on g.
+// Sets the cell at x, y to v. Fails, changing nothing, if x, y is not on g.
 ;export fn put(ref g, x, y, v) {
-    ;const i is (g, x, y, "put")(slot)
+    ;const i is (g, x, y)(index)
+        onfail { ;fail }
     // A frozen cells array is copied once; after that, cells is g's own.
     ;var cells is g.cells
     ;set cells[i] to v
     ;set g.cells to cells
 }
 
-// The value of the cell at position p. Panics if it is not on g.
-;export fn at(ref g, p) { g.cells[(g, p.x, p.y, "at")(slot)] }
+// The value of the cell at position p. Fails if p is not on g.
+;export fn at(ref g, p) {
+    ;const v is (g, p.x, p.y)(get)
+        onfail { ;fail }
+    v
+}
 
-// Sets the cell at position p to v. Panics if it is not on g.
-;export fn putAt(ref g, p, v) { ;(g, p.x, p.y, v)(put) }
+// Sets the cell at position p to v. Fails, changing nothing, if p is not on g.
+;export fn putAt(ref g, p, v) {
+    ;(g, p.x, p.y, v)(put)
+        onfail { ;fail }
+}
 
 // The cells as strings, one per row, for drawing a grid of characters. Each
 // cell is converted as interpolation converts it (§9.3).
@@ -228,31 +243,38 @@
     out
 }
 
-// The values of g's cells at the positions of area, in order. Panics if a
-// position is not on g; clip the area with within first.
+// The values of g's cells at the positions of area that are on g, in order:
+// for asking what is in an area. To act on each cell where it is, use cellsAt.
 ;export fn valuesAt(ref g, ref area) {
     ;var out is []
     ;var i is 0
     ;while (i < area($length)) {
-        ;(out, g.cells[(g, area[i].x, area[i].y, "valuesAt")(slot)])($push)
+        ;if ((g, area[i].x, area[i].y)(inside)) { ;(out, g.cells[area[i].y * g.width + area[i].x])($push) }
         ;set i += 1
     }
     out
 }
 
-// Sets every cell of g at a position of area to v. Panics if a position is
-// not on g, before changing anything; clip the area with within first.
-;export fn fill(ref g, ref area, v) {
-    ;var slots is []
+// The cells of g at the positions of area that are on g, in order, as
+// records { pos, value }: for acting on each cell where it is. To ask only
+// what is in an area, use valuesAt.
+;export fn cellsAt(ref g, ref area) {
+    ;var out is []
     ;var i is 0
     ;while (i < area($length)) {
-        ;(slots, (g, area[i].x, area[i].y, "fill")(slot))($push)
+        ;const p is area[i]
+        ;if ((g, p.x, p.y)(inside)) { ;(out, { pos: p, value: g.cells[p.y * g.width + p.x] })($push) }
         ;set i += 1
     }
+    out
+}
+
+// Sets the cells of g at the positions of area that are on g to v.
+;export fn fill(ref g, ref area, v) {
     ;var cells is g.cells
-    ;set i to 0
-    ;while (i < slots($length)) {
-        ;set cells[slots[i]] to v
+    ;var i is 0
+    ;while (i < area($length)) {
+        ;if ((g, area[i].x, area[i].y)(inside)) { ;set cells[area[i].y * g.width + area[i].x] to v }
         ;set i += 1
     }
     ;set g.cells to cells

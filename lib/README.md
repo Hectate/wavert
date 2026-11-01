@@ -9,7 +9,7 @@ General helpers that any program can use, imported with the reserved prefix `$li
 | Module | Contents |
 |---|---|
 | [math.wvt](math.wvt) | `abs`, `sign`, `min`, `max`, `clamp` (bounds in either order), exact floored `div`, `isqrt`, `gcd`, `lcm`, `sum`, `minOf`, `maxOf`, `lerp` |
-| [grid.wvt](grid.wvt) | Grids of cells (`new`, `get`, `put`, `at`, `putAt`, `copy`, `rows`), positions (`pos`, neighbours, distances, `line`), areas (`rect`, `square`, `ring`, `diamond`, `circle`, `within`, `valuesAt`, `fill`) and combining them (`union`, `intersect`, `minus`, `exclude`) |
+| [grid.wvt](grid.wvt) | Off the grid, one-cell functions fail and area functions use the part on the grid. Grids of cells (`new`, `get`, `put`, `at`, `putAt`, `copy`, `rows`), positions (`pos`, neighbours, distances, `line`), areas (`rect`, `square`, `ring`, `diamond`, `circle`, `within`, `valuesAt`, `cellsAt`, `fill`) and combining them (`union`, `intersect`, `minus`, `exclude`) |
 | [dice.wvt](dice.wvt) | Rolling (`roll`, `dice`, `between` (bounds in either order), `chance`, `pick`, `shuffled`, `weighted`, `rollText`, `check`) and exact odds (`odds`, `chanceAtLeast`, `chanceText`, `percent`) |
 
 Each file's opening comment explains its use, and each function has a comment above it.

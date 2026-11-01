@@ -127,10 +127,31 @@ test('grid: cells, positions and indexes', { skip }, () => {
 ;const p is (map, 9)(grid.posOf)
 ;"{(map, 1, 2)(grid.index)} {p.x},{p.y} {map.width}x{map.height} {(0, 0, 0)(grid.new).cells($length)}"($print)`)),
   lines('...@|....|.#..', '# @ true false false', '9 1,2 4x3 0'));
-  assert.equal(panicOf(gridProgram(';var g is (4, 3, 0)(grid.new)\n;(g, 4, 0)(grid.get)')), 'grid.get: (4, 0) is outside the 4 x 3 grid');
-  assert.equal(panicOf(gridProgram(';var g is (4, 3, 0)(grid.new)\n;(g, 0, -1, 1)(grid.put)')), 'grid.put: (0, -1) is outside the 4 x 3 grid');
-  assert.equal(panicOf(gridProgram(';var g is (4, 3, 0)(grid.new)\n;(g, 12)(grid.posOf)')), 'grid.posOf: 12 is not a cell of the 4 x 3 grid');
   assert.equal(panicOf(gridProgram(';(-1, 3, 0)(grid.new)')), 'grid.new: the size -1 x 3 is negative');
+});
+
+test('grid: off the grid, one cell fails and the caller decides', { skip }, () => {
+  assert.equal(out(gridProgram(`
+;var map is (4, 3, ".")(grid.new)
+;const edge is (map, 4, 0)(grid.get)
+    onfail { "#" }
+;const corner is (map, (-1, -1)(grid.pos))(grid.at)
+    onfail { "#" }
+;const i is (map, 0, 3)(grid.index)
+    onfail { -1 }
+;const p is (map, 12)(grid.posOf)
+    onfail { null }
+;"{edge} {corner} {i} {p}"($print)
+// Writing off the grid changes nothing.
+;(map, 9, 9, "@")(grid.put)
+    onfail { null }
+;(map, (-1, 0)(grid.pos), "@")(grid.putAt)
+    onfail { null }
+;(map(grid.rows), "|")($join)($print)`)),
+  lines('# # -1 null', '....|....|....'));
+  const r = run(gridProgram(';var g is (4, 3, 0)(grid.new)\n;(g, 4, 0)(grid.get)\n;exit\n'));
+  assert.equal(r.code, 1);
+  assert.match(r.err, /unhandled fail \(code 1\) from 'get'/);
 });
 
 test('grid: copies never change each other', { skip }, () => {
@@ -179,20 +200,30 @@ test('grid: area shapes', { skip }, () => {
     '-1,-2 0,-2 1,-2 -2,-1 -1,-1 0,-1 1,-1 2,-1 -2,0 -1,0 0,0 1,0 2,0 -2,1 -1,1 0,1 1,1 2,1 -1,2 0,2 1,2', '0,0 0,0 []'));
 });
 
-test('grid: reading and writing through areas', { skip }, () => {
+test('grid: reading and writing through areas, which use only what is on the grid', { skip }, () => {
   assert.equal(out(gridProgram(`
 ;var map is (5, 3, ".")(grid.new)
+// A blast at the corner reaches off the grid: fill writes the part on it.
 ;const blast is ((0, 0)(grid.pos), 1)(grid.square)
-;const onMap is (map, blast)(grid.within)
-;onMap(show)($print)
-;(map, onMap, "*")(grid.fill)
+;(map, blast)(grid.within)(show)($print)
+;(map, blast, "*")(grid.fill)
+;(map, 4, 2, "@")(grid.put)
 ;(map(grid.rows), "|")($join)($print)
-;((map, ((3, 1)(grid.pos), (4, 2)(grid.pos))(grid.rect))(grid.valuesAt), "")($join)($print)`)),
-  lines('0,0 1,0 0,1 1,1', '**...|**...|.....', '....'));
-  assert.equal(panicOf(gridProgram(';var g is (2, 1, 0)(grid.new)\n;(g, [(0, 0)(grid.pos), (5, 0)(grid.pos)], 1)(grid.fill)')),
-    'grid.fill: (5, 0) is outside the 2 x 1 grid');
-  assert.equal(panicOf(gridProgram(';var g is (2, 1, 0)(grid.new)\n;(g, [(2, 0)(grid.pos)])(grid.valuesAt)')),
-    'grid.valuesAt: (2, 0) is outside the 2 x 1 grid');
+// valuesAt and cellsAt give the same cells, in the same order.
+;const box is ((3, 1)(grid.pos), (5, 2)(grid.pos))(grid.rect)
+;((map, box)(grid.valuesAt), "")($join)($print)
+;const cells is (map, box)(grid.cellsAt)
+;var parts is []
+;var i is 0
+;while (i < cells($length)) {
+    ;(parts, "{cells[i].pos.x},{cells[i].pos.y}={cells[i].value}")($push)
+    ;set i += 1
+}
+;(parts, " ")($join)($print)
+;"{(map, [(9, 9)(grid.pos)])(grid.valuesAt)($length)} {(map, [])(grid.cellsAt)($length)}"($print)
+;(map, [(9, 9)(grid.pos)], "!")(grid.fill)
+;(map(grid.rows), "|")($join)($print)`)),
+  lines('0,0 1,0 0,1 1,1', '**...|**...|....@', '...@', '3,1=. 4,1=. 3,2=. 4,2=@', '0 0', '**...|**...|....@'));
 });
 
 test('grid: combining areas', { skip }, () => {
