@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -2817,6 +2818,67 @@ static wv std_reverse(wv arr) {
   return (wv){ .tag = T_ARR, .a = out };
 }
 
+// Fills keys with the record keys for names: the program's own keys for those
+// names, if it has them, so that r.name and { name: ... } work as for any
+// record. keys must be registered with rt_root.
+static void rec_keys(const char *const *names, int n, const wstr **keys) {
+  if (keys[0]) return;
+  for (int i = 0; i < n; i++) {
+    int64_t len = (int64_t)strlen(names[i]);
+    wstr probe = { len, len, 1, 0, names[i] };
+    const wstr *k = sym_find(&probe);
+    if (!k) {
+      wstr *s = (wstr *)str_new(names[i], len);
+      s->sym = 1;
+      sym_add(s);
+      k = s;
+    }
+    keys[i] = k;
+  }
+}
+
+// ---- the terminal (§12.2) ----
+
+static const wstr *terminal_keys[2], *size_keys[2];
+
+static int is_terminal(int fd) {
+#ifdef _WIN32
+  DWORD mode;
+  return GetConsoleMode(GetStdHandle(fd == 0 ? STD_INPUT_HANDLE : STD_OUTPUT_HANDLE), &mode) != 0;
+#else
+  return isatty(fd);
+#endif
+}
+
+static wv std_terminal(void) {
+  static const char *const names[2] = { "input", "output" };
+  rec_keys(names, 2, terminal_keys);
+  wv vals[2] = { rt_b(is_terminal(0)), rt_b(is_terminal(1)) };
+  return rt_rec(1, 2, terminal_keys, vals);
+}
+
+static wv std_terminalSize(void) {
+  int64_t w = 0, h = 0;
+#ifdef _WIN32
+  CONSOLE_SCREEN_BUFFER_INFO info;
+  if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) {
+    w = info.srWindow.Right - info.srWindow.Left + 1;
+    h = info.srWindow.Bottom - info.srWindow.Top + 1;
+  }
+#else
+  struct winsize ws;
+  if (isatty(1) && ioctl(1, TIOCGWINSZ, &ws) == 0) {
+    w = ws.ws_col;
+    h = ws.ws_row;
+  }
+#endif
+  if (w <= 0 || h <= 0) return rt_std_fail("$terminalSize");
+  static const char *const names[2] = { "width", "height" };
+  rec_keys(names, 2, size_keys);
+  wv vals[2] = { rt_i(w), rt_i(h) };
+  return rt_rec(1, 2, size_keys, vals);
+}
+
 // ---- time and random numbers (§12.8) ----
 
 static wv std_time(void) {
@@ -2832,24 +2894,11 @@ static wv std_time(void) {
 #endif
 }
 
-// A generator is a mutable record { s0, s1, s2, s3 } of 32-bit words. Its keys
-// are the program's own keys for those names, if it has them, so that rng.s0
-// and { s0: ... } work as for any record.
+// A generator is a mutable record { s0, s1, s2, s3 } of 32-bit words.
 static const wstr *rng_keys[4];
 static void rng_start(void) {
-  if (rng_keys[0]) return;
-  static const char *names[4] = { "s0", "s1", "s2", "s3" };
-  for (int i = 0; i < 4; i++) {
-    wstr probe = { 2, 2, 1, 0, names[i] };
-    const wstr *k = sym_find(&probe);
-    if (!k) {
-      wstr *s = (wstr *)str_new(names[i], 2);
-      s->sym = 1;
-      sym_add(s);
-      k = s;
-    }
-    rng_keys[i] = k;
-  }
+  static const char *const names[4] = { "s0", "s1", "s2", "s3" };
+  rec_keys(names, 4, rng_keys);
 }
 
 // MurmurHash3's finalizer.
@@ -2949,6 +2998,8 @@ static __attribute__((noinline)) void rt_run(void) {
   rt_root(&args_cache, sizeof args_cache);
   rt_root(&program_path_cache, sizeof program_path_cache);
   rt_root(rng_keys, sizeof rng_keys);
+  rt_root(terminal_keys, sizeof terminal_keys);
+  rt_root(size_keys, sizeof size_keys);
 #ifdef _WIN32
   rt_root(&key_repeat, sizeof key_repeat);
 #endif

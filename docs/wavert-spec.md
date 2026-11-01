@@ -1,10 +1,12 @@
-# Wavert Language Specification (Draft 0.3)
+# Wavert Language Specification (Draft 0.4)
 
 > Draft 0.1 was the first Wavert specification. Wavert is derived from Γ-- ([wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). It changes Γ--'s syntax and names and keeps its semantics; [hybrid-syntax.md](hybrid-syntax.md) gives the reasons for each change. Section numbers follow the Γ-- specification, so a reference such as §10.4 means the same topic in both.
 >
 > Draft 0.2 adds key input (`$readKey`) and terminal output on Windows (§12.2), and the clock and random numbers (§12.8).
 >
 > Draft 0.3 adds maps (§10.11) and sorting (§10.6), and drops the lint on string-literal keys (§2.8), which are normal for maps.
+>
+> Draft 0.4 adds `$terminal` and `$terminalSize` (§12.2), which tell whether stdin and stdout are terminals and how big the terminal is.
 
 ## 1. Overview
 
@@ -801,6 +803,8 @@ Standard semantics throughout.
 | `$eprint` | `;x($eprint)` | stderr, then a newline |
 | `$readLine` | `;($readLine)` | One line of stdin, without its line ending. Fails at the end of input. |
 | `$readKey` | `;($readKey)` | One key press from stdin, without echo and without waiting for Enter (below). Fails at the end of input. |
+| `$terminal` | `;($terminal)` | Whether stdin and stdout are terminals, as a record `{ input, output }` of booleans (below). |
+| `$terminalSize` | `;($terminalSize)` | The size of the terminal on stdout, as a record `{ width, height }` of ints (below). Fails if stdout is not a terminal. |
 
 `$print`, `$write` and `$eprint` accept any value with an interpolation conversion (§9.3); other values panic.
 
@@ -815,6 +819,22 @@ Standard semantics throughout.
 - It is not a panic or a fail, so nothing can handle it.
 
 **Terminal output.** Output is written unchanged, so ANSI (VT100 and xterm) escape sequences written with `\u{1B}` control a terminal: `;"\u{1B}[2J\u{1B}[H"($write)` clears the screen and moves the cursor to the top left. On Windows the runtime turns on virtual terminal processing for the console at startup, so these sequences work there too.
+
+**Terminal.** `$terminal` tells a program whether a person is at the other end, and `$terminalSize` how much room there is to draw:
+```
+;if (!($terminal).output) {
+    ;"run this in a terminal"($eprint)
+    ;exit 2
+}
+;const size is ($terminalSize)
+    onfail { { width: 80, height: 24 } }
+;"{size.width} columns, {size.height} rows"($print)
+;exit
+```
+- `input` is `true` when stdin is a terminal, and `output` when stdout is. A stream redirected from or to a file, or a pipe, is not a terminal.
+- `$terminalSize` gives the visible window of the terminal on stdout, in character cells: `width` columns and `height` rows. It fails (code 1) when stdout is not a terminal, or the terminal does not report a size.
+- Each call returns a new record with the answers at that moment, so a program that calls `$terminalSize` each turn follows the window as it is resized.
+- On Windows a console is a terminal: Windows Terminal, the console host, and the terminals in editors such as VS Code. Some terminals, such as mintty (used by Git Bash), connect programs through pipes instead, so there stdin and stdout are not terminals, and `$readKey` reads its input as redirected input.
 
 **Keys.** `$readKey` waits for one key press and returns it as a string:
 ```
@@ -927,7 +947,7 @@ Paths are strings. A relative path is relative to the current directory. `/` wor
 | Name | Arity | | Name | Arity |
 |---|---|---|---|---|
 | `$print`, `$write`, `$eprint` | 1 | | `$push`, `$same`, `$at`, `$split`, `$join` | 2 |
-| `$readLine`, `$readKey` | 0 | | `$slice` | 3 |
+| `$readLine`, `$readKey`, `$terminal`, `$terminalSize` | 0 | | `$slice` | 3 |
 | `$readFile`, `$fileExists`, `$listDir`, `$deleteFile` | 1 | | `$length`, `$code`, `$fromCode`, `$pop` | 1 |
 | `$writeFile`, `$appendFile` | 2 | | `$toString`, `$toInt`, `$toFloat` | 1 |
 | `$env` | 1 | | `$floor`, `$ceil`, `$round`, `$trunc`, `$toUint32`, `$isNan` | 1 |
@@ -1116,9 +1136,10 @@ More examples are in [examples/](../examples/).
   - A fail sets a pending code and returns. After each call, the caller either handles it with `onfail` or turns it into a panic (the one-frame rule). A panic prints the function stack and ends the program; nothing unwinds.
   - C leaves the order of a call's arguments unspecified, so arguments whose order matters are evaluated into temporaries, left to right.
   - Float text and `$toFloat` are exact on any C library: the runtime corrects `strtod` with an exact comparison. Float `**` uses fdlibm's `pow` (§11.2).
-- **Key input (§12.2).**
+- **The terminal (§12.2).**
   - On POSIX, key mode clears `ECHO`, `ICANON`, `IEXTEN`, `IXON` and `ICRNL`, and keeps `ISIG` and `OPOST`, so Ctrl+C and Ctrl+Z still raise signals and output keeps its newline handling. Handlers for `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT` and `SIGPIPE` restore the terminal and raise the signal again with its default action. The handler for `SIGTSTP` restores the terminal, stops the program with the default action, and reapplies key mode when the program resumes.
   - On Windows, key mode clears `ENABLE_ECHO_INPUT` and `ENABLE_LINE_INPUT` and keeps `ENABLE_PROCESSED_INPUT`. Keys come from `ReadConsoleInputW` key-down events and are mapped by virtual-key code and character.
+  - A stream is a terminal when `isatty` is true for it on POSIX, and when `GetConsoleMode` succeeds for it on Windows. The size comes from `ioctl` with `TIOCGWINSZ` on POSIX, and from the window rectangle of `GetConsoleScreenBufferInfo` on Windows.
 - **Editor support.** [editors/vscode/](../editors/vscode/) has syntax highlighting and snippets for VS Code.
 - **Tests.** `wvc/test` runs every example, checks this specification's syntax and diagnostics, and checks the bootstrap fixed point.
 
@@ -1137,7 +1158,7 @@ More examples are in [examples/](../examples/).
 - Composite map keys, such as a pair of ints, which would need structural equality for keys.
 - A pipeline operator `|>`. It is a syntax error today, so it can be added later without breaking code. Postfix calls already read as a pipeline; revisit after counting real inside-out chains.
 - A type test operator. It should not be spelled `is`, which is a contextual keyword in declarations (§2.5).
-- More terminal support: the terminal's size, whether stdin or stdout is a terminal, waiting for a key with a timeout, and mouse input. Today `$readKey` always blocks.
+- More terminal support: waiting for a key with a timeout, and mouse input. Today `$readKey` always blocks.
 - A monotonic clock for measuring intervals, and a way to sleep.
 
 **Rejected**

@@ -1,6 +1,6 @@
-// The standard library added in Drafts 0.2 and 0.3: $readKey on redirected
-// input (§12.2), $time, random generators (§12.8), maps (§10.11) and sorting
-// (§10.6).
+// The standard library added in Drafts 0.2 to 0.4: $readKey on redirected
+// input and the terminal (§12.2), $time, random generators (§12.8), maps
+// (§10.11) and sorting (§10.6).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -398,4 +398,38 @@ test('misusing $sort and $sortBy panics', { skip }, () => {
   assert.equal(panicOf(';([1, 2], 5)($sortBy)'), 'type error: $sortBy expects a field name or an array of keys, got int');
   assert.equal(panicOf(';"abc"($sort)'), 'type error: $sort expects an array, got string');
   assert.equal(panicOf(';[1: 2]($reverse)'), 'type error: $reverse expects an array, got map');
+});
+
+// ---- Draft 0.4: the terminal (§12.2) ----
+// The tests run programs with stdin and stdout piped, so neither is a terminal.
+
+test('$terminal reports pipes as not terminals', { skip }, () => {
+  assert.equal(output(`
+;const t is ($terminal)
+;"{t.input} {t.output}"($print)
+;(t($fields), " ")($join)($print)
+;t($typeOf)($print)
+// Each call gives a new record, which a var binding can change.
+;var u is ($terminal)
+;set u.input to true
+;"{u.input} {($terminal).input}"($print)`), lines('false false', 'input output', 'record', 'true false'));
+});
+
+test('$terminalSize fails when stdout is not a terminal', { skip }, () => {
+  assert.equal(output(`
+;const size is ($terminalSize)
+    onfail (c) { { width: 80, height: 24, code: c } }
+;"{size.width} {size.height} {size.code}"($print)`), lines('80 24 1'));
+  const r = runMain(';($terminalSize).width($print)\n;exit\n');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /unhandled fail \(code 1\) from '\$terminalSize'/);
+});
+
+// The code generator checks for a fail only after the stdlib functions in its
+// list, so the list must name every function the specification says can fail:
+// those whose table row says so, and $toInt and $toFloat (§9.5).
+test('the code generator knows which stdlib functions fail', () => {
+  const signalers = JSON.parse(/;const signalers is (\[[^\]]*\])/.exec(readRepo('wvc/codegen_c.wvt'))[1]);
+  const fails = [...readRepo('docs/wavert-spec.md').matchAll(/^\| `\$(\w+)` \|.*\bFails\b/gm)].map((m) => m[1]);
+  assert.deepEqual([...signalers].sort(), [...fails, 'toInt', 'toFloat'].sort());
 });
