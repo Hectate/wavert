@@ -476,7 +476,7 @@ const viewProgram = (body) => `;import grid from "$lib/grid.wvt"
 ;const all is ((0, 0)(grid.pos), (5, 2)(grid.pos))(grid.rect)
 ;const left is ((0, 0)(grid.pos), (2, 2)(grid.pos))(grid.rect)
 ;fn layers() { [(terrain, tiles)(view.gridLayer), (items, [:])(view.mapLayer), (actors, [:])(view.mapLayer)] }
-;fn draw(window, ref visible, ref memory) { (((layers), window, visible, memory, tiles)(view.rows), "|")($join)($print) }
+;fn draw(window, ref visible, ref memory) { (((layers), window, visible, memory, tiles, 0)(view.rows), "|")($join)($print) }
 ${body}`;
 
 test('view: layers, topmost first, with glyphs for each kind of value', { skip }, () => {
@@ -582,6 +582,92 @@ test('view: setting ages, and fading only an area', { skip }, () => {
     onfail { ;set off to "off the map" }
 ;"{none} {off}"($print)`)),
   lines('3 -100', '5 -98 2', 'forgotten -96', '###   |...   |...   ', '3 3 0', '-2 7 -', 'nothing there off the map'));
+});
+
+// colorRows with the escape character shown as ^, so that the codes read.
+const colorProgram = (body) => `;import grid from "$lib/grid.wvt"
+;import view from "$lib/view.wvt"
+;import text from "$lib/text.wvt"
+;enum Terrain (floor, lava, snow)
+;const tiles is [Terrain.floor: ".", Terrain.lava: { glyph: "~", fg: view.Color.yellow, bg: view.Color.red },
+    Terrain.snow: { glyph: "*", bg: view.Color.white }]
+;var terrain is (5, 1, Terrain.floor)(grid.new)
+;var actors is [:]
+;var effects is [:]
+;const w is { x: 0, y: 0, width: 5, height: 1 }
+;fn layers() { [(terrain, tiles)(view.gridLayer), (actors, [:])(view.mapLayer), (effects, [:])(view.mapLayer)] }
+;fn show(ref rows) { ((rows, "|")($join), "\\u{1B}", "^")(text.replace) }
+${body}`;
+
+test('view: colours combine by layer, and a glyph stays readable', { skip }, () => {
+  assert.equal(out(colorProgram(`
+;(terrain, ((1, 0)(grid.pos), (3, 0)(grid.pos))(grid.rect), Terrain.lava)(grid.fill)
+// An orc in lava under a shield, a red rat in red lava, and the lava itself.
+;set actors[(1, 0)(grid.pos)] to { glyph: "o", fg: view.Color.black }
+;set actors[(2, 0)(grid.pos)] to { glyph: "r", fg: view.Color.red }
+;set effects[(1, 0)(grid.pos)] to { bg: view.Color.blue }
+// An effect with the glyph " " hides what is below.
+;set effects[(4, 0)(grid.pos)] to { glyph: "" }
+;((layers), w, null, null, tiles, null, 0)(view.colorRows)(show)($print)
+;((layers), w, null, null, tiles, 0)(view.rows)(show)($print)`)),
+  lines('.^[30;44mo^[97;41mr^[33;41m~^[39;49m ', '.or~ '));
+  assert.equal(out(colorProgram(`
+;(terrain, 0, 0, Terrain.snow)(grid.put)
+;(terrain, 1, 0, Terrain.lava)(grid.put)
+// White on white snow turns black; a tint above a glyph sets its colour.
+;set actors[(0, 0)(grid.pos)] to { glyph: "@", fg: view.Color.white }
+;set actors[(1, 0)(grid.pos)] to "k"
+;set effects[(1, 0)(grid.pos)] to { fg: view.Color.green }
+// Default on default is left alone, and a string draws in default colours.
+;set actors[(2, 0)(grid.pos)] to { glyph: "d", fg: view.Color.default, bg: view.Color.default }
+;set actors[(3, 0)(grid.pos)] to "s"
+;((layers), w, null, null, tiles, null, 0)(view.colorRows)(show)($print)`)),
+  lines('^[30;47m@^[32;41mk^[39;49mds.'));
+});
+
+test('view: remembered cells in colour', { skip }, () => {
+  assert.equal(out(colorProgram(`
+;(terrain, 1, 0, Terrain.lava)(grid.put)
+;var memory is (5, 1)(view.newMemory)
+;(memory, terrain, ((0, 0)(grid.pos), (4, 0)(grid.pos))(grid.rect))(view.remember)
+;const near is [(0, 0)(grid.pos)]
+// In a memory style of gray on default, or in their own colours.
+;((layers), w, near, memory, tiles, { fg: view.Color.gray, bg: view.Color.default }, 0)(view.colorRows)(show)($print)
+;((layers), w, near, memory, tiles, null, 0)(view.colorRows)(show)($print)
+// A memory style whose colours clash still shows the glyph.
+;((layers), w, near, memory, tiles, { fg: view.Color.gray, bg: view.Color.gray }, 0)(view.colorRows)(show)($print)`)),
+  lines('.^[90;49m~...^[0m', '.^[33;41m~^[39;49m...', '.^[97;100m~...^[0m'));
+});
+
+test('view: animation frames, with phases', { skip }, () => {
+  assert.equal(out(colorProgram(`
+// Three torches with the same frames: in step, one a frame later, and one with
+// a phase far beyond the frames, which counts round; a negative phase too.
+;const frames is ["a", "b", "c"]
+;set actors[(0, 0)(grid.pos)] to { glyph: frames }
+;set actors[(1, 0)(grid.pos)] to { glyph: frames, phase: 1 }
+;set actors[(2, 0)(grid.pos)] to { glyph: frames, phase: 7 }
+;set actors[(3, 0)(grid.pos)] to { glyph: frames, phase: -1 }
+;var tick is 0
+;while (tick < 4) {
+    ;((layers), w, null, null, tiles, tick)(view.rows)(show)($print)
+    ;set tick += 1
+}
+// Colours have frames of their own length.
+;set actors[(4, 0)(grid.pos)] to { glyph: "*", fg: [view.Color.red, view.Color.brightRed] }
+;((layers), w, null, null, tiles, null, 0)(view.colorRows)(show)($print)
+;((layers), w, null, null, tiles, null, 1)(view.colorRows)(show)($print)`)),
+  lines('abbc.', 'bcca.', 'caab.', 'abbc.', 'abbc^[31;49m*^[0m', 'bcca^[91;49m*^[0m'));
+  // Glyph tables animate too, and remembered cells are a still picture.
+  assert.equal(out(colorProgram(`
+;const flowing is [Terrain.floor: { glyph: [".", ","], phase: 1 }]
+;fn floor() { [(terrain, flowing)(view.gridLayer)] }
+;var memory is (5, 1)(view.newMemory)
+;(memory, terrain, ((0, 0)(grid.pos), (4, 0)(grid.pos))(grid.rect))(view.remember)
+;const near is [(0, 0)(grid.pos)]
+;((floor), w, near, memory, flowing, 0)(view.rows)(show)($print)
+;((floor), w, near, memory, flowing, 1)(view.rows)(show)($print)`)),
+  lines(',,,,,', '.,,,,'));
 });
 
 test('view: the window follows a position and stops at the edges', { skip }, () => {

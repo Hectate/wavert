@@ -13,7 +13,7 @@ General helpers that any program can use, imported with the reserved prefix `$li
 | [text.wvt](text.wvt) | `repeat`, `padLeft`, `padRight`, `center`, `trim`, `startsWith`, `endsWith`, `indexOf`, `contains`, `replace`, ASCII `toUpper` and `toLower`, `wrap` |
 | [arrays.wvt](arrays.wvt) | `indexOf`, `contains`, `count` (by contents), `range` (in either direction), `filled`, `concat`, `removeAt`, `insertAt` |
 | [maps.wvt](maps.wvt) | `getOr`, `add` (for counting), `pushTo` (for a pile of things under one key) |
-| [view.wvt](view.wvt) | What the player sees: layers (`gridLayer`, `mapLayer`) combined into rows of text (`rows`), a window that follows the player (`follow`), and memory of what was seen (`newMemory`, `remember`, `note`, `forget`, `recalled`, `ageOf`, `setAge`, `setAgeArea`, `fade`, `fadeArea`), which the world can change behind |
+| [view.wvt](view.wvt) | What the player sees: layers (`gridLayer`, `mapLayer`) combined into rows of text (`rows`) or colour (`colorRows`, with `Color`; a glyph is kept readable on its background), animated by frames with a phase each, a window that follows the player (`follow`), and memory of what was seen (`newMemory`, `remember`, `note`, `forget`, `recalled`, `ageOf`, `setAge`, `setAgeArea`, `fade`, `fadeArea`), which the world can change behind |
 | [dice.wvt](dice.wvt) | Rolling (`roll`, `dice`, `between` (bounds in either order), `chance`, `pick`, `shuffled`, `weighted`, `rollText`, `check`) and exact odds (`odds`, `chanceAtLeast`, `chanceText`, `percent`) |
 
 Each file's opening comment explains its use, and each function has a comment above it.

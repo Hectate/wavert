@@ -2,23 +2,55 @@
 //
 // ;import grid from "$lib/grid.wvt"
 // ;import view from "$lib/view.wvt"
-// ;enum Terrain (floor, wall)
-// ;const tiles is [Terrain.floor: ".", Terrain.wall: "#"]
+// ;enum Terrain (floor, wall, lava)
+// ;const tiles is [Terrain.floor: ".", Terrain.wall: "#",
+//     Terrain.lava: { glyph: "~", fg: view.Color.yellow, bg: view.Color.red }]
 // ;const layers is [(terrain, tiles)(view.gridLayer), (items, [:])(view.mapLayer), (actors, [:])(view.mapLayer)]
 // ;const window is (player.pos, 80, 22, terrain)(view.follow)
 // ;(memory, terrain, visible)(view.remember)
-// ;(((layers, window, visible, memory, tiles)(view.rows)), "\n")($join)($print)
+// ;const dim is { fg: view.Color.gray, bg: view.Color.default }
+// ;(((layers, window, visible, memory, tiles, dim, tick)(view.colorRows)), "\n")($join)($print)
 //
 // A game keeps one layer per kind of thing (§10.11): a grid for terrain, and
 // maps keyed by position (grid.pos) for things that are only in some places,
 // such as actors, or piles of items as arrays. Layers are listed bottom first,
 // and each cell shows the topmost layer that has something there.
 //
-// Each layer has a glyph table: a map from the values it holds to the text
-// drawn for them, such as [Terrain.wall: "#"]. A value the table does not have
-// is drawn by itself if it is a string, by its glyph field if it is a record
-// (the convention for actors and items), and as "?" otherwise. null, a missing
-// key and an empty pile are empty: the layers below show through.
+// Each layer has a glyph table: a map from the values it holds to how they are
+// drawn, such as [Terrain.wall: "#"]. An entry is the text drawn, or a style
+// record with any of the fields glyph (the text), fg and bg (Colors), such as
+// { glyph: "~", fg: Color.red, bg: Color.black }. A value the table does not
+// have is drawn by itself if it is a string, by its own glyph, fg and bg
+// fields if it is a record (the convention for actors and items), and as "?"
+// otherwise. null, a missing key and an empty pile are empty: the layers below
+// show through.
+//
+// How layers combine, cell by cell:
+// - The glyph is the topmost layer's that has one. A glyph of " " (or "")
+//   hides what is below.
+// - The foreground comes with the glyph, Color.default if it has none, unless
+//   a layer above it with no glyph sets fg: a tint.
+// - The background is the topmost layer's that sets bg, below the glyph or
+//   above it. A style with no glyph changes only colours, for an effect such
+//   as a shield, a spell's area or a cursor.
+// - If the foreground is then the same as the background, it becomes black on
+//   a light background and bright white on a dark one, so the glyph stays
+//   visible. Colors that are only close, and Color.default, the terminal's
+//   own, which a program cannot see, are left alone.
+//
+// Animation: a style's glyph, fg and bg may each be an array of frames, such
+// as { glyph: ["~", "="], fg: [Color.red, Color.brightRed] }. rows and
+// colorRows take a tick, which the game advances as it animates, such as in
+// its $waitKey loop (§12.2), and each array shows frame tick + phase, counting
+// round its frames, where phase is the style's phase field, 0 if it has none.
+// Any int phase works: give each torch a random one so that they do not
+// flicker in step. Remembered cells do not animate: they show the frame at
+// their phase.
+//
+// rows draws text alone, for logs, tests and output that is not a terminal;
+// colorRows adds the terminal escape sequences for colour. A row of
+// colorRows is longer than it looks, so text.padRight and the like measure it
+// wrongly.
 //
 // Make the layers when drawing: a layer holds its grid or map as it was then.
 //
@@ -36,6 +68,10 @@
 // The kinds of layer.
 ;export enum LayerKind (grid, map)
 
+// The 16 terminal colours, and default: the terminal's own. gray is the
+// bright black of terminals.
+;export enum Color (default, black, red, green, yellow, blue, magenta, cyan, white, gray, brightRed, brightGreen, brightYellow, brightBlue, brightMagenta, brightCyan, brightWhite)
+
 // ---- Layers ----
 
 // A layer of the cells of grid g, drawn with the glyph table glyphs.
@@ -45,19 +81,47 @@
 // table glyphs. A value that is an array is a pile: its last element is drawn.
 ;export fn mapLayer(ref m, glyphs) { { kind: LayerKind.map, source: m, glyphs: glyphs } }
 
-// The text drawn for value v with the glyph table glyphs, or null if v is
-// empty.
-;fn glyphOf(v, ref glyphs) {
+// A style: { glyph, fg, bg }, each null where it is not set.
+;fn style(glyph, fg, bg) { { glyph: glyph == "" ? " " : glyph, fg: fg, bg: bg } }
+
+// Field name of record r, or null if r has no such field.
+;fn field(r, name) { (r($fields), name)(arrays.contains) ? r[name] : null }
+
+// Frame n of x, if x is an array of frames, counting round so that any int
+// n picks one; x itself otherwise; null for no frames.
+;fn frame(x, n) {
+    ;if (x($typeOf) != "array") { ;return x }
+    x($length) == 0 ? null : x[n % x($length)]
+}
+
+// The style a record sets with its glyph, fg and bg fields, at frame tick
+// plus its phase field; "?" if it has none of them.
+;fn recordStyle(r, tick) {
+    ;const phase is (r, "phase")(field)
+    ;const n is tick + (phase == null ? 0 : phase)
+    ;const glyph is ((r, "glyph")(field), n)(frame)
+    ;const fg is ((r, "fg")(field), n)(frame)
+    ;const bg is ((r, "bg")(field), n)(frame)
+    ;if (glyph == null && fg == null && bg == null) { ;return ("?", null, null)(style) }
+    (glyph == null ? null : glyph($toString), fg, bg)(style)
+}
+
+// The style of value v with the glyph table glyphs at frame tick, or null if
+// v is empty.
+;fn styleOf(v, ref glyphs, tick) {
     ;const t is v($typeOf)
     ;if (t == "null") { ;return null }
-    ;if (t == "array") { ;return v($length) == 0 ? null : (v[-1], glyphs)(glyphOf) }
+    ;if (t == "array") { ;return v($length) == 0 ? null : (v[-1], glyphs, tick)(styleOf) }
     // A record, such as an actor, may hold arrays, so it is not a key: it
-    // carries its own glyph.
-    ;if (t == "record") { ;return (v($fields), "glyph")(arrays.contains) ? v.glyph($toString) : "?" }
+    // carries its own style.
+    ;if (t == "record") { ;return (v, tick)(recordStyle) }
     // Floats and maps cannot be keys.
-    ;if (t == "float" || t == "map") { ;return "?" }
-    ;if ((glyphs, v)($has)) { ;return glyphs[v]($toString) }
-    t == "string" ? v : "?"
+    ;if (t == "float" || t == "map") { ;return ("?", null, null)(style) }
+    ;if ((glyphs, v)($has)) {
+        ;const entry is glyphs[v]
+        ;return entry($typeOf) == "record" ? (entry, tick)(recordStyle) : (entry($toString), null, null)(style)
+    }
+    (t == "string" ? v : "?", null, null)(style)
 }
 
 // The value of layer at position p, or null if it has none there.
@@ -72,15 +136,28 @@
     entry
 }
 
-// The text of the topmost layer that has something at position p, or null.
-;fn top(ref layers, p) {
+// The style of position p combined from layers, topmost first, as the header
+// says, with nothing left unset.
+;fn layered(ref layers, p, tick) {
+    ;var glyph is null
+    ;var fg is null
+    ;var bg is null
     ;var i is layers($length) - 1
-    ;while (i >= 0) {
-        ;const g is ((layers[i], p)(valueAt), layers[i].glyphs)(glyphOf)
-        ;if (g != null) { ;return g }
+    ;while (i >= 0 && (glyph == null || bg == null)) {
+        ;const s is ((layers[i], p)(valueAt), layers[i].glyphs, tick)(styleOf)
+        ;if (s != null) {
+            ;if (glyph == null) {
+                ;if (fg == null) { ;set fg to s.fg }
+                ;if (s.glyph != null) {
+                    ;set glyph to s.glyph
+                    ;if (fg == null) { ;set fg to Color.default }
+                }
+            }
+            ;if (bg == null) { ;set bg to s.bg }
+        }
         ;set i -= 1
     }
-    null
+    (glyph == null ? " " : glyph, fg == null ? Color.default : fg, bg == null ? Color.default : bg)(style)
 }
 
 // ---- The window ----
@@ -100,12 +177,42 @@
 
 // ---- Drawing ----
 
-// The window as rows of text, one per row, from layers, listed bottom first.
-// visible is an area (an array of positions) that the player sees now, or
-// null for everything. A cell that is not visible is drawn from memory, with
-// the glyph table memoryGlyphs, or as a space if nothing is remembered there;
-// memory may be null for none.
-;export fn rows(ref layers, window, ref visible, ref memory, ref memoryGlyphs) {
+// The SGR code that selects colour c: as the foreground, or the background.
+;fn sgr(c, background) {
+    ;const fg is match (c) {
+        case Color.default { 39 }
+        case Color.black { 30 }
+        case Color.red { 31 }
+        case Color.green { 32 }
+        case Color.yellow { 33 }
+        case Color.blue { 34 }
+        case Color.magenta { 35 }
+        case Color.cyan { 36 }
+        case Color.white { 37 }
+        case Color.gray { 90 }
+        case Color.brightRed { 91 }
+        case Color.brightGreen { 92 }
+        case Color.brightYellow { 93 }
+        case Color.brightBlue { 94 }
+        case Color.brightMagenta { 95 }
+        case Color.brightCyan { 96 }
+        case Color.brightWhite { 97 }
+    }
+    background ? fg + 10 : fg
+}
+
+;const lightColors is [Color.white, Color.yellow, Color.cyan, Color.brightRed, Color.brightGreen, Color.brightYellow,
+    Color.brightBlue, Color.brightMagenta, Color.brightCyan, Color.brightWhite]
+
+// s, with a foreground that can be read on its background (see the header).
+;fn readable(s) {
+    ;if (s.fg != s.bg || s.fg == Color.default || s.glyph == " ") { ;return s }
+    (s.glyph, (lightColors, s.bg)(arrays.contains) ? Color.black : Color.brightWhite, s.bg)(style)
+}
+
+// The window as rows, the cells styled by colored, else text alone; see rows
+// and colorRows.
+;fn render(ref layers, window, ref visible, ref memory, ref memoryGlyphs, memoryStyle, tick, colored) {
     ;var seen is null
     ;if (visible != null) {
         ;set seen to [:]
@@ -115,28 +222,62 @@
             ;set i += 1
         }
     }
+    // The style of the cell at p: from the layers if it is visible, else
+    // from memory.
+    ;fn cell(p) {
+        ;if (seen == null || (seen, p)($has)) { ;return (layers, p, tick)(layered)(readable) }
+        ;var r is null
+        ;if (memory != null) {
+            ;set r to (memory, p)(grid.at)
+                onfail { null }
+        }
+        // Memory is a still picture: each value at frame 0 plus its phase.
+        ;const s is r == null ? null : (r.value, memoryGlyphs, 0)(styleOf)
+        ;if (s == null || s.glyph == null) { ;return (" ", Color.default, Color.default)(style) }
+        ;if (memoryStyle != null) { ;return (s.glyph, memoryStyle.fg, memoryStyle.bg)(style)(readable) }
+        (s.glyph, s.fg == null ? Color.default : s.fg, s.bg == null ? Color.default : s.bg)(style)(readable)
+    }
     ;var out is []
     ;var y is window.y
     ;while (y < window.y + window.height) {
         ;var line is []
+        ;var fg is Color.default
+        ;var bg is Color.default
         ;var x is window.x
         ;while (x < window.x + window.width) {
-            ;const p is (x, y)(grid.pos)
-            ;var g is null
-            ;if (seen == null || (seen, p)($has)) {
-                ;set g to (layers, p)(top)
-            } else if (memory != null) {
-                ;const r is (memory, p)(grid.at)
-                    onfail { null }
-                ;if (r != null) { ;set g to (r.value, memoryGlyphs)(glyphOf) }
+            ;const s is (x, y)(grid.pos)(cell)
+            ;if (colored && (s.fg != fg || s.bg != bg)) {
+                ;(line, "\u{1B}[{(s.fg, false)(sgr)};{(s.bg, true)(sgr)}m")($push)
+                ;set fg to s.fg
+                ;set bg to s.bg
             }
-            ;(line, g == null ? " " : g)($push)
+            ;(line, s.glyph)($push)
             ;set x += 1
         }
+        ;if (fg != Color.default || bg != Color.default) { ;(line, "\u{1B}[0m")($push) }
         ;(out, (line, "")($join))($push)
         ;set y += 1
     }
     out
+}
+
+// The window as rows of text, one per row, from layers, listed bottom first.
+// visible is an area (an array of positions) that the player sees now, or
+// null for everything. A cell that is not visible is drawn from memory, with
+// the glyph table memoryGlyphs, or as a space if nothing is remembered there;
+// memory may be null for none. tick is the animation frame (see the header);
+// 0 for a game that does not animate.
+;export fn rows(ref layers, window, ref visible, ref memory, ref memoryGlyphs, tick) {
+    (layers, window, visible, memory, memoryGlyphs, null, tick, false)(render)
+}
+
+// rows in colour: each row has the terminal escape sequences that set the
+// colours of its cells, and ends with the colours reset. Remembered cells are
+// drawn in memoryStyle, a record { fg, bg } such as { fg: Color.gray, bg:
+// Color.default }, so that the player can tell them from what is in view; or,
+// if memoryStyle is null, in their own colours.
+;export fn colorRows(ref layers, window, ref visible, ref memory, ref memoryGlyphs, memoryStyle, tick) {
+    (layers, window, visible, memory, memoryGlyphs, memoryStyle, tick, true)(render)
 }
 
 // ---- Memory ----
