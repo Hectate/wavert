@@ -1082,6 +1082,13 @@
             ;while (k < fields($length)) { ;(refs, "&F_{fields[k]}")($push) ;set k += 1 }
             ;(all, "  rt_syms({fields($length)}, (wstr *const[]){{ {(refs, ", ")($join)} }});")($push)
         }
+        // The globals are roots for the collector.
+        ;if (globals($length) > 0) {
+            ;var refs is []
+            ;set k to 0
+            ;while (k < globals($length)) { ;(refs, "&{globals[k]}")($push) ;set k += 1 }
+            ;(all, "  rt_roots({globals($length)}, (wv *const[]){{ {(refs, ", ")($join)} }});")($push)
+        }
         ;set k to 0
         ;while (k < out($length)) { ;(all, out[k])($push) ;set k += 1 }
         ;(all, "}}")($push)

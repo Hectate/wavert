@@ -9,7 +9,7 @@
 // to a static wmem, null -> T_NULL. T_UNSET marks a binding before its
 // declaration (temporal dead zone).
 //
-// Memory is allocated from an arena and never freed.
+// Memory is reclaimed by a conservative mark-and-sweep collector (see "memory").
 //
 // A fail is a pending code in rt_failcode: a function or stdlib function sets
 // it and returns, and the caller either handles it (onfail) or turns it into
@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h> // CommandLineToArgvW: zig cc links shell32 by default
+#include <malloc.h> // _aligned_malloc
 #include <wchar.h>
 #else
 #define _GNU_SOURCE
@@ -38,6 +39,7 @@ extern char **environ;
 #endif
 #include <errno.h>
 #include <math.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -83,27 +85,325 @@ static inline wv rt_m(const wmem *m) { return (wv){ .tag = T_MEM, .m = m }; }
 static inline int isnum(wv x) { return x.tag == T_INT || x.tag == T_FLOAT; }
 static inline double nv(wv x) { return x.tag == T_INT ? (double)x.i : x.f; }
 
-// ---- memory ----
+// ---- memory: a mark-and-sweep collector ----
+// Values are allocated with rt_alloc, or rt_alloc_raw for objects that hold no
+// references (string data). Objects never move. Small objects live in 256 KiB
+// blocks aligned to their size, each holding objects of one size class, so any
+// address maps to its block; objects over GC_SMALL bytes are allocated one by one.
+//
+// A collection marks everything reachable from the roots, then frees the rest.
+// The roots are the program thread's stack and registers, and the ranges given
+// to rt_root: the program's globals and the runtime's own caches. Roots and
+// objects are scanned conservatively: every aligned word that points into an
+// object, or just past its end, keeps it. Raw objects are not scanned.
+// Collections happen only in rt_alloc, on the program thread, which is the only
+// thread that allocates. Memory from malloc (xmalloc) is not scanned, so it must
+// never hold the only reference to an object while anything is allocated.
+//
+// WVT_GC_STRESS=n collects every n allocations and fills freed objects with
+// 0xDD, to expose missing roots. WVT_GC_STATS prints statistics at exit.
 
-static char *ar_p, *ar_end;
 static void rt_flush(void);
 static void term_restore(void);
+static _Noreturn void out_of_memory(void) {
+  rt_flush(); // output written before the failure still appears
+  term_restore();
+  fputs("out of memory\n", stderr);
+  exit(1);
+}
 static void *xmalloc(size_t n) {
   void *p = malloc(n ? n : 1);
-  if (!p) { rt_flush(); term_restore(); fputs("out of memory\n", stderr); exit(1); } // output written before the failure still appears
+  if (!p) out_of_memory();
   return p;
 }
-static void *rt_alloc(size_t n) {
-  n = (n + 15) & ~(size_t)15;
-  if (n > (size_t)(ar_end - ar_p)) {
-    if (n >= (1 << 20)) return xmalloc(n);
-    size_t chunk = 16 << 20;
-    ar_p = xmalloc(chunk);
-    ar_end = ar_p + chunk;
+
+#define GC_BLOCK ((uintptr_t)1 << 18)
+#define GC_SMALL 16384
+#define GC_MAXSLOTS (GC_BLOCK / 16)
+#define GC_MIN ((size_t)8 << 20) // a collection happens after allocating max(GC_MIN, live) bytes
+
+typedef struct gc_block {
+  struct gc_block *next; // in the pool of empty blocks
+  char *first;           // the first slot
+  uint32_t size, slots;
+  uint64_t inv;          // ceil(2^32 / size): offset * inv >> 32 is offset / size within a block
+  int cls, raw;          // cls is -1 for an empty block
+  uint64_t alloc[GC_MAXSLOTS / 64], mark[GC_MAXSLOTS / 64];
+} gc_block;
+typedef struct gc_big { size_t size; int raw, mark; } gc_big; // followed by the object
+typedef struct { char *p; size_t n; } gc_range;
+
+static uint32_t gc_sizes[64];
+static int gc_ncls, gc_ready, gc_stats;
+static uint8_t gc_cls_of[GC_SMALL / 16 + 1];
+static void *gc_free[2][64];                       // free slots, by raw and class
+static gc_block **gc_blocks, **gc_set, *gc_pool;   // every block; the blocks by address; the empty ones
+static size_t gc_nblocks, gc_capblocks, gc_setcap;
+static gc_big **gc_bigs;                           // the big objects, by address
+static size_t gc_nbigs, gc_capbigs, gc_big_bytes;
+static uintptr_t gc_lo = UINTPTR_MAX, gc_hi;       // every object is between these
+static size_t gc_since, gc_next = GC_MIN, gc_live, gc_runs, gc_peak, gc_stress, gc_count;
+static char *gc_stack_base;                        // the top of the program thread's stack
+static gc_range *gc_roots, *gc_marks;
+static size_t gc_nroots, gc_caproots, gc_nmarks, gc_capmarks;
+
+static void gc_init(void) {
+  gc_ready = 1;
+  // 16 to 128 bytes in steps of 16, then four sizes for each doubling
+  for (uint32_t s = 16; s <= GC_SMALL; s += s < 128 ? 16 : ((uint32_t)1 << (31 - __builtin_clz(s))) / 4) gc_sizes[gc_ncls++] = s;
+  for (int c = 0, i = 0; i <= GC_SMALL / 16; i++) {
+    while (gc_sizes[c] < (uint32_t)i * 16) c++;
+    gc_cls_of[i] = (uint8_t)c;
   }
-  void *p = ar_p;
-  ar_p += n;
+  const char *s = getenv("WVT_GC_STRESS");
+  if (s) gc_stress = strtoull(s, NULL, 10) ? strtoull(s, NULL, 10) : 1;
+  gc_stats = getenv("WVT_GC_STATS") != NULL;
+}
+
+static void gc_grow(void *list, size_t *cap, size_t need, size_t item) {
+  if (need <= *cap) return;
+  size_t c = *cap ? *cap * 2 : 64;
+  while (c < need) c *= 2;
+  void *p = realloc(*(void **)list, c * item);
+  if (!p) out_of_memory();
+  *(void **)list = p;
+  *cap = c;
+}
+static void gc_span(uintptr_t lo, uintptr_t hi) {
+  if (lo < gc_lo) gc_lo = lo;
+  if (hi > gc_hi) gc_hi = hi;
+  size_t heap = gc_nblocks * GC_BLOCK + gc_big_bytes;
+  if (heap > gc_peak) gc_peak = heap;
+}
+
+// The blocks are found by address in an open-addressing hash set.
+static size_t gc_hash(uintptr_t b) { return (size_t)((b / GC_BLOCK) * 0x9E3779B97F4A7C15ULL); }
+static void gc_set_put(gc_block *b) {
+  size_t j = gc_hash((uintptr_t)b) & (gc_setcap - 1);
+  while (gc_set[j]) j = (j + 1) & (gc_setcap - 1);
+  gc_set[j] = b;
+}
+static gc_block *gc_block_of(uintptr_t p) {
+  if (!gc_setcap) return NULL;
+  uintptr_t b = p & ~(GC_BLOCK - 1);
+  for (size_t j = gc_hash(b) & (gc_setcap - 1); gc_set[j]; j = (j + 1) & (gc_setcap - 1)) {
+    if ((uintptr_t)gc_set[j] == b) return gc_set[j];
+  }
+  return NULL;
+}
+static gc_block *gc_new_block(void) {
+  void *m;
+#ifdef _WIN32
+  m = _aligned_malloc(GC_BLOCK, GC_BLOCK);
+#else
+  if (posix_memalign(&m, GC_BLOCK, GC_BLOCK)) m = NULL;
+#endif
+  if (!m) out_of_memory();
+  gc_block *b = m;
+  gc_grow(&gc_blocks, &gc_capblocks, gc_nblocks + 1, sizeof *gc_blocks);
+  gc_blocks[gc_nblocks++] = b;
+  if (gc_nblocks * 2 > gc_setcap) {
+    free(gc_set);
+    gc_setcap = gc_setcap ? gc_setcap * 2 : 64;
+    gc_set = xmalloc(gc_setcap * sizeof *gc_set);
+    memset(gc_set, 0, gc_setcap * sizeof *gc_set);
+    for (size_t i = 0; i < gc_nblocks; i++) gc_set_put(gc_blocks[i]);
+  } else {
+    gc_set_put(b);
+  }
+  gc_span((uintptr_t)b, (uintptr_t)b + GC_BLOCK);
+  return b;
+}
+// A block for class c, its slots added to the class's free list.
+static void gc_refill(int raw, int c) {
+  gc_block *b = gc_pool;
+  if (b) gc_pool = b->next;
+  else b = gc_new_block();
+  size_t header = (sizeof(gc_block) + 15) & ~(size_t)15;
+  b->next = NULL;
+  b->first = (char *)b + header;
+  b->size = gc_sizes[c];
+  b->inv = (((uint64_t)1 << 32) + b->size - 1) / b->size;
+  b->slots = (uint32_t)((GC_BLOCK - header) / b->size);
+  b->cls = c;
+  b->raw = raw;
+  memset(b->alloc, 0, sizeof b->alloc);
+  memset(b->mark, 0, sizeof b->mark);
+  void *head = gc_free[raw][c];
+  for (uint32_t i = b->slots; i-- > 0;) {
+    void *p = b->first + (size_t)i * b->size;
+    *(void **)p = head;
+    head = p;
+  }
+  gc_free[raw][c] = head;
+}
+
+// The big object that p points into or just past, or NULL.
+static gc_big *gc_big_of(uintptr_t p) {
+  size_t lo = 0, hi = gc_nbigs;
+  while (lo < hi) {
+    size_t mid = (lo + hi) / 2;
+    if ((uintptr_t)gc_bigs[mid] <= p) lo = mid + 1;
+    else hi = mid;
+  }
+  if (!lo) return NULL;
+  gc_big *h = gc_bigs[lo - 1];
+  uintptr_t start = (uintptr_t)(h + 1);
+  return p >= start && p <= start + h->size ? h : NULL;
+}
+static void *gc_big_alloc(size_t n, int raw) {
+  gc_big *h = malloc(sizeof(gc_big) + n);
+  if (!h) out_of_memory();
+  *h = (gc_big){ n, raw, 0 };
+  if (!raw) memset(h + 1, 0, n);
+  size_t lo = 0, hi = gc_nbigs;
+  while (lo < hi) {
+    size_t mid = (lo + hi) / 2;
+    if (gc_bigs[mid] < h) lo = mid + 1;
+    else hi = mid;
+  }
+  gc_grow(&gc_bigs, &gc_capbigs, gc_nbigs + 1, sizeof *gc_bigs);
+  memmove(gc_bigs + lo + 1, gc_bigs + lo, (gc_nbigs - lo) * sizeof *gc_bigs);
+  gc_bigs[lo] = h;
+  gc_nbigs++;
+  gc_big_bytes += n;
+  gc_since += n;
+  gc_span((uintptr_t)h, (uintptr_t)(h + 1) + n);
+  return h + 1;
+}
+
+// ---- marking ----
+
+static void gc_mark_slot(gc_block *b, size_t i) {
+  uint64_t bit = (uint64_t)1 << (i & 63);
+  if (!(b->alloc[i >> 6] & bit) || (b->mark[i >> 6] & bit)) return;
+  b->mark[i >> 6] |= bit;
+  if (b->raw) return;
+  gc_grow(&gc_marks, &gc_capmarks, gc_nmarks + 1, sizeof *gc_marks);
+  gc_marks[gc_nmarks++] = (gc_range){ b->first + i * b->size, b->size };
+}
+// Marks the object that p points into, or just past.
+static void gc_mark(uintptr_t p) {
+  if (p < gc_lo || p > gc_hi) return;
+  gc_block *b = gc_block_of(p);
+  if (b) {
+    if (b->cls < 0 || p < (uintptr_t)b->first) return;
+    size_t off = p - (uintptr_t)b->first, i = (size_t)((off * b->inv) >> 32);
+    if (i < b->slots) gc_mark_slot(b, i);
+    if (off == i * b->size && i > 0 && i <= b->slots) gc_mark_slot(b, i - 1);
+    return;
+  }
+  gc_big *h = gc_big_of(p);
+  if (h && !h->mark) {
+    h->mark = 1;
+    if (h->raw) return;
+    gc_grow(&gc_marks, &gc_capmarks, gc_nmarks + 1, sizeof *gc_marks);
+    gc_marks[gc_nmarks++] = (gc_range){ (char *)(h + 1), h->size };
+  }
+}
+static void gc_scan(const char *p, size_t n) {
+  const uintptr_t *w = (const uintptr_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7);
+  for (; (const char *)(w + 1) <= p + n; w++) gc_mark(*w);
+}
+
+// ---- sweeping ----
+
+static void gc_sweep(void) {
+  size_t live = 0;
+  memset(gc_free, 0, sizeof gc_free);
+  for (size_t k = 0; k < gc_nblocks; k++) {
+    gc_block *b = gc_blocks[k];
+    if (b->cls < 0) continue;
+    uint32_t used = 0;
+    for (uint32_t j = 0; j < (b->slots + 63) / 64; j++) {
+      uint64_t dead = b->alloc[j] & ~b->mark[j];
+      if (gc_stress) {
+        for (; dead; dead &= dead - 1) memset(b->first + ((size_t)j * 64 + __builtin_ctzll(dead)) * b->size, 0xDD, b->size);
+      }
+      b->alloc[j] = b->mark[j];
+      used += (uint32_t)__builtin_popcountll(b->mark[j]);
+      b->mark[j] = 0;
+    }
+    if (!used) {
+      b->cls = -1;
+      b->next = gc_pool;
+      gc_pool = b;
+      continue;
+    }
+    live += (size_t)used * b->size;
+    for (uint32_t i = b->slots; i-- > 0;) {
+      if (b->alloc[i >> 6] >> (i & 63) & 1) continue;
+      void *p = b->first + (size_t)i * b->size;
+      *(void **)p = gc_free[b->raw][b->cls];
+      gc_free[b->raw][b->cls] = p;
+    }
+  }
+  size_t n = 0;
+  for (size_t k = 0; k < gc_nbigs; k++) {
+    gc_big *h = gc_bigs[k];
+    if (h->mark) {
+      h->mark = 0;
+      live += h->size;
+      gc_bigs[n++] = h;
+    } else {
+      gc_big_bytes -= h->size;
+      if (gc_stress) memset(h + 1, 0xDD, h->size);
+      free(h);
+    }
+  }
+  gc_nbigs = n;
+  gc_live = live;
+  gc_since = 0;
+  gc_next = live > GC_MIN ? live : GC_MIN;
+}
+
+// ---- collecting ----
+
+static __attribute__((noinline)) void gc_collect_from(const char *sp) {
+  gc_runs++;
+  gc_scan(sp, (size_t)(gc_stack_base - sp));
+  for (size_t i = 0; i < gc_nroots; i++) gc_scan(gc_roots[i].p, gc_roots[i].n);
+  while (gc_nmarks) {
+    gc_range r = gc_marks[--gc_nmarks];
+    gc_scan(r.p, r.n);
+  }
+  gc_sweep();
+}
+static __attribute__((noinline)) void gc_collect(void) {
+  // setjmp spills the registers into regs, on the stack, where the scan finds them.
+  jmp_buf regs;
+  __builtin_unwind_init();
+  setjmp(regs);
+  gc_collect_from((const char *)&regs);
+}
+
+static void *gc_alloc(size_t n, int raw) {
+  if (!gc_ready) gc_init();
+  if (gc_stack_base && (gc_stress ? ++gc_count % gc_stress == 0 : gc_since >= gc_next)) gc_collect();
+  if (n > GC_SMALL) return gc_big_alloc(n, raw);
+  int c = gc_cls_of[(n + 15) / 16];
+  void *p = gc_free[raw][c];
+  if (!p) {
+    gc_refill(raw, c);
+    p = gc_free[raw][c];
+  }
+  gc_free[raw][c] = *(void **)p;
+  gc_block *b = (gc_block *)((uintptr_t)p & ~(GC_BLOCK - 1));
+  size_t i = (size_t)(((uint64_t)((char *)p - b->first) * b->inv) >> 32);
+  b->alloc[i >> 6] |= (uint64_t)1 << (i & 63);
+  gc_since += b->size;
+  if (raw) *(void **)p = NULL;
+  else memset(p, 0, b->size);
   return p;
+}
+// A new object of n bytes, zeroed, which may hold references.
+static void *rt_alloc(size_t n) { return gc_alloc(n, 0); }
+// A new object of n bytes that holds no references: it is not scanned or zeroed.
+static void *rt_alloc_raw(size_t n) { return gc_alloc(n, 1); }
+// Registers n bytes at p as a root, scanned in every collection.
+static void rt_root(void *p, size_t n) {
+  gc_grow(&gc_roots, &gc_caproots, gc_nroots + 1, sizeof *gc_roots);
+  gc_roots[gc_nroots++] = (gc_range){ p, n };
 }
 
 // A growable byte buffer for building text (malloc'd, freed by the user).
@@ -155,7 +455,7 @@ static uint32_t utf8_get(const unsigned char *p, int *len) {
 
 // A new string from n bytes of valid UTF-8.
 static const wstr *str_new(const char *p, int64_t n) {
-  wstr *s = rt_alloc(sizeof(wstr) + n + 1);
+  wstr *s = rt_alloc_raw(sizeof(wstr) + n + 1);
   char *d = (char *)(s + 1);
   memcpy(d, p, n);
   d[n] = 0;
@@ -247,7 +547,7 @@ static int64_t cp_offset(const wstr *s, int64_t k) {
     return off;
   }
   if (s != cache_s) {
-    cache_off = rt_alloc(sizeof(int64_t) * s->cps);
+    cache_off = rt_alloc_raw(sizeof(int64_t) * s->cps);
     int64_t off = 0;
     for (int64_t i = 0; i < s->cps; i++) {
       int len;
@@ -637,7 +937,7 @@ static wv rt_text(wv v) {
 static wv rt_cat(int n, const wv *parts) {
   int64_t len = 0;
   for (int i = 0; i < n; i++) len += parts[i].s->bytes;
-  wstr *s = rt_alloc(sizeof(wstr) + len + 1);
+  wstr *s = rt_alloc_raw(sizeof(wstr) + len + 1);
   char *d = (char *)(s + 1);
   int64_t cps = 0, off = 0;
   for (int i = 0; i < n; i++) {
@@ -1167,7 +1467,7 @@ static void map_rehash(wmap *m, int64_t cap) {
   for (int64_t i = 0; i < m->len; i++) if (m->e[i].live) e[len++] = m->e[i];
   int64_t icap = 16;
   while (icap < cap * 2) icap *= 2;
-  int64_t *idx = rt_alloc(sizeof(int64_t) * icap);
+  int64_t *idx = rt_alloc_raw(sizeof(int64_t) * icap);
   memset(idx, 0xFF, sizeof(int64_t) * icap);
   for (int64_t i = 0; i < len; i++) {
     int64_t j = key_hash(e[i].key) & (icap - 1);
@@ -1311,6 +1611,9 @@ static _Noreturn void rt_panic(wv v) {
 static void rt_exit_code(int64_t code) {
   rt_flush();
   term_restore();
+  if (gc_stats) {
+    fprintf(stderr, "gc: %zu collections, live %zu bytes, peak heap %zu bytes\n", gc_runs, gc_live, gc_peak);
+  }
 #ifdef _WIN32
   ExitProcess((UINT)code);
 #else
@@ -2361,7 +2664,9 @@ static wv std_pop(wv arr) {
   warr *a = an_array(arr, "$pop");
   mutable(a, "$pop");
   if (a->len == 0) rt_fail("$pop: the array is empty");
-  return a->items[--a->len];
+  wv v = a->items[--a->len];
+  a->items[a->len] = RT_UNSET; // so that the collector can free it
+  return v;
 }
 static int same(wv a, wv b) {
   if (a.tag == T_ARR && b.tag == T_ARR) {
@@ -2422,9 +2727,10 @@ static wv std_remove(wv m, wv k) {
   map_writable(p, "$remove");
   int64_t at = map_find(p, k);
   if (at < 0) return rt_std_fail("$remove");
-  p->e[at].live = 0;
+  wv v = p->e[at].val;
+  p->e[at] = (wment){ 0 }; // dead: compacted away later, and not keeping its key and value alive
   p->n--;
-  return p->e[at].val;
+  return v;
 }
 // The keys (which 1) or values (0) of a map, in insertion order.
 static wv map_column(wv m, int which, const char *fn) {
@@ -2500,10 +2806,9 @@ static wv std_sortBy(wv arr, wv by) {
   }
   if (by.tag != T_STR) rt_fail("type error: $sortBy expects a field name or an array of keys, got %s", type_name(by));
   const wstr *key = sym_find(by.s);
-  wv *keys = xmalloc(sizeof(wv) * (a->len ? a->len : 1));
+  wv *keys = rt_alloc(sizeof(wv) * (a->len ? a->len : 1));
   for (int64_t i = 0; i < a->len; i++) keys[i] = *field(key, by.s, a->items[i]);
   wv r = sort_by_keys(a, keys, "$sortBy");
-  free(keys);
   return r;
 }
 static wv std_reverse(wv arr) {
@@ -2630,18 +2935,40 @@ static wv std_randomFloat(wv rng) {
 // The compiled program: library initialization, then the entry file's body.
 static void wvt_main(void);
 
+// Registers the globals of the compiled program as roots (rt_root).
+static void rt_roots(int n, wv *const *globals) {
+  for (int i = 0; i < n; i++) rt_root(globals[i], sizeof(wv));
+}
+
+// Runs the program. It is not inlined, so that all of its stack, and that of
+// what it calls, is below the stack base its caller sets for the collector. (A
+// frame pointer may point into the middle of its own frame.)
+static __attribute__((noinline)) void rt_run(void) {
+  // The runtime's own references to values.
+  rt_root(&cache_s, sizeof cache_s);
+  rt_root(&cache_off, sizeof cache_off);
+  rt_root(&args_cache, sizeof args_cache);
+  rt_root(&program_path_cache, sizeof program_path_cache);
+  rt_root(rng_keys, sizeof rng_keys);
 #ifdef _WIN32
-static DWORD WINAPI rt_thread(LPVOID arg) {
-  (void)arg;
+  rt_root(&key_repeat, sizeof key_repeat);
+#endif
   wvt_main();
   rt_exit_code(0);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI rt_thread(LPVOID arg) {
+  gc_stack_base = __builtin_frame_address(0);
+  (void)arg;
+  rt_run();
   return 0;
 }
 #else
 static void *rt_thread(void *arg) {
+  gc_stack_base = __builtin_frame_address(0);
   (void)arg;
-  wvt_main();
-  rt_exit_code(0);
+  rt_run();
   return NULL;
 }
 #endif

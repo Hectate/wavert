@@ -89,7 +89,9 @@ for (const wah of files) {
       const ra = run(wahc, [wah, '--target', target, '-o', outA, '--runtime', rt]);
       const rb = run(wvc, [wvt, '--target', target, '-o', outB, '--runtime', rt]);
       if (ra.code !== 0 || rb.code !== 0) { problems.push(`--target ${target} failed:\n${ra.err}${rb.err}`); continue; }
-      if (renamed(readFileSync(outA, 'utf8')) !== readFileSync(outB, 'utf8')) problems.push(`--target ${target}: the output differs`);
+      // wvc registers a program's globals with the collector, which wahc predates.
+      const wvtOut = readFileSync(outB, 'utf8').replace(/^ {2}rt_roots\(.*\);\n/m, '');
+      if (renamed(readFileSync(outA, 'utf8')) !== wvtOut) problems.push(`--target ${target}: the output differs`);
     }
   }
   if (problems.length) {

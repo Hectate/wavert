@@ -9,7 +9,7 @@
 // to a static wmem, null -> T_NULL. T_UNSET marks a binding before its
 // declaration (temporal dead zone).
 //
-// Memory is allocated from an arena and never freed.
+// Memory is reclaimed by a conservative mark-and-sweep collector (see "memory").
 //
 // A fail is a pending code in rt_failcode: a function or stdlib function sets
 // it and returns, and the caller either handles it (onfail) or turns it into
@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h> // CommandLineToArgvW: zig cc links shell32 by default
+#include <malloc.h> // _aligned_malloc
 #include <wchar.h>
 #else
 #define _GNU_SOURCE
@@ -38,6 +39,7 @@ extern char **environ;
 #endif
 #include <errno.h>
 #include <math.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -83,27 +85,325 @@ static inline wv rt_m(const wmem *m) { return (wv){ .tag = T_MEM, .m = m }; }
 static inline int isnum(wv x) { return x.tag == T_INT || x.tag == T_FLOAT; }
 static inline double nv(wv x) { return x.tag == T_INT ? (double)x.i : x.f; }
 
-// ---- memory ----
+// ---- memory: a mark-and-sweep collector ----
+// Values are allocated with rt_alloc, or rt_alloc_raw for objects that hold no
+// references (string data). Objects never move. Small objects live in 256 KiB
+// blocks aligned to their size, each holding objects of one size class, so any
+// address maps to its block; objects over GC_SMALL bytes are allocated one by one.
+//
+// A collection marks everything reachable from the roots, then frees the rest.
+// The roots are the program thread's stack and registers, and the ranges given
+// to rt_root: the program's globals and the runtime's own caches. Roots and
+// objects are scanned conservatively: every aligned word that points into an
+// object, or just past its end, keeps it. Raw objects are not scanned.
+// Collections happen only in rt_alloc, on the program thread, which is the only
+// thread that allocates. Memory from malloc (xmalloc) is not scanned, so it must
+// never hold the only reference to an object while anything is allocated.
+//
+// WVT_GC_STRESS=n collects every n allocations and fills freed objects with
+// 0xDD, to expose missing roots. WVT_GC_STATS prints statistics at exit.
 
-static char *ar_p, *ar_end;
 static void rt_flush(void);
 static void term_restore(void);
+static _Noreturn void out_of_memory(void) {
+  rt_flush(); // output written before the failure still appears
+  term_restore();
+  fputs("out of memory\n", stderr);
+  exit(1);
+}
 static void *xmalloc(size_t n) {
   void *p = malloc(n ? n : 1);
-  if (!p) { rt_flush(); term_restore(); fputs("out of memory\n", stderr); exit(1); } // output written before the failure still appears
+  if (!p) out_of_memory();
   return p;
 }
-static void *rt_alloc(size_t n) {
-  n = (n + 15) & ~(size_t)15;
-  if (n > (size_t)(ar_end - ar_p)) {
-    if (n >= (1 << 20)) return xmalloc(n);
-    size_t chunk = 16 << 20;
-    ar_p = xmalloc(chunk);
-    ar_end = ar_p + chunk;
+
+#define GC_BLOCK ((uintptr_t)1 << 18)
+#define GC_SMALL 16384
+#define GC_MAXSLOTS (GC_BLOCK / 16)
+#define GC_MIN ((size_t)8 << 20) // a collection happens after allocating max(GC_MIN, live) bytes
+
+typedef struct gc_block {
+  struct gc_block *next; // in the pool of empty blocks
+  char *first;           // the first slot
+  uint32_t size, slots;
+  uint64_t inv;          // ceil(2^32 / size): offset * inv >> 32 is offset / size within a block
+  int cls, raw;          // cls is -1 for an empty block
+  uint64_t alloc[GC_MAXSLOTS / 64], mark[GC_MAXSLOTS / 64];
+} gc_block;
+typedef struct gc_big { size_t size; int raw, mark; } gc_big; // followed by the object
+typedef struct { char *p; size_t n; } gc_range;
+
+static uint32_t gc_sizes[64];
+static int gc_ncls, gc_ready, gc_stats;
+static uint8_t gc_cls_of[GC_SMALL / 16 + 1];
+static void *gc_free[2][64];                       // free slots, by raw and class
+static gc_block **gc_blocks, **gc_set, *gc_pool;   // every block; the blocks by address; the empty ones
+static size_t gc_nblocks, gc_capblocks, gc_setcap;
+static gc_big **gc_bigs;                           // the big objects, by address
+static size_t gc_nbigs, gc_capbigs, gc_big_bytes;
+static uintptr_t gc_lo = UINTPTR_MAX, gc_hi;       // every object is between these
+static size_t gc_since, gc_next = GC_MIN, gc_live, gc_runs, gc_peak, gc_stress, gc_count;
+static char *gc_stack_base;                        // the top of the program thread's stack
+static gc_range *gc_roots, *gc_marks;
+static size_t gc_nroots, gc_caproots, gc_nmarks, gc_capmarks;
+
+static void gc_init(void) {
+  gc_ready = 1;
+  // 16 to 128 bytes in steps of 16, then four sizes for each doubling
+  for (uint32_t s = 16; s <= GC_SMALL; s += s < 128 ? 16 : ((uint32_t)1 << (31 - __builtin_clz(s))) / 4) gc_sizes[gc_ncls++] = s;
+  for (int c = 0, i = 0; i <= GC_SMALL / 16; i++) {
+    while (gc_sizes[c] < (uint32_t)i * 16) c++;
+    gc_cls_of[i] = (uint8_t)c;
   }
-  void *p = ar_p;
-  ar_p += n;
+  const char *s = getenv("WVT_GC_STRESS");
+  if (s) gc_stress = strtoull(s, NULL, 10) ? strtoull(s, NULL, 10) : 1;
+  gc_stats = getenv("WVT_GC_STATS") != NULL;
+}
+
+static void gc_grow(void *list, size_t *cap, size_t need, size_t item) {
+  if (need <= *cap) return;
+  size_t c = *cap ? *cap * 2 : 64;
+  while (c < need) c *= 2;
+  void *p = realloc(*(void **)list, c * item);
+  if (!p) out_of_memory();
+  *(void **)list = p;
+  *cap = c;
+}
+static void gc_span(uintptr_t lo, uintptr_t hi) {
+  if (lo < gc_lo) gc_lo = lo;
+  if (hi > gc_hi) gc_hi = hi;
+  size_t heap = gc_nblocks * GC_BLOCK + gc_big_bytes;
+  if (heap > gc_peak) gc_peak = heap;
+}
+
+// The blocks are found by address in an open-addressing hash set.
+static size_t gc_hash(uintptr_t b) { return (size_t)((b / GC_BLOCK) * 0x9E3779B97F4A7C15ULL); }
+static void gc_set_put(gc_block *b) {
+  size_t j = gc_hash((uintptr_t)b) & (gc_setcap - 1);
+  while (gc_set[j]) j = (j + 1) & (gc_setcap - 1);
+  gc_set[j] = b;
+}
+static gc_block *gc_block_of(uintptr_t p) {
+  if (!gc_setcap) return NULL;
+  uintptr_t b = p & ~(GC_BLOCK - 1);
+  for (size_t j = gc_hash(b) & (gc_setcap - 1); gc_set[j]; j = (j + 1) & (gc_setcap - 1)) {
+    if ((uintptr_t)gc_set[j] == b) return gc_set[j];
+  }
+  return NULL;
+}
+static gc_block *gc_new_block(void) {
+  void *m;
+#ifdef _WIN32
+  m = _aligned_malloc(GC_BLOCK, GC_BLOCK);
+#else
+  if (posix_memalign(&m, GC_BLOCK, GC_BLOCK)) m = NULL;
+#endif
+  if (!m) out_of_memory();
+  gc_block *b = m;
+  gc_grow(&gc_blocks, &gc_capblocks, gc_nblocks + 1, sizeof *gc_blocks);
+  gc_blocks[gc_nblocks++] = b;
+  if (gc_nblocks * 2 > gc_setcap) {
+    free(gc_set);
+    gc_setcap = gc_setcap ? gc_setcap * 2 : 64;
+    gc_set = xmalloc(gc_setcap * sizeof *gc_set);
+    memset(gc_set, 0, gc_setcap * sizeof *gc_set);
+    for (size_t i = 0; i < gc_nblocks; i++) gc_set_put(gc_blocks[i]);
+  } else {
+    gc_set_put(b);
+  }
+  gc_span((uintptr_t)b, (uintptr_t)b + GC_BLOCK);
+  return b;
+}
+// A block for class c, its slots added to the class's free list.
+static void gc_refill(int raw, int c) {
+  gc_block *b = gc_pool;
+  if (b) gc_pool = b->next;
+  else b = gc_new_block();
+  size_t header = (sizeof(gc_block) + 15) & ~(size_t)15;
+  b->next = NULL;
+  b->first = (char *)b + header;
+  b->size = gc_sizes[c];
+  b->inv = (((uint64_t)1 << 32) + b->size - 1) / b->size;
+  b->slots = (uint32_t)((GC_BLOCK - header) / b->size);
+  b->cls = c;
+  b->raw = raw;
+  memset(b->alloc, 0, sizeof b->alloc);
+  memset(b->mark, 0, sizeof b->mark);
+  void *head = gc_free[raw][c];
+  for (uint32_t i = b->slots; i-- > 0;) {
+    void *p = b->first + (size_t)i * b->size;
+    *(void **)p = head;
+    head = p;
+  }
+  gc_free[raw][c] = head;
+}
+
+// The big object that p points into or just past, or NULL.
+static gc_big *gc_big_of(uintptr_t p) {
+  size_t lo = 0, hi = gc_nbigs;
+  while (lo < hi) {
+    size_t mid = (lo + hi) / 2;
+    if ((uintptr_t)gc_bigs[mid] <= p) lo = mid + 1;
+    else hi = mid;
+  }
+  if (!lo) return NULL;
+  gc_big *h = gc_bigs[lo - 1];
+  uintptr_t start = (uintptr_t)(h + 1);
+  return p >= start && p <= start + h->size ? h : NULL;
+}
+static void *gc_big_alloc(size_t n, int raw) {
+  gc_big *h = malloc(sizeof(gc_big) + n);
+  if (!h) out_of_memory();
+  *h = (gc_big){ n, raw, 0 };
+  if (!raw) memset(h + 1, 0, n);
+  size_t lo = 0, hi = gc_nbigs;
+  while (lo < hi) {
+    size_t mid = (lo + hi) / 2;
+    if (gc_bigs[mid] < h) lo = mid + 1;
+    else hi = mid;
+  }
+  gc_grow(&gc_bigs, &gc_capbigs, gc_nbigs + 1, sizeof *gc_bigs);
+  memmove(gc_bigs + lo + 1, gc_bigs + lo, (gc_nbigs - lo) * sizeof *gc_bigs);
+  gc_bigs[lo] = h;
+  gc_nbigs++;
+  gc_big_bytes += n;
+  gc_since += n;
+  gc_span((uintptr_t)h, (uintptr_t)(h + 1) + n);
+  return h + 1;
+}
+
+// ---- marking ----
+
+static void gc_mark_slot(gc_block *b, size_t i) {
+  uint64_t bit = (uint64_t)1 << (i & 63);
+  if (!(b->alloc[i >> 6] & bit) || (b->mark[i >> 6] & bit)) return;
+  b->mark[i >> 6] |= bit;
+  if (b->raw) return;
+  gc_grow(&gc_marks, &gc_capmarks, gc_nmarks + 1, sizeof *gc_marks);
+  gc_marks[gc_nmarks++] = (gc_range){ b->first + i * b->size, b->size };
+}
+// Marks the object that p points into, or just past.
+static void gc_mark(uintptr_t p) {
+  if (p < gc_lo || p > gc_hi) return;
+  gc_block *b = gc_block_of(p);
+  if (b) {
+    if (b->cls < 0 || p < (uintptr_t)b->first) return;
+    size_t off = p - (uintptr_t)b->first, i = (size_t)((off * b->inv) >> 32);
+    if (i < b->slots) gc_mark_slot(b, i);
+    if (off == i * b->size && i > 0 && i <= b->slots) gc_mark_slot(b, i - 1);
+    return;
+  }
+  gc_big *h = gc_big_of(p);
+  if (h && !h->mark) {
+    h->mark = 1;
+    if (h->raw) return;
+    gc_grow(&gc_marks, &gc_capmarks, gc_nmarks + 1, sizeof *gc_marks);
+    gc_marks[gc_nmarks++] = (gc_range){ (char *)(h + 1), h->size };
+  }
+}
+static void gc_scan(const char *p, size_t n) {
+  const uintptr_t *w = (const uintptr_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7);
+  for (; (const char *)(w + 1) <= p + n; w++) gc_mark(*w);
+}
+
+// ---- sweeping ----
+
+static void gc_sweep(void) {
+  size_t live = 0;
+  memset(gc_free, 0, sizeof gc_free);
+  for (size_t k = 0; k < gc_nblocks; k++) {
+    gc_block *b = gc_blocks[k];
+    if (b->cls < 0) continue;
+    uint32_t used = 0;
+    for (uint32_t j = 0; j < (b->slots + 63) / 64; j++) {
+      uint64_t dead = b->alloc[j] & ~b->mark[j];
+      if (gc_stress) {
+        for (; dead; dead &= dead - 1) memset(b->first + ((size_t)j * 64 + __builtin_ctzll(dead)) * b->size, 0xDD, b->size);
+      }
+      b->alloc[j] = b->mark[j];
+      used += (uint32_t)__builtin_popcountll(b->mark[j]);
+      b->mark[j] = 0;
+    }
+    if (!used) {
+      b->cls = -1;
+      b->next = gc_pool;
+      gc_pool = b;
+      continue;
+    }
+    live += (size_t)used * b->size;
+    for (uint32_t i = b->slots; i-- > 0;) {
+      if (b->alloc[i >> 6] >> (i & 63) & 1) continue;
+      void *p = b->first + (size_t)i * b->size;
+      *(void **)p = gc_free[b->raw][b->cls];
+      gc_free[b->raw][b->cls] = p;
+    }
+  }
+  size_t n = 0;
+  for (size_t k = 0; k < gc_nbigs; k++) {
+    gc_big *h = gc_bigs[k];
+    if (h->mark) {
+      h->mark = 0;
+      live += h->size;
+      gc_bigs[n++] = h;
+    } else {
+      gc_big_bytes -= h->size;
+      if (gc_stress) memset(h + 1, 0xDD, h->size);
+      free(h);
+    }
+  }
+  gc_nbigs = n;
+  gc_live = live;
+  gc_since = 0;
+  gc_next = live > GC_MIN ? live : GC_MIN;
+}
+
+// ---- collecting ----
+
+static __attribute__((noinline)) void gc_collect_from(const char *sp) {
+  gc_runs++;
+  gc_scan(sp, (size_t)(gc_stack_base - sp));
+  for (size_t i = 0; i < gc_nroots; i++) gc_scan(gc_roots[i].p, gc_roots[i].n);
+  while (gc_nmarks) {
+    gc_range r = gc_marks[--gc_nmarks];
+    gc_scan(r.p, r.n);
+  }
+  gc_sweep();
+}
+static __attribute__((noinline)) void gc_collect(void) {
+  // setjmp spills the registers into regs, on the stack, where the scan finds them.
+  jmp_buf regs;
+  __builtin_unwind_init();
+  setjmp(regs);
+  gc_collect_from((const char *)&regs);
+}
+
+static void *gc_alloc(size_t n, int raw) {
+  if (!gc_ready) gc_init();
+  if (gc_stack_base && (gc_stress ? ++gc_count % gc_stress == 0 : gc_since >= gc_next)) gc_collect();
+  if (n > GC_SMALL) return gc_big_alloc(n, raw);
+  int c = gc_cls_of[(n + 15) / 16];
+  void *p = gc_free[raw][c];
+  if (!p) {
+    gc_refill(raw, c);
+    p = gc_free[raw][c];
+  }
+  gc_free[raw][c] = *(void **)p;
+  gc_block *b = (gc_block *)((uintptr_t)p & ~(GC_BLOCK - 1));
+  size_t i = (size_t)(((uint64_t)((char *)p - b->first) * b->inv) >> 32);
+  b->alloc[i >> 6] |= (uint64_t)1 << (i & 63);
+  gc_since += b->size;
+  if (raw) *(void **)p = NULL;
+  else memset(p, 0, b->size);
   return p;
+}
+// A new object of n bytes, zeroed, which may hold references.
+static void *rt_alloc(size_t n) { return gc_alloc(n, 0); }
+// A new object of n bytes that holds no references: it is not scanned or zeroed.
+static void *rt_alloc_raw(size_t n) { return gc_alloc(n, 1); }
+// Registers n bytes at p as a root, scanned in every collection.
+static void rt_root(void *p, size_t n) {
+  gc_grow(&gc_roots, &gc_caproots, gc_nroots + 1, sizeof *gc_roots);
+  gc_roots[gc_nroots++] = (gc_range){ p, n };
 }
 
 // A growable byte buffer for building text (malloc'd, freed by the user).
@@ -155,7 +455,7 @@ static uint32_t utf8_get(const unsigned char *p, int *len) {
 
 // A new string from n bytes of valid UTF-8.
 static const wstr *str_new(const char *p, int64_t n) {
-  wstr *s = rt_alloc(sizeof(wstr) + n + 1);
+  wstr *s = rt_alloc_raw(sizeof(wstr) + n + 1);
   char *d = (char *)(s + 1);
   memcpy(d, p, n);
   d[n] = 0;
@@ -247,7 +547,7 @@ static int64_t cp_offset(const wstr *s, int64_t k) {
     return off;
   }
   if (s != cache_s) {
-    cache_off = rt_alloc(sizeof(int64_t) * s->cps);
+    cache_off = rt_alloc_raw(sizeof(int64_t) * s->cps);
     int64_t off = 0;
     for (int64_t i = 0; i < s->cps; i++) {
       int len;
@@ -637,7 +937,7 @@ static wv rt_text(wv v) {
 static wv rt_cat(int n, const wv *parts) {
   int64_t len = 0;
   for (int i = 0; i < n; i++) len += parts[i].s->bytes;
-  wstr *s = rt_alloc(sizeof(wstr) + len + 1);
+  wstr *s = rt_alloc_raw(sizeof(wstr) + len + 1);
   char *d = (char *)(s + 1);
   int64_t cps = 0, off = 0;
   for (int i = 0; i < n; i++) {
@@ -1167,7 +1467,7 @@ static void map_rehash(wmap *m, int64_t cap) {
   for (int64_t i = 0; i < m->len; i++) if (m->e[i].live) e[len++] = m->e[i];
   int64_t icap = 16;
   while (icap < cap * 2) icap *= 2;
-  int64_t *idx = rt_alloc(sizeof(int64_t) * icap);
+  int64_t *idx = rt_alloc_raw(sizeof(int64_t) * icap);
   memset(idx, 0xFF, sizeof(int64_t) * icap);
   for (int64_t i = 0; i < len; i++) {
     int64_t j = key_hash(e[i].key) & (icap - 1);
@@ -1311,6 +1611,9 @@ static _Noreturn void rt_panic(wv v) {
 static void rt_exit_code(int64_t code) {
   rt_flush();
   term_restore();
+  if (gc_stats) {
+    fprintf(stderr, "gc: %zu collections, live %zu bytes, peak heap %zu bytes\n", gc_runs, gc_live, gc_peak);
+  }
 #ifdef _WIN32
   ExitProcess((UINT)code);
 #else
@@ -2361,7 +2664,9 @@ static wv std_pop(wv arr) {
   warr *a = an_array(arr, "$pop");
   mutable(a, "$pop");
   if (a->len == 0) rt_fail("$pop: the array is empty");
-  return a->items[--a->len];
+  wv v = a->items[--a->len];
+  a->items[a->len] = RT_UNSET; // so that the collector can free it
+  return v;
 }
 static int same(wv a, wv b) {
   if (a.tag == T_ARR && b.tag == T_ARR) {
@@ -2422,9 +2727,10 @@ static wv std_remove(wv m, wv k) {
   map_writable(p, "$remove");
   int64_t at = map_find(p, k);
   if (at < 0) return rt_std_fail("$remove");
-  p->e[at].live = 0;
+  wv v = p->e[at].val;
+  p->e[at] = (wment){ 0 }; // dead: compacted away later, and not keeping its key and value alive
   p->n--;
-  return p->e[at].val;
+  return v;
 }
 // The keys (which 1) or values (0) of a map, in insertion order.
 static wv map_column(wv m, int which, const char *fn) {
@@ -2500,10 +2806,9 @@ static wv std_sortBy(wv arr, wv by) {
   }
   if (by.tag != T_STR) rt_fail("type error: $sortBy expects a field name or an array of keys, got %s", type_name(by));
   const wstr *key = sym_find(by.s);
-  wv *keys = xmalloc(sizeof(wv) * (a->len ? a->len : 1));
+  wv *keys = rt_alloc(sizeof(wv) * (a->len ? a->len : 1));
   for (int64_t i = 0; i < a->len; i++) keys[i] = *field(key, by.s, a->items[i]);
   wv r = sort_by_keys(a, keys, "$sortBy");
-  free(keys);
   return r;
 }
 static wv std_reverse(wv arr) {
@@ -2630,18 +2935,40 @@ static wv std_randomFloat(wv rng) {
 // The compiled program: library initialization, then the entry file's body.
 static void wvt_main(void);
 
+// Registers the globals of the compiled program as roots (rt_root).
+static void rt_roots(int n, wv *const *globals) {
+  for (int i = 0; i < n; i++) rt_root(globals[i], sizeof(wv));
+}
+
+// Runs the program. It is not inlined, so that all of its stack, and that of
+// what it calls, is below the stack base its caller sets for the collector. (A
+// frame pointer may point into the middle of its own frame.)
+static __attribute__((noinline)) void rt_run(void) {
+  // The runtime's own references to values.
+  rt_root(&cache_s, sizeof cache_s);
+  rt_root(&cache_off, sizeof cache_off);
+  rt_root(&args_cache, sizeof args_cache);
+  rt_root(&program_path_cache, sizeof program_path_cache);
+  rt_root(rng_keys, sizeof rng_keys);
 #ifdef _WIN32
-static DWORD WINAPI rt_thread(LPVOID arg) {
-  (void)arg;
+  rt_root(&key_repeat, sizeof key_repeat);
+#endif
   wvt_main();
   rt_exit_code(0);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI rt_thread(LPVOID arg) {
+  gc_stack_base = __builtin_frame_address(0);
+  (void)arg;
+  rt_run();
   return 0;
 }
 #else
 static void *rt_thread(void *arg) {
+  gc_stack_base = __builtin_frame_address(0);
   (void)arg;
-  wvt_main();
-  rt_exit_code(0);
+  rt_run();
   return NULL;
 }
 #endif
@@ -3349,52 +3676,54 @@ static const wstr S675 = { 28, 28, 1, 0, "static void wvt_main(void) {" };
 static const wstr S676 = { 10, 10, 1, 0, "  rt_syms(" };
 static const wstr S677 = { 19, 19, 1, 0, ", (wstr *const[]){ " };
 static const wstr S678 = { 4, 4, 1, 0, " });" };
-static const wstr S679 = { 4, 4, 1, 0, "  | " };
-static const wstr S680 = { 4, 4, 1, 0, "  { " };
-static const wstr S681 = { 4, 4, 1, 0, "    " };
-static const wstr S682 = { 3, 3, 1, 0, "  }" };
-static const wstr S683 = { 5, 5, 1, 0, "array" };
-static const wstr S684 = { 2, 2, 1, 0, "[]" };
-static const wstr S685 = { 6, 6, 1, 0, "record" };
-static const wstr S686 = { 2, 2, 1, 0, ".." };
-static const wstr S687 = { 14, 14, 1, 0, "import cycle: " };
-static const wstr S688 = { 4, 4, 1, 0, " -> " };
-static const wstr S689 = { 13, 13, 1, 0, "cannot read '" };
-static const wstr S690 = { 3, 1, 0, 0, "﻿" };
-static const wstr S691 = { 7, 7, 1, 0, "usage:\n" };
-static const wstr S692 = { 50, 50, 1, 0, "  wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>]\n" };
-static const wstr S693 = { 64, 64, 1, 0, "  wvc <file.wvt> --target js [-o <out.js>] [--runtime <wvt.js>]\n" };
-static const wstr S694 = { 76, 76, 1, 0, "  wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]\n" };
-static const wstr S695 = { 26, 26, 1, 0, "  wvc --tokens <file.wvt>\n" };
-static const wstr S696 = { 22, 22, 1, 0, "  wvc --ast <file.wvt>" };
-static const wstr S697 = { 17, 17, 1, 0, "wvc: cannot read " };
-static const wstr S698 = { 5, 5, 1, 0, "build" };
-static const wstr S699 = { 8, 8, 1, 0, "--tokens" };
-static const wstr S700 = { 5, 5, 1, 0, "--ast" };
-static const wstr S701 = { 2, 2, 1, 0, "-o" };
-static const wstr S702 = { 9, 9, 1, 0, "--runtime" };
-static const wstr S703 = { 8, 8, 1, 0, "--target" };
-static const wstr S704 = { 4, 4, 1, 0, "--cc" };
-static const wstr S705 = { 2, 2, 1, 0, "js" };
-static const wstr S706 = { 1, 1, 1, 0, "c" };
-static const wstr S707 = { 2, 2, 1, 0, "OS" };
-static const wstr S708 = { 10, 10, 1, 0, "Windows_NT" };
-static const wstr S709 = { 3, 3, 1, 0, "ZIG" };
-static const wstr S710 = { 3, 3, 1, 0, "zig" };
-static const wstr S711 = { 5, 5, 1, 0, "wvc: " };
-static const wstr S712 = { 52, 52, 1, 0, " does not end with .wvt, so name the program with -o" };
-static const wstr S713 = { 4, 4, 1, 0, ".exe" };
-static const wstr S714 = { 13, 13, 1, 0, "runtime/wvt.c" };
-static const wstr S715 = { 14, 14, 1, 0, "runtime/wvt.js" };
-static const wstr S716 = { 3, 3, 1, 0, "../" };
-static const wstr S717 = { 18, 18, 1, 0, "wvc: cannot write " };
-static const wstr S718 = { 2, 2, 1, 0, ".c" };
-static const wstr S719 = { 3, 3, 1, 0, "-O2" };
-static const wstr S720 = { 7, 7, 1, 0, "zig.exe" };
-static const wstr S721 = { 2, 2, 1, 0, "cc" };
-static const wstr S722 = { 16, 16, 1, 0, "wvc: cannot run " };
-static const wstr S723 = { 67, 67, 1, 0, ": install Zig (https://ziglang.org), or name a C compiler with --cc" };
-static const wstr S724 = { 23, 23, 1, 0, " failed with exit code " };
+static const wstr S679 = { 11, 11, 1, 0, "  rt_roots(" };
+static const wstr S680 = { 17, 17, 1, 0, ", (wv *const[]){ " };
+static const wstr S681 = { 4, 4, 1, 0, "  | " };
+static const wstr S682 = { 4, 4, 1, 0, "  { " };
+static const wstr S683 = { 4, 4, 1, 0, "    " };
+static const wstr S684 = { 3, 3, 1, 0, "  }" };
+static const wstr S685 = { 5, 5, 1, 0, "array" };
+static const wstr S686 = { 2, 2, 1, 0, "[]" };
+static const wstr S687 = { 6, 6, 1, 0, "record" };
+static const wstr S688 = { 2, 2, 1, 0, ".." };
+static const wstr S689 = { 14, 14, 1, 0, "import cycle: " };
+static const wstr S690 = { 4, 4, 1, 0, " -> " };
+static const wstr S691 = { 13, 13, 1, 0, "cannot read '" };
+static const wstr S692 = { 3, 1, 0, 0, "﻿" };
+static const wstr S693 = { 7, 7, 1, 0, "usage:\n" };
+static const wstr S694 = { 50, 50, 1, 0, "  wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>]\n" };
+static const wstr S695 = { 64, 64, 1, 0, "  wvc <file.wvt> --target js [-o <out.js>] [--runtime <wvt.js>]\n" };
+static const wstr S696 = { 76, 76, 1, 0, "  wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]\n" };
+static const wstr S697 = { 26, 26, 1, 0, "  wvc --tokens <file.wvt>\n" };
+static const wstr S698 = { 22, 22, 1, 0, "  wvc --ast <file.wvt>" };
+static const wstr S699 = { 17, 17, 1, 0, "wvc: cannot read " };
+static const wstr S700 = { 5, 5, 1, 0, "build" };
+static const wstr S701 = { 8, 8, 1, 0, "--tokens" };
+static const wstr S702 = { 5, 5, 1, 0, "--ast" };
+static const wstr S703 = { 2, 2, 1, 0, "-o" };
+static const wstr S704 = { 9, 9, 1, 0, "--runtime" };
+static const wstr S705 = { 8, 8, 1, 0, "--target" };
+static const wstr S706 = { 4, 4, 1, 0, "--cc" };
+static const wstr S707 = { 2, 2, 1, 0, "js" };
+static const wstr S708 = { 1, 1, 1, 0, "c" };
+static const wstr S709 = { 2, 2, 1, 0, "OS" };
+static const wstr S710 = { 10, 10, 1, 0, "Windows_NT" };
+static const wstr S711 = { 3, 3, 1, 0, "ZIG" };
+static const wstr S712 = { 3, 3, 1, 0, "zig" };
+static const wstr S713 = { 5, 5, 1, 0, "wvc: " };
+static const wstr S714 = { 52, 52, 1, 0, " does not end with .wvt, so name the program with -o" };
+static const wstr S715 = { 4, 4, 1, 0, ".exe" };
+static const wstr S716 = { 13, 13, 1, 0, "runtime/wvt.c" };
+static const wstr S717 = { 14, 14, 1, 0, "runtime/wvt.js" };
+static const wstr S718 = { 3, 3, 1, 0, "../" };
+static const wstr S719 = { 18, 18, 1, 0, "wvc: cannot write " };
+static const wstr S720 = { 2, 2, 1, 0, ".c" };
+static const wstr S721 = { 3, 3, 1, 0, "-O2" };
+static const wstr S722 = { 7, 7, 1, 0, "zig.exe" };
+static const wstr S723 = { 2, 2, 1, 0, "cc" };
+static const wstr S724 = { 16, 16, 1, 0, "wvc: cannot run " };
+static const wstr S725 = { 67, 67, 1, 0, ": install Zig (https://ziglang.org), or name a C compiler with --cc" };
+static const wstr S726 = { 23, 23, 1, 0, " failed with exit code " };
 static wstr F_severity = { 8, 8, 1, 0, "severity" };
 static wstr F_pos = { 3, 3, 1, 0, "pos" };
 static wstr F_message = { 7, 7, 1, 0, "message" };
@@ -3548,7 +3877,7 @@ struct fr49 { wv v184_toks; wv v186_p; wv v187_depth; wv v188_exports; wv v189_f
 struct fr100 { wv v384_modules; wv v386_errors; wv v387_nextFn; wv v388_curMod; wv v389_functions; wv v390_uses; wv v391_enums; wv v424_topFn; };
 struct fr140 { wv v637_modules; wv v639_out; wv v640_indent; wv v641_n; wv v642_loops; wv v643_iife; wv v644_mod; wv v645_stolen; wv v646_enums; wv v647_refPositions; };
 struct fr184 { wv v824_modules; wv v825_runtime; wv v826_n; wv v827_tmps; wv v828_strings; wv v829_fields; wv v830_shapes; wv v831_enumDefs; wv v832_globals; wv v833_frames; wv v834_functions; wv v835_out; wv v836_indent; wv v837_loops; wv v838_iife; wv v839_decls; wv v840_fns; wv v841_tops; wv v842_slots; wv v843_curMod; wv v844_mod; wv v845_curSlot; wv v846_stolen; wv v847_ownEnums; wv v848_cur; };
-struct fr254 { wv v1228_modules; };
+struct fr254 { wv v1229_modules; };
 static wv w2_srcFile;
 static wv w2_srcChars;
 static wv w2_warnings;
@@ -3600,10 +3929,10 @@ static wv w_parts;
 static wv w_ccName;
 static wv w_flags;
 static wv w_status;
-static wv v1255_a;
-static wv v1264_tokens;
-static wv v1265_program;
-static wv v1266_p;
+static wv v1256_a;
+static wv v1265_tokens;
+static wv v1266_program;
+static wv v1267_p;
 static wv w1_isSpace(wv v0_c);
 static wv w1_isDigit(wv v1_c);
 static wv w1_isHexDigit(wv v2_c);
@@ -3842,20 +4171,20 @@ static wv s905_matchExpr(struct fr184 *up, wv v1144_e);
 static wv s906_callC(struct fr184 *up, wv v1148_callee, wv v1149_args, wv v1150_checked);
 static wv s907_expr(struct fr184 *up, wv v1159_e);
 static wv s908_assemble(struct fr184 *up);
-static wv w8_dumpTokens(wv v1188_toks, wv v1189_indent);
-static wv w8_sorted(wv v1195_xs);
-static wv w8_dumpValue(wv v1200_x, wv v1201_indent);
-static wv w9_dirOf(wv v1210_path);
-static wv w9_normalize(wv v1213_path);
-static wv w9_with(wv v1218_xs, wv v1219_x);
-static wv w9_failIn(wv v1222_file, wv v1223_chars, wv v1224_pos, wv v1225_message);
-static wv w9_loadProgram(wv v1226_entryFile, wv v1227_entryChars);
-static wv s1229_loaded(struct fr254 *up, wv v1232_path);
-static wv s1230_visit(struct fr254 *up, wv v1234_file, wv v1235_chars, wv v1236_path, wv v1237_chain);
+static wv w8_dumpTokens(wv v1189_toks, wv v1190_indent);
+static wv w8_sorted(wv v1196_xs);
+static wv w8_dumpValue(wv v1201_x, wv v1202_indent);
+static wv w9_dirOf(wv v1211_path);
+static wv w9_normalize(wv v1214_path);
+static wv w9_with(wv v1219_xs, wv v1220_x);
+static wv w9_failIn(wv v1223_file, wv v1224_chars, wv v1225_pos, wv v1226_message);
+static wv w9_loadProgram(wv v1227_entryFile, wv v1228_entryChars);
+static wv s1230_loaded(struct fr254 *up, wv v1233_path);
+static wv s1231_visit(struct fr254 *up, wv v1235_file, wv v1236_chars, wv v1237_path, wv v1238_chain);
 static wv w_die(void);
-static wv w_load(wv v1251_file);
+static wv w_load(wv v1252_file);
 static wv w_onWindows(void);
-static wv w_tryRead(wv v1257_path);
+static wv w_tryRead(wv v1258_path);
 static wv w_programDir(void);
 static wv w_readRuntime(void);
 
@@ -7593,24 +7922,24 @@ static wv w7_generateC(wv p_v824_modules, wv p_v825_runtime) {
   fr.v847_ownEnums = rt_arr(0, NULL, 1);
   fr.v848_cur = rt_i(0);
   wv v909_mi = rt_i(0);
-  while (rt_cond(({ wv t2405 = v909_mi; wv t2406 = std_length(fr.v824_modules); rt_lt(t2405, t2406); }))) {
+  while (rt_cond(({ wv t2415 = v909_mi; wv t2416 = std_length(fr.v824_modules); rt_lt(t2415, t2416); }))) {
     (void)rt_chk(s863_analyze(&fr, v909_mi), "generateC");
     v909_mi = rt_add(v909_mi, rt_i(1));
   }
   v909_mi = rt_i(0);
-  while (rt_cond(({ wv t2407 = v909_mi; wv t2408 = std_length(fr.v824_modules); rt_lt(t2407, t2408); }))) {
-    wv v1186_list = rt_bind(rt_get(&F_stmts, rt_get(&F_program, rt_idx(v909_mi, fr.v824_modules))), 0);
-    wv v1187_li = rt_i(0);
-    while (rt_cond(({ wv t2409 = v1187_li; wv t2410 = std_length(v1186_list); rt_lt(t2409, t2410); }))) {
-      if (rt_cond(rt_eq(rt_get(&F_k, rt_idx(v1187_li, v1186_list)), rt_s(&S46)))) {
-        (void)({ wv t2411 = rt_idx(v1187_li, v1186_list); wv t2412 = rt_chk(s849_modId(&fr, v909_mi), "generateC"); rt_chk(s869_enumDef(&fr, t2411, t2412), "generateC"); });
+  while (rt_cond(({ wv t2417 = v909_mi; wv t2418 = std_length(fr.v824_modules); rt_lt(t2417, t2418); }))) {
+    wv v1187_list = rt_bind(rt_get(&F_stmts, rt_get(&F_program, rt_idx(v909_mi, fr.v824_modules))), 0);
+    wv v1188_li = rt_i(0);
+    while (rt_cond(({ wv t2419 = v1188_li; wv t2420 = std_length(v1187_list); rt_lt(t2419, t2420); }))) {
+      if (rt_cond(rt_eq(rt_get(&F_k, rt_idx(v1188_li, v1187_list)), rt_s(&S46)))) {
+        (void)({ wv t2421 = rt_idx(v1188_li, v1187_list); wv t2422 = rt_chk(s849_modId(&fr, v909_mi), "generateC"); rt_chk(s869_enumDef(&fr, t2421, t2422), "generateC"); });
       }
-      v1187_li = rt_add(v1187_li, rt_i(1));
+      v1188_li = rt_add(v1188_li, rt_i(1));
     }
     v909_mi = rt_add(v909_mi, rt_i(1));
   }
   v909_mi = rt_i(0);
-  while (rt_cond(({ wv t2413 = v909_mi; wv t2414 = std_length(fr.v824_modules); rt_lt(t2413, t2414); }))) {
+  while (rt_cond(({ wv t2423 = v909_mi; wv t2424 = std_length(fr.v824_modules); rt_lt(t2423, t2424); }))) {
     (void)rt_chk(s864_enter(&fr, v909_mi), "generateC");
     (void)rt_chk(s878_stmts(&fr, rt_get(&F_stmts, rt_get(&F_program, rt_idx(v909_mi, fr.v824_modules)))), "generateC");
     v909_mi = rt_add(v909_mi, rt_i(1));
@@ -8988,9 +9317,18 @@ static wv s908_assemble(struct fr184 *up) {
     }
     (void)({ wv t2397 = v1174_all; wv t2398 = ({ wv t2395 = rt_text(std_length(rt_def(up->v829_fields, "fields"))); wv t2396 = rt_text(std_join(v1185_refs, rt_s(&S405))); rt_cat(5, (wv[]){ rt_s(&S676), t2395, rt_s(&S677), t2396, rt_s(&S678) }); }); std_push(t2397, t2398); });
   }
+  if (rt_cond(rt_gt(std_length(rt_def(up->v832_globals, "globals")), rt_i(0)))) {
+    wv v1186_refs = rt_arr(0, NULL, 1);
+    v1175_k = rt_i(0);
+    while (rt_cond(({ wv t2399 = v1175_k; wv t2400 = std_length(rt_def(up->v832_globals, "globals")); rt_lt(t2399, t2400); }))) {
+      (void)({ wv t2403 = v1186_refs; wv t2404 = rt_cat(2, (wv[]){ rt_s(&S91), rt_text(({ wv t2401 = v1175_k; wv t2402 = rt_def(up->v832_globals, "globals"); rt_idx(t2401, t2402); })) }); std_push(t2403, t2404); });
+      v1175_k = rt_add(v1175_k, rt_i(1));
+    }
+    (void)({ wv t2407 = v1174_all; wv t2408 = ({ wv t2405 = rt_text(std_length(rt_def(up->v832_globals, "globals"))); wv t2406 = rt_text(std_join(v1186_refs, rt_s(&S405))); rt_cat(5, (wv[]){ rt_s(&S679), t2405, rt_s(&S680), t2406, rt_s(&S678) }); }); std_push(t2407, t2408); });
+  }
   v1175_k = rt_i(0);
-  while (rt_cond(({ wv t2399 = v1175_k; wv t2400 = std_length(rt_def(up->v835_out, "out")); rt_lt(t2399, t2400); }))) {
-    (void)({ wv t2403 = v1174_all; wv t2404 = ({ wv t2401 = v1175_k; wv t2402 = rt_def(up->v835_out, "out"); rt_idx(t2401, t2402); }); std_push(t2403, t2404); });
+  while (rt_cond(({ wv t2409 = v1175_k; wv t2410 = std_length(rt_def(up->v835_out, "out")); rt_lt(t2409, t2410); }))) {
+    (void)({ wv t2413 = v1174_all; wv t2414 = ({ wv t2411 = v1175_k; wv t2412 = rt_def(up->v835_out, "out"); rt_idx(t2411, t2412); }); std_push(t2413, t2414); });
     v1175_k = rt_add(v1175_k, rt_i(1));
   }
   (void)std_push(v1174_all, rt_s(&S15));
@@ -8998,219 +9336,219 @@ static wv s908_assemble(struct fr184 *up) {
   RT_RET(std_join(v1174_all, rt_s(&S2)));
 }
 
-static wv w8_dumpTokens(wv v1188_toks, wv v1189_indent) {
+static wv w8_dumpTokens(wv v1189_toks, wv v1190_indent) {
   rt_enter("dumpTokens");
-  v1188_toks = rt_bind(v1188_toks, 0);
-  v1189_indent = rt_bind(v1189_indent, 0);
-  wv v1190_k = rt_i(0);
-  while (rt_cond(({ wv t2415 = v1190_k; wv t2416 = std_length(v1188_toks); rt_lt(t2415, t2416); }))) {
-    wv v1191_tk = rt_bind(rt_idx(v1190_k, v1188_toks), 0);
-    wv v1192_line = ({ wv t2417 = rt_text(v1189_indent); wv t2418 = rt_text(rt_get(&F_t, v1191_tk)); wv t2419 = rt_text(rt_get(&F_pos, v1191_tk)); wv t2420 = rt_text(rt_get(&F_end, v1191_tk)); wv t2421 = rt_text(rt_get(&F_sp, v1191_tk)); rt_cat(8, (wv[]){ t2417, t2418, rt_s(&S0), t2419, rt_s(&S0), t2420, rt_s(&S0), t2421 }); });
-    if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_eq(rt_get(&F_t, v1191_tk), rt_s(&S137)), "||") || rt_bool(rt_eq(rt_get(&F_t, v1191_tk), rt_s(&S156)), "||")), "||") || rt_bool(rt_eq(rt_get(&F_t, v1191_tk), rt_s(&S111)), "||")))) {
-      v1192_line = ({ wv t2422 = v1192_line; wv t2423 = rt_cat(2, (wv[]){ rt_s(&S0), rt_text(rt_get(&F_v, v1191_tk)) }); rt_add(t2422, t2423); });
-    } else if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_t, v1191_tk), rt_s(&S138)), "||") || rt_bool(rt_eq(rt_get(&F_t, v1191_tk), rt_s(&S148)), "||")))) {
-      v1192_line = ({ wv t2426 = v1192_line; wv t2427 = ({ wv t2424 = rt_text(rt_get(&F_text, v1191_tk)); wv t2425 = rt_text(rt_get(&F_v, v1191_tk)); rt_cat(4, (wv[]){ rt_s(&S0), t2424, rt_s(&S0), t2425 }); }); rt_add(t2426, t2427); });
+  v1189_toks = rt_bind(v1189_toks, 0);
+  v1190_indent = rt_bind(v1190_indent, 0);
+  wv v1191_k = rt_i(0);
+  while (rt_cond(({ wv t2425 = v1191_k; wv t2426 = std_length(v1189_toks); rt_lt(t2425, t2426); }))) {
+    wv v1192_tk = rt_bind(rt_idx(v1191_k, v1189_toks), 0);
+    wv v1193_line = ({ wv t2427 = rt_text(v1190_indent); wv t2428 = rt_text(rt_get(&F_t, v1192_tk)); wv t2429 = rt_text(rt_get(&F_pos, v1192_tk)); wv t2430 = rt_text(rt_get(&F_end, v1192_tk)); wv t2431 = rt_text(rt_get(&F_sp, v1192_tk)); rt_cat(8, (wv[]){ t2427, t2428, rt_s(&S0), t2429, rt_s(&S0), t2430, rt_s(&S0), t2431 }); });
+    if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_eq(rt_get(&F_t, v1192_tk), rt_s(&S137)), "||") || rt_bool(rt_eq(rt_get(&F_t, v1192_tk), rt_s(&S156)), "||")), "||") || rt_bool(rt_eq(rt_get(&F_t, v1192_tk), rt_s(&S111)), "||")))) {
+      v1193_line = ({ wv t2432 = v1193_line; wv t2433 = rt_cat(2, (wv[]){ rt_s(&S0), rt_text(rt_get(&F_v, v1192_tk)) }); rt_add(t2432, t2433); });
+    } else if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_t, v1192_tk), rt_s(&S138)), "||") || rt_bool(rt_eq(rt_get(&F_t, v1192_tk), rt_s(&S148)), "||")))) {
+      v1193_line = ({ wv t2436 = v1193_line; wv t2437 = ({ wv t2434 = rt_text(rt_get(&F_text, v1192_tk)); wv t2435 = rt_text(rt_get(&F_v, v1192_tk)); rt_cat(4, (wv[]){ rt_s(&S0), t2434, rt_s(&S0), t2435 }); }); rt_add(t2436, t2437); });
     }
-    (void)std_print(v1192_line);
-    if (rt_cond(rt_eq(rt_get(&F_t, v1191_tk), rt_s(&S171)))) {
-      wv v1193_p = rt_i(0);
-      while (rt_cond(({ wv t2428 = v1193_p; wv t2429 = std_length(rt_get(&F_parts, v1191_tk)); rt_lt(t2428, t2429); }))) {
-        wv v1194_part = rt_bind(({ wv t2430 = v1193_p; wv t2431 = rt_get(&F_parts, v1191_tk); rt_idx(t2430, t2431); }), 0);
-        if (rt_cond(rt_eq(std_typeOf(v1194_part), rt_s(&S185)))) {
-          (void)std_print(({ wv t2432 = rt_text(v1189_indent); wv t2433 = rt_text(rt_chk(w1_quote(v1194_part), "dumpTokens")); rt_cat(3, (wv[]){ t2432, rt_s(&S679), t2433 }); }));
+    (void)std_print(v1193_line);
+    if (rt_cond(rt_eq(rt_get(&F_t, v1192_tk), rt_s(&S171)))) {
+      wv v1194_p = rt_i(0);
+      while (rt_cond(({ wv t2438 = v1194_p; wv t2439 = std_length(rt_get(&F_parts, v1192_tk)); rt_lt(t2438, t2439); }))) {
+        wv v1195_part = rt_bind(({ wv t2440 = v1194_p; wv t2441 = rt_get(&F_parts, v1192_tk); rt_idx(t2440, t2441); }), 0);
+        if (rt_cond(rt_eq(std_typeOf(v1195_part), rt_s(&S185)))) {
+          (void)std_print(({ wv t2442 = rt_text(v1190_indent); wv t2443 = rt_text(rt_chk(w1_quote(v1195_part), "dumpTokens")); rt_cat(3, (wv[]){ t2442, rt_s(&S681), t2443 }); }));
         } else {
-          (void)std_print(({ wv t2434 = rt_text(v1189_indent); wv t2435 = rt_text(rt_get(&F_pos, v1194_part)); rt_cat(3, (wv[]){ t2434, rt_s(&S680), t2435 }); }));
-          (void)({ wv t2436 = rt_get(&F_tokens, v1194_part); wv t2437 = rt_add(v1189_indent, rt_s(&S681)); rt_chk(w8_dumpTokens(t2436, t2437), "dumpTokens"); });
-          (void)std_print(rt_cat(2, (wv[]){ rt_text(v1189_indent), rt_s(&S682) }));
+          (void)std_print(({ wv t2444 = rt_text(v1190_indent); wv t2445 = rt_text(rt_get(&F_pos, v1195_part)); rt_cat(3, (wv[]){ t2444, rt_s(&S682), t2445 }); }));
+          (void)({ wv t2446 = rt_get(&F_tokens, v1195_part); wv t2447 = rt_add(v1190_indent, rt_s(&S683)); rt_chk(w8_dumpTokens(t2446, t2447), "dumpTokens"); });
+          (void)std_print(rt_cat(2, (wv[]){ rt_text(v1190_indent), rt_s(&S684) }));
         }
-        v1193_p = rt_add(v1193_p, rt_i(1));
+        v1194_p = rt_add(v1194_p, rt_i(1));
       }
     }
-    v1190_k = rt_add(v1190_k, rt_i(1));
+    v1191_k = rt_add(v1191_k, rt_i(1));
   }
   RT_RET(RT_NULL);
 }
 
-static wv w8_sorted(wv v1195_xs) {
+static wv w8_sorted(wv v1196_xs) {
   rt_enter("sorted");
-  v1195_xs = rt_bind(v1195_xs, 0);
-  wv v1196_out = rt_arr(0, NULL, 1);
-  wv v1197_k = rt_i(0);
-  while (rt_cond(({ wv t2438 = v1197_k; wv t2439 = std_length(v1195_xs); rt_lt(t2438, t2439); }))) {
-    (void)({ wv t2440 = v1196_out; wv t2441 = rt_idx(v1197_k, v1195_xs); std_push(t2440, t2441); });
-    wv v1198_j = rt_sub(std_length(v1196_out), rt_i(1));
-    while (rt_cond(rt_b(rt_bool(rt_gt(v1198_j, rt_i(0)), "&&") && rt_bool(({ wv t2444 = ({ wv t2442 = rt_sub(v1198_j, rt_i(1)); wv t2443 = v1196_out; rt_idx(t2442, t2443); }); wv t2445 = rt_idx(v1198_j, v1196_out); rt_gt(t2444, t2445); }), "&&")))) {
-      wv v1199_swap = rt_bind(rt_idx(v1198_j, v1196_out), 0);
-      ({ wv t2448 = ({ wv t2446 = rt_sub(v1198_j, rt_i(1)); wv t2447 = v1196_out; rt_idx(t2446, t2447); }); wv t2449 = v1198_j; wv t2450 = v1196_out; rt_set_idx(t2448, t2449, t2450); });
-      ({ wv t2451 = v1199_swap; wv t2452 = rt_sub(v1198_j, rt_i(1)); wv t2453 = v1196_out; rt_set_idx(t2451, t2452, t2453); });
-      v1198_j = rt_sub(v1198_j, rt_i(1));
+  v1196_xs = rt_bind(v1196_xs, 0);
+  wv v1197_out = rt_arr(0, NULL, 1);
+  wv v1198_k = rt_i(0);
+  while (rt_cond(({ wv t2448 = v1198_k; wv t2449 = std_length(v1196_xs); rt_lt(t2448, t2449); }))) {
+    (void)({ wv t2450 = v1197_out; wv t2451 = rt_idx(v1198_k, v1196_xs); std_push(t2450, t2451); });
+    wv v1199_j = rt_sub(std_length(v1197_out), rt_i(1));
+    while (rt_cond(rt_b(rt_bool(rt_gt(v1199_j, rt_i(0)), "&&") && rt_bool(({ wv t2454 = ({ wv t2452 = rt_sub(v1199_j, rt_i(1)); wv t2453 = v1197_out; rt_idx(t2452, t2453); }); wv t2455 = rt_idx(v1199_j, v1197_out); rt_gt(t2454, t2455); }), "&&")))) {
+      wv v1200_swap = rt_bind(rt_idx(v1199_j, v1197_out), 0);
+      ({ wv t2458 = ({ wv t2456 = rt_sub(v1199_j, rt_i(1)); wv t2457 = v1197_out; rt_idx(t2456, t2457); }); wv t2459 = v1199_j; wv t2460 = v1197_out; rt_set_idx(t2458, t2459, t2460); });
+      ({ wv t2461 = v1200_swap; wv t2462 = rt_sub(v1199_j, rt_i(1)); wv t2463 = v1197_out; rt_set_idx(t2461, t2462, t2463); });
+      v1199_j = rt_sub(v1199_j, rt_i(1));
     }
-    v1197_k = rt_add(v1197_k, rt_i(1));
+    v1198_k = rt_add(v1198_k, rt_i(1));
   }
-  RT_RET(v1196_out);
+  RT_RET(v1197_out);
 }
 
-static wv w8_dumpValue(wv v1200_x, wv v1201_indent) {
+static wv w8_dumpValue(wv v1201_x, wv v1202_indent) {
   rt_enter("dumpValue");
-  v1200_x = rt_bind(v1200_x, 0);
-  v1201_indent = rt_bind(v1201_indent, 0);
-  wv v1202_type = rt_bind(std_typeOf(v1200_x), 0);
-  if (rt_cond(rt_eq(v1202_type, rt_s(&S185)))) {
-    RT_RET(rt_chk(w1_quote(v1200_x), "dumpValue"));
+  v1201_x = rt_bind(v1201_x, 0);
+  v1202_indent = rt_bind(v1202_indent, 0);
+  wv v1203_type = rt_bind(std_typeOf(v1201_x), 0);
+  if (rt_cond(rt_eq(v1203_type, rt_s(&S185)))) {
+    RT_RET(rt_chk(w1_quote(v1201_x), "dumpValue"));
   }
-  wv v1203_inner = rt_add(v1201_indent, rt_s(&S500));
-  if (rt_cond(rt_eq(v1202_type, rt_s(&S683)))) {
-    if (rt_cond(rt_eq(std_length(v1200_x), rt_i(0)))) {
-      RT_RET(rt_s(&S684));
+  wv v1204_inner = rt_add(v1202_indent, rt_s(&S500));
+  if (rt_cond(rt_eq(v1203_type, rt_s(&S685)))) {
+    if (rt_cond(rt_eq(std_length(v1201_x), rt_i(0)))) {
+      RT_RET(rt_s(&S686));
     }
-    wv v1204_out = rt_s(&S98);
-    wv v1205_k = rt_i(0);
-    while (rt_cond(({ wv t2454 = v1205_k; wv t2455 = std_length(v1200_x); rt_lt(t2454, t2455); }))) {
-      v1204_out = ({ wv t2460 = ({ wv t2456 = rt_add(v1204_out, rt_s(&S2)); wv t2457 = v1203_inner; rt_add(t2456, t2457); }); wv t2461 = ({ wv t2458 = rt_idx(v1205_k, v1200_x); wv t2459 = v1203_inner; rt_chk(w8_dumpValue(t2458, t2459), "dumpValue"); }); rt_add(t2460, t2461); });
-      v1205_k = rt_add(v1205_k, rt_i(1));
+    wv v1205_out = rt_s(&S98);
+    wv v1206_k = rt_i(0);
+    while (rt_cond(({ wv t2464 = v1206_k; wv t2465 = std_length(v1201_x); rt_lt(t2464, t2465); }))) {
+      v1205_out = ({ wv t2470 = ({ wv t2466 = rt_add(v1205_out, rt_s(&S2)); wv t2467 = v1204_inner; rt_add(t2466, t2467); }); wv t2471 = ({ wv t2468 = rt_idx(v1206_k, v1201_x); wv t2469 = v1204_inner; rt_chk(w8_dumpValue(t2468, t2469), "dumpValue"); }); rt_add(t2470, t2471); });
+      v1206_k = rt_add(v1206_k, rt_i(1));
     }
-    RT_RET(rt_add(({ wv t2462 = rt_add(v1204_out, rt_s(&S2)); wv t2463 = v1201_indent; rt_add(t2462, t2463); }), rt_s(&S99)));
+    RT_RET(rt_add(({ wv t2472 = rt_add(v1205_out, rt_s(&S2)); wv t2473 = v1202_indent; rt_add(t2472, t2473); }), rt_s(&S99)));
   }
-  if (rt_cond(rt_eq(v1202_type, rt_s(&S685)))) {
-    wv v1206_keys = rt_bind(rt_chk(w8_sorted(std_fields(v1200_x)), "dumpValue"), 0);
-    wv v1207_out = rt_s(&S100);
-    wv v1208_k = rt_i(0);
-    while (rt_cond(({ wv t2464 = v1208_k; wv t2465 = std_length(v1206_keys); rt_lt(t2464, t2465); }))) {
-      wv v1209_key = rt_bind(rt_idx(v1208_k, v1206_keys), 0);
-      v1207_out = ({ wv t2472 = ({ wv t2468 = v1207_out; wv t2469 = ({ wv t2466 = rt_text(v1203_inner); wv t2467 = rt_text(v1209_key); rt_cat(4, (wv[]){ rt_s(&S2), t2466, t2467, rt_s(&S29) }); }); rt_add(t2468, t2469); }); wv t2473 = ({ wv t2470 = rt_idx(v1209_key, v1200_x); wv t2471 = v1203_inner; rt_chk(w8_dumpValue(t2470, t2471), "dumpValue"); }); rt_add(t2472, t2473); });
-      v1208_k = rt_add(v1208_k, rt_i(1));
+  if (rt_cond(rt_eq(v1203_type, rt_s(&S687)))) {
+    wv v1207_keys = rt_bind(rt_chk(w8_sorted(std_fields(v1201_x)), "dumpValue"), 0);
+    wv v1208_out = rt_s(&S100);
+    wv v1209_k = rt_i(0);
+    while (rt_cond(({ wv t2474 = v1209_k; wv t2475 = std_length(v1207_keys); rt_lt(t2474, t2475); }))) {
+      wv v1210_key = rt_bind(rt_idx(v1209_k, v1207_keys), 0);
+      v1208_out = ({ wv t2482 = ({ wv t2478 = v1208_out; wv t2479 = ({ wv t2476 = rt_text(v1204_inner); wv t2477 = rt_text(v1210_key); rt_cat(4, (wv[]){ rt_s(&S2), t2476, t2477, rt_s(&S29) }); }); rt_add(t2478, t2479); }); wv t2483 = ({ wv t2480 = rt_idx(v1210_key, v1201_x); wv t2481 = v1204_inner; rt_chk(w8_dumpValue(t2480, t2481), "dumpValue"); }); rt_add(t2482, t2483); });
+      v1209_k = rt_add(v1209_k, rt_i(1));
     }
-    RT_RET(({ wv t2474 = v1207_out; wv t2475 = rt_cat(3, (wv[]){ rt_s(&S2), rt_text(v1201_indent), rt_s(&S15) }); rt_add(t2474, t2475); }));
+    RT_RET(({ wv t2484 = v1208_out; wv t2485 = rt_cat(3, (wv[]){ rt_s(&S2), rt_text(v1202_indent), rt_s(&S15) }); rt_add(t2484, t2485); }));
   }
-  RT_RET(std_toString(v1200_x));
+  RT_RET(std_toString(v1201_x));
 }
 
-static wv w9_dirOf(wv v1210_path) {
+static wv w9_dirOf(wv v1211_path) {
   rt_enter("dirOf");
-  v1210_path = rt_bind(v1210_path, 0);
-  wv v1211_cs = rt_bind(std_split(v1210_path, rt_s(&S13)), 0);
-  wv v1212_k = rt_sub(std_length(v1211_cs), rt_i(1));
-  while (rt_cond(rt_b(rt_bool(rt_ge(v1212_k, rt_i(0)), "&&") && rt_bool(rt_ne(rt_idx(v1212_k, v1211_cs), rt_s(&S87)), "&&")))) {
-    v1212_k = rt_sub(v1212_k, rt_i(1));
+  v1211_path = rt_bind(v1211_path, 0);
+  wv v1212_cs = rt_bind(std_split(v1211_path, rt_s(&S13)), 0);
+  wv v1213_k = rt_sub(std_length(v1212_cs), rt_i(1));
+  while (rt_cond(rt_b(rt_bool(rt_ge(v1213_k, rt_i(0)), "&&") && rt_bool(rt_ne(rt_idx(v1213_k, v1212_cs), rt_s(&S87)), "&&")))) {
+    v1213_k = rt_sub(v1213_k, rt_i(1));
   }
-  RT_RET(std_join(({ wv t2476 = v1211_cs; wv t2477 = rt_add(v1212_k, rt_i(1)); std_slice(t2476, rt_i(0), t2477); }), rt_s(&S13)));
+  RT_RET(std_join(({ wv t2486 = v1212_cs; wv t2487 = rt_add(v1213_k, rt_i(1)); std_slice(t2486, rt_i(0), t2487); }), rt_s(&S13)));
 }
 
-static wv w9_normalize(wv v1213_path) {
+static wv w9_normalize(wv v1214_path) {
   rt_enter("normalize");
-  v1213_path = rt_bind(v1213_path, 0);
-  wv v1214_segs = rt_bind(std_split(v1213_path, rt_s(&S87)), 0);
-  wv v1215_out = rt_arr(0, NULL, 1);
-  wv v1216_k = rt_i(0);
-  while (rt_cond(({ wv t2478 = v1216_k; wv t2479 = std_length(v1214_segs); rt_lt(t2478, t2479); }))) {
-    wv v1217_seg = rt_bind(rt_idx(v1216_k, v1214_segs), 0);
-    v1216_k = rt_add(v1216_k, rt_i(1));
-    if (rt_cond(rt_b(rt_bool(rt_eq(v1217_seg, rt_s(&S129)), "||") || rt_bool(rt_b(rt_bool(rt_eq(v1217_seg, rt_s(&S13)), "&&") && rt_bool(rt_gt(std_length(v1215_out), rt_i(0)), "&&")), "||")))) {
+  v1214_path = rt_bind(v1214_path, 0);
+  wv v1215_segs = rt_bind(std_split(v1214_path, rt_s(&S87)), 0);
+  wv v1216_out = rt_arr(0, NULL, 1);
+  wv v1217_k = rt_i(0);
+  while (rt_cond(({ wv t2488 = v1217_k; wv t2489 = std_length(v1215_segs); rt_lt(t2488, t2489); }))) {
+    wv v1218_seg = rt_bind(rt_idx(v1217_k, v1215_segs), 0);
+    v1217_k = rt_add(v1217_k, rt_i(1));
+    if (rt_cond(rt_b(rt_bool(rt_eq(v1218_seg, rt_s(&S129)), "||") || rt_bool(rt_b(rt_bool(rt_eq(v1218_seg, rt_s(&S13)), "&&") && rt_bool(rt_gt(std_length(v1216_out), rt_i(0)), "&&")), "||")))) {
       continue;
     }
-    if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(v1217_seg, rt_s(&S686)), "&&") && rt_bool(rt_gt(std_length(v1215_out), rt_i(0)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(rt_i(-1), v1215_out), rt_s(&S686)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(rt_i(-1), v1215_out), rt_s(&S13)), "&&")))) {
-      (void)std_pop(v1215_out);
+    if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(v1218_seg, rt_s(&S688)), "&&") && rt_bool(rt_gt(std_length(v1216_out), rt_i(0)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(rt_i(-1), v1216_out), rt_s(&S688)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(rt_i(-1), v1216_out), rt_s(&S13)), "&&")))) {
+      (void)std_pop(v1216_out);
     } else {
-      (void)std_push(v1215_out, v1217_seg);
+      (void)std_push(v1216_out, v1218_seg);
     }
   }
-  RT_RET(std_join(v1215_out, rt_s(&S87)));
+  RT_RET(std_join(v1216_out, rt_s(&S87)));
 }
 
-static wv w9_with(wv v1218_xs, wv v1219_x) {
+static wv w9_with(wv v1219_xs, wv v1220_x) {
   rt_enter("with");
-  v1218_xs = rt_bind(v1218_xs, 0);
-  v1219_x = rt_bind(v1219_x, 0);
-  wv v1220_out = rt_arr(0, NULL, 1);
-  wv v1221_k = rt_i(0);
-  while (rt_cond(({ wv t2480 = v1221_k; wv t2481 = std_length(v1218_xs); rt_lt(t2480, t2481); }))) {
-    (void)({ wv t2482 = v1220_out; wv t2483 = rt_idx(v1221_k, v1218_xs); std_push(t2482, t2483); });
-    v1221_k = rt_add(v1221_k, rt_i(1));
+  v1219_xs = rt_bind(v1219_xs, 0);
+  v1220_x = rt_bind(v1220_x, 0);
+  wv v1221_out = rt_arr(0, NULL, 1);
+  wv v1222_k = rt_i(0);
+  while (rt_cond(({ wv t2490 = v1222_k; wv t2491 = std_length(v1219_xs); rt_lt(t2490, t2491); }))) {
+    (void)({ wv t2492 = v1221_out; wv t2493 = rt_idx(v1222_k, v1219_xs); std_push(t2492, t2493); });
+    v1222_k = rt_add(v1222_k, rt_i(1));
   }
-  (void)std_push(v1220_out, v1219_x);
-  RT_RET(v1220_out);
+  (void)std_push(v1221_out, v1220_x);
+  RT_RET(v1221_out);
 }
 
-static wv w9_failIn(wv v1222_file, wv v1223_chars, wv v1224_pos, wv v1225_message) {
+static wv w9_failIn(wv v1223_file, wv v1224_chars, wv v1225_pos, wv v1226_message) {
   rt_enter("failIn");
-  v1222_file = rt_bind(v1222_file, 0);
-  v1223_chars = rt_bind(v1223_chars, 0);
-  v1224_pos = rt_bind(v1224_pos, 0);
-  v1225_message = rt_bind(v1225_message, 0);
-  (void)rt_chk(w2_setSource(v1222_file, v1223_chars), "failIn");
-  (void)rt_chk(w2_abort(v1224_pos, v1225_message), "failIn");
+  v1223_file = rt_bind(v1223_file, 0);
+  v1224_chars = rt_bind(v1224_chars, 0);
+  v1225_pos = rt_bind(v1225_pos, 0);
+  v1226_message = rt_bind(v1226_message, 0);
+  (void)rt_chk(w2_setSource(v1223_file, v1224_chars), "failIn");
+  (void)rt_chk(w2_abort(v1225_pos, v1226_message), "failIn");
   RT_RET(RT_NULL);
 }
 
-static wv w9_loadProgram(wv v1226_entryFile, wv v1227_entryChars) {
+static wv w9_loadProgram(wv v1227_entryFile, wv v1228_entryChars) {
   rt_enter("loadProgram");
   struct fr254 fr = { 0 };
-  v1226_entryFile = rt_bind(v1226_entryFile, 0);
-  fr.v1228_modules = rt_arr(0, NULL, 1);
-  wv v1231_path = rt_bind(rt_chk(w9_normalize(std_join(std_split(v1226_entryFile, rt_s(&S19)), rt_s(&S87))), "loadProgram"), 0);
-  (void)({ wv t2534 = v1226_entryFile; wv t2535 = v1227_entryChars; wv t2536 = v1231_path; wv t2537 = rt_arr(1, (wv[]){ v1231_path }, 0); rt_chk(s1230_visit(&fr, t2534, t2535, t2536, t2537), "loadProgram"); });
-  RT_RET(fr.v1228_modules);
+  v1227_entryFile = rt_bind(v1227_entryFile, 0);
+  fr.v1229_modules = rt_arr(0, NULL, 1);
+  wv v1232_path = rt_bind(rt_chk(w9_normalize(std_join(std_split(v1227_entryFile, rt_s(&S19)), rt_s(&S87))), "loadProgram"), 0);
+  (void)({ wv t2544 = v1227_entryFile; wv t2545 = v1228_entryChars; wv t2546 = v1232_path; wv t2547 = rt_arr(1, (wv[]){ v1232_path }, 0); rt_chk(s1231_visit(&fr, t2544, t2545, t2546, t2547), "loadProgram"); });
+  RT_RET(fr.v1229_modules);
 }
 
-static wv s1229_loaded(struct fr254 *up, wv v1232_path) {
+static wv s1230_loaded(struct fr254 *up, wv v1233_path) {
   rt_enter("loaded");
-  v1232_path = rt_bind(v1232_path, 0);
-  wv v1233_k = rt_i(0);
-  while (rt_cond(({ wv t2484 = v1233_k; wv t2485 = std_length(rt_def(up->v1228_modules, "modules")); rt_lt(t2484, t2485); }))) {
-    if (rt_cond(({ wv t2488 = rt_get(&F_path, ({ wv t2486 = v1233_k; wv t2487 = rt_def(up->v1228_modules, "modules"); rt_idx(t2486, t2487); })); wv t2489 = v1232_path; rt_eq(t2488, t2489); }))) {
-      RT_RET(v1233_k);
+  v1233_path = rt_bind(v1233_path, 0);
+  wv v1234_k = rt_i(0);
+  while (rt_cond(({ wv t2494 = v1234_k; wv t2495 = std_length(rt_def(up->v1229_modules, "modules")); rt_lt(t2494, t2495); }))) {
+    if (rt_cond(({ wv t2498 = rt_get(&F_path, ({ wv t2496 = v1234_k; wv t2497 = rt_def(up->v1229_modules, "modules"); rt_idx(t2496, t2497); })); wv t2499 = v1233_path; rt_eq(t2498, t2499); }))) {
+      RT_RET(v1234_k);
     }
-    v1233_k = rt_add(v1233_k, rt_i(1));
+    v1234_k = rt_add(v1234_k, rt_i(1));
   }
   RT_RET(RT_NULL);
 }
 
-static wv s1230_visit(struct fr254 *up, wv v1234_file, wv v1235_chars, wv v1236_path, wv v1237_chain) {
+static wv s1231_visit(struct fr254 *up, wv v1235_file, wv v1236_chars, wv v1237_path, wv v1238_chain) {
   rt_enter("visit");
-  v1234_file = rt_bind(v1234_file, 0);
-  v1235_chars = rt_bind(v1235_chars, 0);
-  v1236_path = rt_bind(v1236_path, 0);
-  v1237_chain = rt_bind(v1237_chain, 0);
-  (void)rt_chk(w2_setSource(v1234_file, v1235_chars), "visit");
-  wv v1238_program = rt_bind(rt_chk(w4_parse(rt_chk(w3_lex(v1235_chars), "visit")), "visit"), 0);
-  wv v1239_imports = rt_arr(0, NULL, 1);
-  wv v1240_k = rt_i(0);
-  while (rt_cond(({ wv t2490 = v1240_k; wv t2491 = std_length(rt_get(&F_stmts, v1238_program)); rt_lt(t2490, t2491); }))) {
-    wv v1243_s = rt_bind(({ wv t2492 = v1240_k; wv t2493 = rt_get(&F_stmts, v1238_program); rt_idx(t2492, t2493); }), 0);
-    v1240_k = rt_add(v1240_k, rt_i(1));
-    if (rt_cond(rt_ne(rt_get(&F_k, v1243_s), rt_s(&S47)))) {
+  v1235_file = rt_bind(v1235_file, 0);
+  v1236_chars = rt_bind(v1236_chars, 0);
+  v1237_path = rt_bind(v1237_path, 0);
+  v1238_chain = rt_bind(v1238_chain, 0);
+  (void)rt_chk(w2_setSource(v1235_file, v1236_chars), "visit");
+  wv v1239_program = rt_bind(rt_chk(w4_parse(rt_chk(w3_lex(v1236_chars), "visit")), "visit"), 0);
+  wv v1240_imports = rt_arr(0, NULL, 1);
+  wv v1241_k = rt_i(0);
+  while (rt_cond(({ wv t2500 = v1241_k; wv t2501 = std_length(rt_get(&F_stmts, v1239_program)); rt_lt(t2500, t2501); }))) {
+    wv v1244_s = rt_bind(({ wv t2502 = v1241_k; wv t2503 = rt_get(&F_stmts, v1239_program); rt_idx(t2502, t2503); }), 0);
+    v1241_k = rt_add(v1241_k, rt_i(1));
+    if (rt_cond(rt_ne(rt_get(&F_k, v1244_s), rt_s(&S47)))) {
       continue;
     }
-    wv v1244_libPath = rt_bind(rt_chk(w9_normalize(({ wv t2494 = rt_chk(w9_dirOf(v1236_path), "visit"); wv t2495 = rt_get(&F_path, v1243_s); rt_add(t2494, t2495); })), "visit"), 0);
-    wv v1245_at = rt_i(0);
-    while (rt_cond(rt_b(rt_bool(({ wv t2496 = v1245_at; wv t2497 = std_length(v1237_chain); rt_lt(t2496, t2497); }), "&&") && rt_bool(({ wv t2498 = rt_idx(v1245_at, v1237_chain); wv t2499 = v1244_libPath; rt_ne(t2498, t2499); }), "&&")))) {
-      v1245_at = rt_add(v1245_at, rt_i(1));
+    wv v1245_libPath = rt_bind(rt_chk(w9_normalize(({ wv t2504 = rt_chk(w9_dirOf(v1237_path), "visit"); wv t2505 = rt_get(&F_path, v1244_s); rt_add(t2504, t2505); })), "visit"), 0);
+    wv v1246_at = rt_i(0);
+    while (rt_cond(rt_b(rt_bool(({ wv t2506 = v1246_at; wv t2507 = std_length(v1238_chain); rt_lt(t2506, t2507); }), "&&") && rt_bool(({ wv t2508 = rt_idx(v1246_at, v1238_chain); wv t2509 = v1245_libPath; rt_ne(t2508, t2509); }), "&&")))) {
+      v1246_at = rt_add(v1246_at, rt_i(1));
     }
-    if (rt_cond(({ wv t2500 = v1245_at; wv t2501 = std_length(v1237_chain); rt_lt(t2500, t2501); }))) {
-      wv v1247_cycle = rt_bind(({ wv t2505 = ({ wv t2502 = v1237_chain; wv t2503 = v1245_at; wv t2504 = std_length(v1237_chain); std_slice(t2502, t2503, t2504); }); wv t2506 = v1244_libPath; rt_chk(w9_with(t2505, t2506), "visit"); }), 0);
-      (void)({ wv t2507 = v1234_file; wv t2508 = v1235_chars; wv t2509 = rt_get(&F_pathPos, v1243_s); wv t2510 = rt_cat(2, (wv[]){ rt_s(&S687), rt_text(std_join(v1247_cycle, rt_s(&S688))) }); rt_chk(w9_failIn(t2507, t2508, t2509, t2510), "visit"); });
+    if (rt_cond(({ wv t2510 = v1246_at; wv t2511 = std_length(v1238_chain); rt_lt(t2510, t2511); }))) {
+      wv v1248_cycle = rt_bind(({ wv t2515 = ({ wv t2512 = v1238_chain; wv t2513 = v1246_at; wv t2514 = std_length(v1238_chain); std_slice(t2512, t2513, t2514); }); wv t2516 = v1245_libPath; rt_chk(w9_with(t2515, t2516), "visit"); }), 0);
+      (void)({ wv t2517 = v1235_file; wv t2518 = v1236_chars; wv t2519 = rt_get(&F_pathPos, v1244_s); wv t2520 = rt_cat(2, (wv[]){ rt_s(&S689), rt_text(std_join(v1248_cycle, rt_s(&S690))) }); rt_chk(w9_failIn(t2517, t2518, t2519, t2520), "visit"); });
     }
-    wv v1246_lib = rt_bind(rt_chk(s1229_loaded(up, v1244_libPath), "visit"), 1);
-    if (rt_cond(rt_eq(v1246_lib, RT_NULL))) {
-      wv t2511 = std_readFile(v1244_libPath);
+    wv v1247_lib = rt_bind(rt_chk(s1230_loaded(up, v1245_libPath), "visit"), 1);
+    if (rt_cond(rt_eq(v1247_lib, RT_NULL))) {
+      wv t2521 = std_readFile(v1245_libPath);
       if (rt_failcode) {
         rt_failcode = 0;
         {
-          (void)({ wv t2512 = v1234_file; wv t2513 = v1235_chars; wv t2514 = rt_get(&F_pathPos, v1243_s); wv t2515 = rt_cat(3, (wv[]){ rt_s(&S689), rt_text(v1244_libPath), rt_s(&S113) }); rt_chk(w9_failIn(t2512, t2513, t2514, t2515), "visit"); });
-          t2511 = RT_NULL;
+          (void)({ wv t2522 = v1235_file; wv t2523 = v1236_chars; wv t2524 = rt_get(&F_pathPos, v1244_s); wv t2525 = rt_cat(3, (wv[]){ rt_s(&S691), rt_text(v1245_libPath), rt_s(&S113) }); rt_chk(w9_failIn(t2522, t2523, t2524, t2525), "visit"); });
+          t2521 = RT_NULL;
         }
       }
-      wv v1248_text = rt_bind(t2511, 0);
-      wv v1249_cs = rt_bind(std_split(v1248_text, rt_s(&S13)), 0);
-      wv v1250_bom = rt_bind((rt_cond(rt_b(rt_bool(rt_gt(std_length(v1249_cs), rt_i(0)), "&&") && rt_bool(rt_eq(rt_idx(rt_i(0), v1249_cs), rt_s(&S690)), "&&"))) ? rt_i(1) : rt_i(0)), 0);
-      v1246_lib = rt_bind(({ wv t2519 = v1244_libPath; wv t2520 = ({ wv t2516 = v1249_cs; wv t2517 = v1250_bom; wv t2518 = std_length(v1249_cs); std_slice(t2516, t2517, t2518); }); wv t2521 = v1244_libPath; wv t2522 = rt_chk(w9_with(v1237_chain, v1244_libPath), "visit"); rt_chk(s1230_visit(up, t2519, t2520, t2521, t2522), "visit"); }), 1);
+      wv v1249_text = rt_bind(t2521, 0);
+      wv v1250_cs = rt_bind(std_split(v1249_text, rt_s(&S13)), 0);
+      wv v1251_bom = rt_bind((rt_cond(rt_b(rt_bool(rt_gt(std_length(v1250_cs), rt_i(0)), "&&") && rt_bool(rt_eq(rt_idx(rt_i(0), v1250_cs), rt_s(&S692)), "&&"))) ? rt_i(1) : rt_i(0)), 0);
+      v1247_lib = rt_bind(({ wv t2529 = v1245_libPath; wv t2530 = ({ wv t2526 = v1250_cs; wv t2527 = v1251_bom; wv t2528 = std_length(v1250_cs); std_slice(t2526, t2527, t2528); }); wv t2531 = v1245_libPath; wv t2532 = rt_chk(w9_with(v1238_chain, v1245_libPath), "visit"); rt_chk(s1231_visit(up, t2529, t2530, t2531, t2532), "visit"); }), 1);
     }
-    (void)({ wv t2523 = v1239_imports; wv t2524 = rt_rec(0, 2, K58, (wv[]){ v1243_s, v1246_lib }); std_push(t2523, t2524); });
+    (void)({ wv t2533 = v1240_imports; wv t2534 = rt_rec(0, 2, K58, (wv[]){ v1244_s, v1247_lib }); std_push(t2533, t2534); });
   }
-  wv v1241_refTargets = rt_arr(0, NULL, 1);
-  wv v1242_mod = ({ wv t2525 = v1234_file; wv t2526 = v1235_chars; wv t2527 = v1236_path; wv t2528 = v1238_program; wv t2529 = v1239_imports; wv t2530 = rt_arr(0, NULL, 0); wv t2531 = v1241_refTargets; rt_rec(1, 8, K59, (wv[]){ t2525, t2526, t2527, t2528, t2529, t2530, rt_b(0), t2531 }); });
-  (void)({ wv t2532 = rt_def(up->v1228_modules, "modules"); wv t2533 = v1242_mod; std_push(t2532, t2533); });
-  RT_RET(rt_sub(std_length(rt_def(up->v1228_modules, "modules")), rt_i(1)));
+  wv v1242_refTargets = rt_arr(0, NULL, 1);
+  wv v1243_mod = ({ wv t2535 = v1235_file; wv t2536 = v1236_chars; wv t2537 = v1237_path; wv t2538 = v1239_program; wv t2539 = v1240_imports; wv t2540 = rt_arr(0, NULL, 0); wv t2541 = v1242_refTargets; rt_rec(1, 8, K59, (wv[]){ t2535, t2536, t2537, t2538, t2539, t2540, rt_b(0), t2541 }); });
+  (void)({ wv t2542 = rt_def(up->v1229_modules, "modules"); wv t2543 = v1243_mod; std_push(t2542, t2543); });
+  RT_RET(rt_sub(std_length(rt_def(up->v1229_modules, "modules")), rt_i(1)));
 }
 
 static wv w_die(void) {
@@ -9220,76 +9558,77 @@ static wv w_die(void) {
   RT_RET(RT_NULL);
 }
 
-static wv w_load(wv v1251_file) {
+static wv w_load(wv v1252_file) {
   rt_enter("load");
-  v1251_file = rt_bind(v1251_file, 0);
-  wv t2538 = std_readFile(v1251_file);
+  v1252_file = rt_bind(v1252_file, 0);
+  wv t2548 = std_readFile(v1252_file);
   if (rt_failcode) {
     rt_failcode = 0;
     {
-      (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S697), rt_text(v1251_file) }));
+      (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S699), rt_text(v1252_file) }));
       rt_exit(rt_i(2));
-      t2538 = RT_NULL;
+      t2548 = RT_NULL;
     }
   }
-  wv v1252_text = rt_bind(t2538, 0);
-  wv v1253_chars = rt_bind(std_split(v1252_text, rt_s(&S13)), 0);
-  wv v1254_bom = rt_bind((rt_cond(rt_b(rt_bool(rt_gt(std_length(v1253_chars), rt_i(0)), "&&") && rt_bool(rt_eq(rt_idx(rt_i(0), v1253_chars), rt_s(&S690)), "&&"))) ? rt_i(1) : rt_i(0)), 0);
-  (void)({ wv t2542 = v1251_file; wv t2543 = ({ wv t2539 = v1253_chars; wv t2540 = v1254_bom; wv t2541 = std_length(v1253_chars); std_slice(t2539, t2540, t2541); }); rt_chk(w2_setSource(t2542, t2543), "load"); });
+  wv v1253_text = rt_bind(t2548, 0);
+  wv v1254_chars = rt_bind(std_split(v1253_text, rt_s(&S13)), 0);
+  wv v1255_bom = rt_bind((rt_cond(rt_b(rt_bool(rt_gt(std_length(v1254_chars), rt_i(0)), "&&") && rt_bool(rt_eq(rt_idx(rt_i(0), v1254_chars), rt_s(&S692)), "&&"))) ? rt_i(1) : rt_i(0)), 0);
+  (void)({ wv t2552 = v1252_file; wv t2553 = ({ wv t2549 = v1254_chars; wv t2550 = v1255_bom; wv t2551 = std_length(v1254_chars); std_slice(t2549, t2550, t2551); }); rt_chk(w2_setSource(t2552, t2553), "load"); });
   RT_RET(RT_NULL);
 }
 
 static wv w_onWindows(void) {
   rt_enter("onWindows");
-  wv t2548 = rt_s(&S707);
-  wv t2549 = std_env(t2548);
+  wv t2558 = rt_s(&S709);
+  wv t2559 = std_env(t2558);
   if (rt_failcode) {
     rt_failcode = 0;
     {
-      t2549 = rt_s(&S13);
+      t2559 = rt_s(&S13);
     }
   }
-  wv v1256_os = rt_bind(t2549, 0);
-  RT_RET(rt_eq(v1256_os, rt_s(&S708)));
+  wv v1257_os = rt_bind(t2559, 0);
+  RT_RET(rt_eq(v1257_os, rt_s(&S710)));
 }
 
-static wv w_tryRead(wv v1257_path) {
+static wv w_tryRead(wv v1258_path) {
   rt_enter("tryRead");
-  v1257_path = rt_bind(v1257_path, 0);
-  wv t2556 = std_readFile(v1257_path);
+  v1258_path = rt_bind(v1258_path, 0);
+  wv t2566 = std_readFile(v1258_path);
   if (rt_failcode) {
     rt_failcode = 0;
     {
-      t2556 = RT_NULL;
+      t2566 = RT_NULL;
     }
   }
-  wv v1258_text = rt_bind(t2556, 0);
-  RT_RET(v1258_text);
+  wv v1259_text = rt_bind(t2566, 0);
+  RT_RET(v1259_text);
 }
 
 static wv w_programDir(void) {
   rt_enter("programDir");
-  wv v1259_cs = rt_bind(std_split(std_programPath(), rt_s(&S13)), 0);
-  wv v1260_k = rt_sub(std_length(v1259_cs), rt_i(1));
-  while (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_ge(v1260_k, rt_i(0)), "&&") && rt_bool(rt_ne(rt_idx(v1260_k, v1259_cs), rt_s(&S87)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(v1260_k, v1259_cs), rt_s(&S19)), "&&")))) {
-    v1260_k = rt_sub(v1260_k, rt_i(1));
+  wv v1260_cs = rt_bind(std_split(std_programPath(), rt_s(&S13)), 0);
+  wv v1261_k = rt_sub(std_length(v1260_cs), rt_i(1));
+  while (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_ge(v1261_k, rt_i(0)), "&&") && rt_bool(rt_ne(rt_idx(v1261_k, v1260_cs), rt_s(&S87)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(v1261_k, v1260_cs), rt_s(&S19)), "&&")))) {
+    v1261_k = rt_sub(v1261_k, rt_i(1));
   }
-  RT_RET(std_join(({ wv t2557 = v1259_cs; wv t2558 = rt_add(v1260_k, rt_i(1)); std_slice(t2557, rt_i(0), t2558); }), rt_s(&S13)));
+  RT_RET(std_join(({ wv t2567 = v1260_cs; wv t2568 = rt_add(v1261_k, rt_i(1)); std_slice(t2567, rt_i(0), t2568); }), rt_s(&S13)));
 }
 
 static wv w_readRuntime(void) {
   rt_enter("readRuntime");
-  wv v1261_text = rt_bind(rt_chk(w_tryRead(rt_def(w_runtimePath, "runtimePath")), "readRuntime"), 0);
-  if (rt_cond(rt_b(rt_bool(rt_ne(v1261_text, RT_NULL), "||") || rt_bool(rt_def(w_runtimeGiven, "runtimeGiven"), "||")))) {
-    RT_RET(v1261_text);
+  wv v1262_text = rt_bind(rt_chk(w_tryRead(rt_def(w_runtimePath, "runtimePath")), "readRuntime"), 0);
+  if (rt_cond(rt_b(rt_bool(rt_ne(v1262_text, RT_NULL), "||") || rt_bool(rt_def(w_runtimeGiven, "runtimeGiven"), "||")))) {
+    RT_RET(v1262_text);
   }
-  wv v1262_dir = rt_bind(rt_chk(w_programDir(), "readRuntime"), 0);
-  wv v1263_here = rt_bind(rt_chk(w_tryRead(({ wv t2559 = v1262_dir; wv t2560 = rt_def(w_runtimePath, "runtimePath"); rt_add(t2559, t2560); })), "readRuntime"), 0);
-  RT_RET((rt_cond(rt_ne(v1263_here, RT_NULL)) ? v1263_here : rt_chk(w_tryRead(({ wv t2561 = rt_add(v1262_dir, rt_s(&S716)); wv t2562 = rt_def(w_runtimePath, "runtimePath"); rt_add(t2561, t2562); })), "readRuntime")));
+  wv v1263_dir = rt_bind(rt_chk(w_programDir(), "readRuntime"), 0);
+  wv v1264_here = rt_bind(rt_chk(w_tryRead(({ wv t2569 = v1263_dir; wv t2570 = rt_def(w_runtimePath, "runtimePath"); rt_add(t2569, t2570); })), "readRuntime"), 0);
+  RT_RET((rt_cond(rt_ne(v1264_here, RT_NULL)) ? v1264_here : rt_chk(w_tryRead(({ wv t2571 = rt_add(v1263_dir, rt_s(&S718)); wv t2572 = rt_def(w_runtimePath, "runtimePath"); rt_add(t2571, t2572); })), "readRuntime")));
 }
 
 static void wvt_main(void) {
   rt_syms(88, (wstr *const[]){ &F_severity, &F_pos, &F_message, &F_hint, &F_file, &F_chars, &F_word, &F_t, &F_end, &F_sp, &F_nl, &F_v, &F_text, &F_parts, &F_tokens, &F_k, &F_e, &F_handler, &F_items, &F_fields, &F_index, &F_arr, &F_rec, &F_l, &F_r, &F_c, &F_a, &F_b, &F_stmts, &F_param, &F_paramPos, &F_body, &F_neg, &F_cond, &F_isVar, &F_isRef, &F_name, &F_namePos, &F_op, &F_target, &F_code, &F_arg, &F_paren, &F_path, &F_pathPos, &F_names, &F_params, &F_members, &F_value, &F_close, &F_field, &F_callee, &F_args, &F_values, &F_subject, &F_cases, &F_els, &F_branches, &F_arity, &F_mod, &F_parent, &F_kind, &F_visibleAt, &F_fnId, &F_lib, &F_id, &F_func, &F_top, &F_loops, &F_key, &F_exports, &F_refTargets, &F_useMod, &F_imports, &F_node, &F_notLibrary, &F_program, &F_js, &F_children, &F_d, &F_depth, &F_cname, &F_captured, &F_fnIndex, &F_pre, &F_cs, &F_proto, &F_lines });
+  rt_roots(55, (wv *const[]){ &w2_srcFile, &w2_srcChars, &w2_warnings, &w3_keywords, &w3_reserved, &w3_bangWords, &w3_setOps, &w3_ops, &w3_maxInt, &w4_exprStart, &w4_onfailOk, &w4_callees, &w4_exportable, &w5_stdlib, &w5_neverCompletes, &w5_onfailValueUsed, &w5_libraryTop, &w6_binOps, &w6_binFns, &w6_scalarKinds, &w6_plainKinds, &w7_binOps, &w7_binFns, &w7_scalarKinds, &w7_plainKinds, &w7_signalers, &w7_constK, &w7_pureK, &w7_effectK, &w_usage, &w_argv, &w_mode, &w_input, &w_output, &w_target, &w_runtimePath, &w_cc, &w_arg, &w_inspect, &w_dotWvt, &w_runtimeGiven, &w_modules, &w_problems, &w_runtime, &w_code, &w_dotExe, &w_cFile, &w_parts, &w_ccName, &w_flags, &w_status, &v1256_a, &v1265_tokens, &v1266_program, &v1267_p });
   w2_srcFile = rt_s(&S13);
   w2_srcChars = rt_arr(0, NULL, 0);
   w2_warnings = rt_arr(0, NULL, 1);
@@ -9319,7 +9658,7 @@ static void wvt_main(void) {
   w7_constK = rt_i(0);
   w7_pureK = rt_i(1);
   w7_effectK = rt_i(2);
-  w_usage = rt_add(rt_add(rt_add(rt_add(rt_add(rt_s(&S691), rt_s(&S692)), rt_s(&S693)), rt_s(&S694)), rt_s(&S695)), rt_s(&S696));
+  w_usage = rt_add(rt_add(rt_add(rt_add(rt_add(rt_s(&S693), rt_s(&S694)), rt_s(&S695)), rt_s(&S696)), rt_s(&S697)), rt_s(&S698));
   w_argv = rt_bind(std_args(), 0);
   w_mode = rt_s(&S13);
   w_input = rt_s(&S13);
@@ -9328,143 +9667,143 @@ static void wvt_main(void) {
   w_runtimePath = rt_s(&S13);
   w_cc = rt_s(&S13);
   w_arg = rt_i(0);
-  while (rt_cond(({ wv t2544 = w_arg; wv t2545 = std_length(w_argv); rt_lt(t2544, t2545); }))) {
-    v1255_a = rt_bind(rt_idx(w_arg, w_argv), 0);
-    if (rt_cond(rt_b(rt_bool(rt_eq(w_arg, rt_i(0)), "&&") && rt_bool(rt_eq(v1255_a, rt_s(&S698)), "&&")))) {
-      w_mode = rt_bind(v1255_a, 1);
-    } else if (rt_cond(rt_b(rt_bool(rt_eq(v1255_a, rt_s(&S699)), "||") || rt_bool(rt_eq(v1255_a, rt_s(&S700)), "||")))) {
-      w_mode = rt_bind(v1255_a, 1);
-    } else if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(v1255_a, rt_s(&S701)), "||") || rt_bool(rt_eq(v1255_a, rt_s(&S702)), "||")), "||") || rt_bool(rt_eq(v1255_a, rt_s(&S703)), "||")), "||") || rt_bool(rt_eq(v1255_a, rt_s(&S704)), "||")))) {
+  while (rt_cond(({ wv t2554 = w_arg; wv t2555 = std_length(w_argv); rt_lt(t2554, t2555); }))) {
+    v1256_a = rt_bind(rt_idx(w_arg, w_argv), 0);
+    if (rt_cond(rt_b(rt_bool(rt_eq(w_arg, rt_i(0)), "&&") && rt_bool(rt_eq(v1256_a, rt_s(&S700)), "&&")))) {
+      w_mode = rt_bind(v1256_a, 1);
+    } else if (rt_cond(rt_b(rt_bool(rt_eq(v1256_a, rt_s(&S701)), "||") || rt_bool(rt_eq(v1256_a, rt_s(&S702)), "||")))) {
+      w_mode = rt_bind(v1256_a, 1);
+    } else if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(v1256_a, rt_s(&S703)), "||") || rt_bool(rt_eq(v1256_a, rt_s(&S704)), "||")), "||") || rt_bool(rt_eq(v1256_a, rt_s(&S705)), "||")), "||") || rt_bool(rt_eq(v1256_a, rt_s(&S706)), "||")))) {
       w_arg = rt_add(w_arg, rt_i(1));
-      if (rt_cond(({ wv t2546 = w_arg; wv t2547 = std_length(w_argv); rt_ge(t2546, t2547); }))) {
+      if (rt_cond(({ wv t2556 = w_arg; wv t2557 = std_length(w_argv); rt_ge(t2556, t2557); }))) {
         (void)rt_chk(w_die(), NULL);
       }
-      if (rt_cond(rt_eq(v1255_a, rt_s(&S701)))) {
+      if (rt_cond(rt_eq(v1256_a, rt_s(&S703)))) {
         w_output = rt_bind(rt_idx(w_arg, w_argv), 1);
-      } else if (rt_cond(rt_eq(v1255_a, rt_s(&S702)))) {
+      } else if (rt_cond(rt_eq(v1256_a, rt_s(&S704)))) {
         w_runtimePath = rt_bind(rt_idx(w_arg, w_argv), 1);
-      } else if (rt_cond(rt_eq(v1255_a, rt_s(&S704)))) {
+      } else if (rt_cond(rt_eq(v1256_a, rt_s(&S706)))) {
         w_cc = rt_bind(rt_idx(w_arg, w_argv), 1);
-      } else if (rt_cond(rt_b(rt_bool(rt_eq(rt_idx(w_arg, w_argv), rt_s(&S705)), "||") || rt_bool(rt_eq(rt_idx(w_arg, w_argv), rt_s(&S706)), "||")))) {
+      } else if (rt_cond(rt_b(rt_bool(rt_eq(rt_idx(w_arg, w_argv), rt_s(&S707)), "||") || rt_bool(rt_eq(rt_idx(w_arg, w_argv), rt_s(&S708)), "||")))) {
         w_target = rt_bind(rt_idx(w_arg, w_argv), 1);
       } else {
         (void)rt_chk(w_die(), NULL);
       }
-    } else if (rt_cond(rt_b(rt_bool(rt_ne(w_input, rt_s(&S13)), "||") || rt_bool(rt_b(rt_bool(rt_gt(std_length(v1255_a), rt_i(0)), "&&") && rt_bool(rt_eq(std_at(v1255_a, rt_i(0)), rt_s(&S85)), "&&")), "||")))) {
+    } else if (rt_cond(rt_b(rt_bool(rt_ne(w_input, rt_s(&S13)), "||") || rt_bool(rt_b(rt_bool(rt_gt(std_length(v1256_a), rt_i(0)), "&&") && rt_bool(rt_eq(std_at(v1256_a, rt_i(0)), rt_s(&S85)), "&&")), "||")))) {
       (void)rt_chk(w_die(), NULL);
     } else {
-      w_input = rt_bind(v1255_a, 1);
+      w_input = rt_bind(v1256_a, 1);
     }
     w_arg = rt_add(w_arg, rt_i(1));
   }
-  w_inspect = rt_b(rt_bool(rt_eq(w_mode, rt_s(&S699)), "||") || rt_bool(rt_eq(w_mode, rt_s(&S700)), "||"));
-  if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(w_input, rt_s(&S13)), "||") || rt_bool(rt_b(rt_bool(w_inspect, "&&") && rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_ne(w_output, rt_s(&S13)), "||") || rt_bool(rt_ne(w_runtimePath, rt_s(&S13)), "||")), "||") || rt_bool(rt_ne(w_target, rt_s(&S13)), "||")), "&&")), "||")), "||") || rt_bool(rt_b(rt_bool(rt_eq(w_mode, rt_s(&S698)), "&&") && rt_bool(rt_ne(w_target, rt_s(&S13)), "&&")), "||")), "||") || rt_bool(rt_b(rt_bool(rt_ne(w_mode, rt_s(&S698)), "&&") && rt_bool(rt_ne(w_cc, rt_s(&S13)), "&&")), "||")))) {
+  w_inspect = rt_b(rt_bool(rt_eq(w_mode, rt_s(&S701)), "||") || rt_bool(rt_eq(w_mode, rt_s(&S702)), "||"));
+  if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(w_input, rt_s(&S13)), "||") || rt_bool(rt_b(rt_bool(w_inspect, "&&") && rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_ne(w_output, rt_s(&S13)), "||") || rt_bool(rt_ne(w_runtimePath, rt_s(&S13)), "||")), "||") || rt_bool(rt_ne(w_target, rt_s(&S13)), "||")), "&&")), "||")), "||") || rt_bool(rt_b(rt_bool(rt_eq(w_mode, rt_s(&S700)), "&&") && rt_bool(rt_ne(w_target, rt_s(&S13)), "&&")), "||")), "||") || rt_bool(rt_b(rt_bool(rt_ne(w_mode, rt_s(&S700)), "&&") && rt_bool(rt_ne(w_cc, rt_s(&S13)), "&&")), "||")))) {
     (void)rt_chk(w_die(), NULL);
   }
-  w_dotWvt = rt_b(rt_bool(rt_ge(std_length(w_input), rt_i(4)), "&&") && rt_bool(rt_eq(({ wv t2550 = w_input; wv t2551 = std_length(w_input); std_slice(t2550, rt_i(-4), t2551); }), rt_s(&S232)), "&&"));
-  if (rt_cond(rt_eq(w_mode, rt_s(&S698)))) {
-    w_target = rt_s(&S706);
+  w_dotWvt = rt_b(rt_bool(rt_ge(std_length(w_input), rt_i(4)), "&&") && rt_bool(rt_eq(({ wv t2560 = w_input; wv t2561 = std_length(w_input); std_slice(t2560, rt_i(-4), t2561); }), rt_s(&S232)), "&&"));
+  if (rt_cond(rt_eq(w_mode, rt_s(&S700)))) {
+    w_target = rt_s(&S708);
     if (rt_cond(rt_eq(w_cc, rt_s(&S13)))) {
-      wv t2552 = rt_s(&S709);
-      wv t2553 = std_env(t2552);
+      wv t2562 = rt_s(&S711);
+      wv t2563 = std_env(t2562);
       if (rt_failcode) {
         rt_failcode = 0;
         {
-          t2553 = rt_s(&S710);
+          t2563 = rt_s(&S712);
         }
       }
-      w_cc = rt_bind(t2553, 1);
+      w_cc = rt_bind(t2563, 1);
     }
     if (rt_cond(rt_b(rt_bool(rt_eq(w_output, rt_s(&S13)), "&&") && rt_bool(rt_not(w_dotWvt), "&&")))) {
-      (void)std_eprint(rt_cat(3, (wv[]){ rt_s(&S711), rt_text(w_input), rt_s(&S712) }));
+      (void)std_eprint(rt_cat(3, (wv[]){ rt_s(&S713), rt_text(w_input), rt_s(&S714) }));
       rt_exit(rt_i(2));
     }
     if (rt_cond(rt_eq(w_output, rt_s(&S13)))) {
-      w_output = ({ wv t2554 = std_slice(w_input, rt_i(0), rt_i(-4)); wv t2555 = (rt_cond(rt_chk(w_onWindows(), NULL)) ? rt_s(&S713) : rt_s(&S13)); rt_add(t2554, t2555); });
+      w_output = ({ wv t2564 = std_slice(w_input, rt_i(0), rt_i(-4)); wv t2565 = (rt_cond(rt_chk(w_onWindows(), NULL)) ? rt_s(&S715) : rt_s(&S13)); rt_add(t2564, t2565); });
     }
   }
   if (rt_cond(rt_eq(w_target, rt_s(&S13)))) {
-    w_target = rt_s(&S706);
+    w_target = rt_s(&S708);
   }
   w_runtimeGiven = rt_ne(w_runtimePath, rt_s(&S13));
   if (rt_cond(rt_not(w_runtimeGiven))) {
-    w_runtimePath = rt_bind((rt_cond(rt_eq(w_target, rt_s(&S706))) ? rt_s(&S714) : rt_s(&S715)), 1);
+    w_runtimePath = rt_bind((rt_cond(rt_eq(w_target, rt_s(&S708))) ? rt_s(&S716) : rt_s(&S717)), 1);
   }
   (void)rt_chk(w_load(w_input), NULL);
-  if (rt_cond(rt_eq(w_mode, rt_s(&S699)))) {
-    v1264_tokens = rt_bind(rt_chk(w3_lex(w2_srcChars), NULL), 0);
+  if (rt_cond(rt_eq(w_mode, rt_s(&S701)))) {
+    v1265_tokens = rt_bind(rt_chk(w3_lex(w2_srcChars), NULL), 0);
     (void)rt_chk(w2_flushWarnings(), NULL);
-    (void)rt_chk(w8_dumpTokens(v1264_tokens, rt_s(&S13)), NULL);
+    (void)rt_chk(w8_dumpTokens(v1265_tokens, rt_s(&S13)), NULL);
     rt_exit(rt_i(0));
   }
-  if (rt_cond(rt_eq(w_mode, rt_s(&S700)))) {
-    v1265_program = rt_bind(rt_chk(w4_parse(rt_chk(w3_lex(w2_srcChars), NULL)), NULL), 0);
+  if (rt_cond(rt_eq(w_mode, rt_s(&S702)))) {
+    v1266_program = rt_bind(rt_chk(w4_parse(rt_chk(w3_lex(w2_srcChars), NULL)), NULL), 0);
     (void)rt_chk(w2_flushWarnings(), NULL);
-    (void)std_print(rt_chk(w8_dumpValue(v1265_program, rt_s(&S13)), NULL));
+    (void)std_print(rt_chk(w8_dumpValue(v1266_program, rt_s(&S13)), NULL));
     rt_exit(rt_i(0));
   }
   w_modules = rt_bind(rt_chk(w9_loadProgram(w2_srcFile, w2_srcChars), NULL), 0);
   w_problems = rt_bind(rt_chk(w5_check(w_modules, rt_b(1)), NULL), 0);
   if (rt_cond(rt_gt(std_length(w_problems), rt_i(0)))) {
     (void)rt_chk(w2_flushWarnings(), NULL);
-    v1266_p = rt_i(0);
-    while (rt_cond(({ wv t2563 = v1266_p; wv t2564 = std_length(w_problems); rt_lt(t2563, t2564); }))) {
-      (void)std_eprint(rt_chk(w2_formatDiag(rt_idx(v1266_p, w_problems)), NULL));
-      v1266_p = rt_add(v1266_p, rt_i(1));
+    v1267_p = rt_i(0);
+    while (rt_cond(({ wv t2573 = v1267_p; wv t2574 = std_length(w_problems); rt_lt(t2573, t2574); }))) {
+      (void)std_eprint(rt_chk(w2_formatDiag(rt_idx(v1267_p, w_problems)), NULL));
+      v1267_p = rt_add(v1267_p, rt_i(1));
     }
     rt_exit(rt_i(2));
   }
   w_runtime = rt_bind(rt_chk(w_readRuntime(), NULL), 0);
   if (rt_cond(rt_eq(w_runtime, RT_NULL))) {
-    (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S697), rt_text(w_runtimePath) }));
+    (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S699), rt_text(w_runtimePath) }));
     rt_exit(rt_i(2));
   }
-  w_code = rt_bind((rt_cond(rt_eq(w_target, rt_s(&S706))) ? rt_chk(w7_generateC(w_modules, w_runtime), NULL) : rt_chk(w6_generate(w_modules, w_runtime), NULL)), 0);
+  w_code = rt_bind((rt_cond(rt_eq(w_target, rt_s(&S708))) ? rt_chk(w7_generateC(w_modules, w_runtime), NULL) : rt_chk(w6_generate(w_modules, w_runtime), NULL)), 0);
   (void)rt_chk(w2_flushWarnings(), NULL);
-  if (rt_cond(rt_ne(w_mode, rt_s(&S698)))) {
+  if (rt_cond(rt_ne(w_mode, rt_s(&S700)))) {
     if (rt_cond(rt_eq(w_output, rt_s(&S13)))) {
-      w_output = ({ wv t2565 = (rt_cond(w_dotWvt) ? std_slice(w_input, rt_i(0), rt_i(-4)) : w_input); wv t2566 = rt_cat(2, (wv[]){ rt_s(&S129), rt_text(w_target) }); rt_add(t2565, t2566); });
+      w_output = ({ wv t2575 = (rt_cond(w_dotWvt) ? std_slice(w_input, rt_i(0), rt_i(-4)) : w_input); wv t2576 = rt_cat(2, (wv[]){ rt_s(&S129), rt_text(w_target) }); rt_add(t2575, t2576); });
     }
-    wv t2567 = std_writeFile(w_output, w_code);
+    wv t2577 = std_writeFile(w_output, w_code);
     if (rt_failcode) {
       rt_failcode = 0;
       {
-        (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S717), rt_text(w_output) }));
+        (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S719), rt_text(w_output) }));
         rt_exit(rt_i(2));
-        t2567 = RT_NULL;
+        t2577 = RT_NULL;
       }
     }
-    (void)t2567;
+    (void)t2577;
     rt_exit(rt_i(0));
   }
-  w_dotExe = rt_b(rt_bool(rt_ge(std_length(w_output), rt_i(4)), "&&") && rt_bool(rt_eq(rt_chk(w1_toLower(({ wv t2568 = w_output; wv t2569 = std_length(w_output); std_slice(t2568, rt_i(-4), t2569); })), NULL), rt_s(&S713)), "&&"));
-  w_cFile = rt_add((rt_cond(w_dotExe) ? std_slice(w_output, rt_i(0), rt_i(-4)) : w_output), rt_s(&S718));
-  wv t2570 = std_writeFile(w_cFile, w_code);
+  w_dotExe = rt_b(rt_bool(rt_ge(std_length(w_output), rt_i(4)), "&&") && rt_bool(rt_eq(rt_chk(w1_toLower(({ wv t2578 = w_output; wv t2579 = std_length(w_output); std_slice(t2578, rt_i(-4), t2579); })), NULL), rt_s(&S715)), "&&"));
+  w_cFile = rt_add((rt_cond(w_dotExe) ? std_slice(w_output, rt_i(0), rt_i(-4)) : w_output), rt_s(&S720));
+  wv t2580 = std_writeFile(w_cFile, w_code);
   if (rt_failcode) {
     rt_failcode = 0;
     {
-      (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S717), rt_text(w_cFile) }));
+      (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S719), rt_text(w_cFile) }));
       rt_exit(rt_i(2));
-      t2570 = RT_NULL;
+      t2580 = RT_NULL;
     }
   }
-  (void)t2570;
+  (void)t2580;
   w_parts = rt_bind(std_split(std_join(std_split(w_cc, rt_s(&S19)), rt_s(&S87)), rt_s(&S87)), 0);
   w_ccName = rt_bind(rt_chk(w1_toLower(rt_idx(rt_i(-1), w_parts)), NULL), 0);
-  w_flags = rt_arr(4, (wv[]){ rt_s(&S719), rt_s(&S701), w_output, w_cFile }, 0);
-  wv t2571 = (rt_cond(rt_b(rt_bool(rt_eq(w_ccName, rt_s(&S710)), "||") || rt_bool(rt_eq(w_ccName, rt_s(&S720)), "||"))) ? rt_arr(5, (wv[]){ rt_s(&S721), rt_s(&S719), rt_s(&S701), w_output, w_cFile }, 0) : w_flags);
-  wv t2572 = std_run(w_cc, t2571);
+  w_flags = rt_arr(4, (wv[]){ rt_s(&S721), rt_s(&S703), w_output, w_cFile }, 0);
+  wv t2581 = (rt_cond(rt_b(rt_bool(rt_eq(w_ccName, rt_s(&S712)), "||") || rt_bool(rt_eq(w_ccName, rt_s(&S722)), "||"))) ? rt_arr(5, (wv[]){ rt_s(&S723), rt_s(&S721), rt_s(&S703), w_output, w_cFile }, 0) : w_flags);
+  wv t2582 = std_run(w_cc, t2581);
   if (rt_failcode) {
     rt_failcode = 0;
     {
-      (void)std_eprint(rt_cat(3, (wv[]){ rt_s(&S722), rt_text(w_cc), rt_s(&S723) }));
+      (void)std_eprint(rt_cat(3, (wv[]){ rt_s(&S724), rt_text(w_cc), rt_s(&S725) }));
       rt_exit(rt_i(2));
-      t2572 = RT_NULL;
+      t2582 = RT_NULL;
     }
   }
-  w_status = rt_bind(t2572, 0);
+  w_status = rt_bind(t2582, 0);
   if (rt_cond(rt_ne(w_status, rt_i(0)))) {
-    (void)std_eprint(({ wv t2573 = rt_text(w_cc); wv t2574 = rt_text(w_status); rt_cat(4, (wv[]){ rt_s(&S711), t2573, rt_s(&S724), t2574 }); }));
+    (void)std_eprint(({ wv t2583 = rt_text(w_cc); wv t2584 = rt_text(w_status); rt_cat(4, (wv[]){ rt_s(&S713), t2583, rt_s(&S726), t2584 }); }));
     rt_exit(rt_i(2));
   }
   rt_exit(rt_i(0));

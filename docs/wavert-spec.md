@@ -1111,7 +1111,7 @@ More examples are in [examples/](../examples/).
   - Values are a 16-byte tagged struct. Strings are UTF-8. Enum members are pointers to static structs.
   - A map is an array of entries in insertion order with a hash index of them. A removed entry is marked, and the entries are compacted when the array is full.
   - Sorting is a merge sort, with insertion sort for runs of up to 16 elements. Any stable sort gives the same result, since the comparison is fixed (§10.6).
-  - Memory comes from an arena that is never freed.
+  - Memory is reclaimed by a mark-and-sweep garbage collector, which never moves objects. It finds references on the C stack and in registers conservatively, by treating every word that points into an object as a reference, so the generated code needs no bookkeeping beyond registering its globals. Collections happen during allocation, when the program has allocated as much as was live after the last one (at least 8 MiB).
   - Functions are C functions. The bindings a nested function uses live in a frame struct on the C stack, reached through an `up` pointer; that is enough because a nested function never outlives the call that contains it (§16).
   - A fail sets a pending code and returns. After each call, the caller either handles it with `onfail` or turns it into a panic (the one-frame rule). A panic prints the function stack and ends the program; nothing unwinds.
   - C leaves the order of a call's arguments unspecified, so arguments whose order matters are evaluated into temporaries, left to right.
@@ -1149,4 +1149,3 @@ More examples are in [examples/](../examples/).
 
 **Runtime**
 - Copy-on-write storage for the copies of §10.4. It would change no behavior, only memory use.
-- Reclaiming memory. The C backend's arena is never freed (§15), so a long-running program, such as a game that redraws the screen every turn, grows without limit. Options include a garbage collector, or an arena that the program can reset between turns.
