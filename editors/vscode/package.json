@@ -1,8 +1,8 @@
 {
   "name": "wavert-language",
   "displayName": "Wavert",
-  "description": "Syntax highlighting, brackets and snippets for Wavert (.wvt)",
-  "version": "0.2.0",
+  "description": "Syntax highlighting, brackets, snippets, and documentation on hover and in completions for Wavert (.wvt)",
+  "version": "0.3.0",
   "publisher": "wavert",
   "private": true,
   "license": "MIT",
@@ -13,6 +13,7 @@
     "Programming Languages",
     "Snippets"
   ],
+  "main": "./src/extension.js",
   "contributes": {
     "languages": [
       {
@@ -39,6 +40,21 @@
         "language": "wavert",
         "path": "./snippets/wavert.code-snippets"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Wavert",
+      "properties": {
+        "wavert.libPath": {
+          "type": "string",
+          "default": "",
+          "description": "The standard library folder that '$lib/' imports come from, for hovers and completions. Empty: found from wavert.wvcPath, or the Wavert repository the file is in."
+        },
+        "wavert.wvcPath": {
+          "type": "string",
+          "default": "",
+          "description": "The wvc compiler. Its standard library is found as wvc finds it: lib/ next to wvc, then one folder up."
+        }
+      }
+    }
   }
 }

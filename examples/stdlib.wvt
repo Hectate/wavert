@@ -1,0 +1,12 @@
+// The standard library: libraries written in Wavert that come with wvc.
+//
+// An import path that starts with $lib/ names a file in the standard library
+// (lib/ in the repository), wherever the program is. Other import paths are
+// relative to the importing file.
+//
+// Usage: wvc build examples/stdlib.wvt
+
+;import math from "$lib/math.wvt"
+
+;"{(-7)(math.abs)} {(15, 0, 10)(math.clamp)} {(-7, 2)(math.div)}"($print)
+;exit

@@ -1,0 +1,324 @@
+// grid: a two-dimensional grid of cells, positions on it, and areas.
+//
+// ;import grid from "$lib/grid.wvt"
+// ;var map is (40, 20, ".")(grid.new)
+// ;(map, 3, 4, "#")(grid.put)
+// ;const blast is ((3, 4)(grid.pos), 2)(grid.circle)
+// ;(map, (map, blast)(grid.within), "*")(grid.fill)
+// ;(map(grid.rows), "\n")($join)($print)
+//
+// x grows to the right and y downward, as on a screen: (0, 0) is the top left.
+//
+// A grid is a record { width, height, cells }, with cells in rows, one value
+// per cell, of any kind. Keep one grid per kind of thing (terrain, what the
+// player has seen) rather than several things in one cell; for things that
+// are only in some places, a map keyed by position fits better.
+// - Hold a grid you change in a var binding: a const grid cannot be changed.
+// - A var grid made from another one shares its cells until the first put,
+//   which copies them, so two grids never change each other. But a const
+//   snapshot of a grid that is changed later shares its cells: take snapshots
+//   and duplicates with copy.
+// - Grids are passed to ref parameters only so that they are not copied.
+//
+// A position is a record { x, y }, made by pos. Build positions with pos
+// rather than writing the record, so that every one has the same shape and
+// works as a map key (§10.11).
+//
+// An area is an array of positions, such as the cells in a box or within a
+// blast's radius. It is not a copy of the cells: read and write the grid
+// through it with valuesAt and fill. Shapes list their positions row by row,
+// and may reach outside the grid; within keeps the ones on it.
+
+;import math from "math.wvt"
+
+// ---- Positions ----
+
+// The position x, y.
+;export fn pos(x, y) { { x: x, y: y } }
+
+// The 4 positions next to p, clockwise from above: up, right, down, left.
+;export fn neighbors4(p) {
+    [(p.x, p.y - 1)(pos), (p.x + 1, p.y)(pos), (p.x, p.y + 1)(pos), (p.x - 1, p.y)(pos)]
+}
+
+// The 8 positions around p, clockwise from above.
+;export fn neighbors8(p) {
+    [(p.x, p.y - 1)(pos), (p.x + 1, p.y - 1)(pos), (p.x + 1, p.y)(pos), (p.x + 1, p.y + 1)(pos),
+        (p.x, p.y + 1)(pos), (p.x - 1, p.y + 1)(pos), (p.x - 1, p.y)(pos), (p.x - 1, p.y - 1)(pos)]
+}
+
+// The number of steps from a to b moving in 4 directions.
+;export fn manhattan(a, b) { (a.x - b.x)(math.abs) + (a.y - b.y)(math.abs) }
+
+// The number of steps from a to b moving in 8 directions.
+;export fn chebyshev(a, b) { ((a.x - b.x)(math.abs), (a.y - b.y)(math.abs))(math.max) }
+
+// The positions on a straight line from a to b, both included (Bresenham's
+// line). Going from b to a may pass through different cells.
+;export fn line(a, b) {
+    ;const dx is (b.x - a.x)(math.abs)
+    ;const dy is -((b.y - a.y)(math.abs))
+    ;const sx is a.x < b.x ? 1 : -1
+    ;const sy is a.y < b.y ? 1 : -1
+    ;var x is a.x
+    ;var y is a.y
+    ;var err is dx + dy
+    ;var out is []
+    ;while (true) {
+        ;(out, (x, y)(pos))($push)
+        ;if (x == b.x && y == b.y) { ;break }
+        ;const e2 is 2 * err
+        ;if (e2 >= dy) {
+            ;set err += dy
+            ;set x += sx
+        }
+        ;if (e2 <= dx) {
+            ;set err += dx
+            ;set y += sy
+        }
+    }
+    out
+}
+
+// ---- Grids ----
+
+// A grid of width x height cells, each holding value. value is shared by every
+// cell, so for a mutable array in each cell, put a new one into each.
+;export fn new(width, height, value) {
+    ;if (width < 0 || height < 0) { ;panic "grid.new: the size {width} x {height} is negative" }
+    ;var cells is []
+    ;var i is 0
+    ;while (i < width * height) {
+        ;(cells, value)($push)
+        ;set i += 1
+    }
+    ;const frozen is cells
+    { width: width, height: height, cells: frozen }
+}
+
+// A copy of g that shares nothing that g's later changes reach: for a
+// snapshot, or for a second grid to change separately.
+;export fn copy(ref g) {
+    ;const cells is g.cells
+    { width: g.width, height: g.height, cells: cells }
+}
+
+// Whether x, y is on g.
+;export fn inside(ref g, x, y) { x >= 0 && x < g.width && y >= 0 && y < g.height }
+
+// The index of x, y in g.cells; panics, naming the function what, if it is
+// not on g.
+;fn slot(ref g, x, y, what) {
+    ;if (!(g, x, y)(inside)) { ;panic "grid.{what}: ({x}, {y}) is outside the {g.width} x {g.height} grid" }
+    y * g.width + x
+}
+
+// The index of x, y in g.cells, row by row. Panics if it is not on g.
+;export fn index(ref g, x, y) { (g, x, y, "index")(slot) }
+
+// The position of index i in g.cells. Panics if there is no such cell.
+;export fn posOf(ref g, i) {
+    ;if (i < 0 || i >= g.width * g.height) { ;panic "grid.posOf: {i} is not a cell of the {g.width} x {g.height} grid" }
+    (i % g.width, (i, g.width)(math.div))(pos)
+}
+
+// The value of the cell at x, y. Panics if it is not on g.
+;export fn get(ref g, x, y) { g.cells[(g, x, y, "get")(slot)] }
+
+// Sets the cell at x, y to v. Panics if it is not on g.
+;export fn put(ref g, x, y, v) {
+    ;const i is (g, x, y, "put")(slot)
+    // A frozen cells array is copied once; after that, cells is g's own.
+    ;var cells is g.cells
+    ;set cells[i] to v
+    ;set g.cells to cells
+}
+
+// The value of the cell at position p. Panics if it is not on g.
+;export fn at(ref g, p) { g.cells[(g, p.x, p.y, "at")(slot)] }
+
+// Sets the cell at position p to v. Panics if it is not on g.
+;export fn putAt(ref g, p, v) { ;(g, p.x, p.y, v)(put) }
+
+// The cells as strings, one per row, for drawing a grid of characters. Each
+// cell is converted as interpolation converts it (§9.3).
+;export fn rows(ref g) {
+    ;var out is []
+    ;var y is 0
+    ;while (y < g.height) {
+        ;(out, ((g.cells, y * g.width, y * g.width + g.width)($slice), "")($join))($push)
+        ;set y += 1
+    }
+    out
+}
+
+// ---- Areas ----
+
+// Every position in the box with corners a and b, both included.
+;export fn rect(a, b) {
+    ;const x0 is (a.x, b.x)(math.min)
+    ;const x1 is (a.x, b.x)(math.max)
+    ;var out is []
+    ;var y is (a.y, b.y)(math.min)
+    ;while (y <= (a.y, b.y)(math.max)) {
+        ;var x is x0
+        ;while (x <= x1) {
+            ;(out, (x, y)(pos))($push)
+            ;set x += 1
+        }
+        ;set y += 1
+    }
+    out
+}
+
+// The positions within r steps of center moving in 8 directions: a square.
+;export fn square(center, r) {
+    ;if (r < 0) { ;return [] }
+    ((center.x - r, center.y - r)(pos), (center.x + r, center.y + r)(pos))(rect)
+}
+
+// The positions exactly r steps from center moving in 8 directions: the
+// square's edge. A radius of 0 is center alone.
+;export fn ring(center, r) {
+    ;var out is []
+    ;const all is (center, r)(square)
+    ;var i is 0
+    ;while (i < all($length)) {
+        ;if ((center, all[i])(chebyshev) == r) { ;(out, all[i])($push) }
+        ;set i += 1
+    }
+    out
+}
+
+// The positions within r steps of center moving in 4 directions: a diamond.
+;export fn diamond(center, r) {
+    ;var out is []
+    ;const all is (center, r)(square)
+    ;var i is 0
+    ;while (i < all($length)) {
+        ;if ((center, all[i])(manhattan) <= r) { ;(out, all[i])($push) }
+        ;set i += 1
+    }
+    out
+}
+
+// The positions closer to center than r + 1/2, measured straight: a disc.
+;export fn circle(center, r) {
+    ;var out is []
+    ;const all is (center, r)(square)
+    ;var i is 0
+    ;while (i < all($length)) {
+        ;const dx is all[i].x - center.x
+        ;const dy is all[i].y - center.y
+        // dx² + dy² < (r + 1/2)², in ints.
+        ;if (dx * dx + dy * dy <= r * r + r) { ;(out, all[i])($push) }
+        ;set i += 1
+    }
+    out
+}
+
+// The positions of area that are on g, in order.
+;export fn within(ref g, ref area) {
+    ;var out is []
+    ;var i is 0
+    ;while (i < area($length)) {
+        ;if ((g, area[i].x, area[i].y)(inside)) { ;(out, area[i])($push) }
+        ;set i += 1
+    }
+    out
+}
+
+// The values of g's cells at the positions of area, in order. Panics if a
+// position is not on g; clip the area with within first.
+;export fn valuesAt(ref g, ref area) {
+    ;var out is []
+    ;var i is 0
+    ;while (i < area($length)) {
+        ;(out, g.cells[(g, area[i].x, area[i].y, "valuesAt")(slot)])($push)
+        ;set i += 1
+    }
+    out
+}
+
+// Sets every cell of g at a position of area to v. Panics if a position is
+// not on g, before changing anything; clip the area with within first.
+;export fn fill(ref g, ref area, v) {
+    ;var slots is []
+    ;var i is 0
+    ;while (i < area($length)) {
+        ;(slots, (g, area[i].x, area[i].y, "fill")(slot))($push)
+        ;set i += 1
+    }
+    ;var cells is g.cells
+    ;set i to 0
+    ;while (i < slots($length)) {
+        ;set cells[slots[i]] to v
+        ;set i += 1
+    }
+    ;set g.cells to cells
+}
+
+// ---- Combining areas ----
+// Each result lists every position once: first those from a, in a's order,
+// then those from b, in b's order. Positions compare by their contents.
+
+// The positions of area as the keys of a map.
+;fn keys(ref area) {
+    ;var m is [:]
+    ;var i is 0
+    ;while (i < area($length)) {
+        ;set m[area[i]] to true
+        ;set i += 1
+    }
+    m
+}
+
+// Adds to out the positions of area not yet in seen that are in other, or not
+// in other, as inOther says.
+;fn collect(ref area, ref other, inOther, ref seen, ref out) {
+    ;var i is 0
+    ;while (i < area($length)) {
+        ;const p is area[i]
+        ;if ((other, p)($has) == inOther && !(seen, p)($has)) {
+            ;set seen[p] to true
+            ;(out, p)($push)
+        }
+        ;set i += 1
+    }
+}
+
+// The positions in a or b or both.
+;export fn union(ref a, ref b) {
+    ;var seen is [:]
+    ;var out is []
+    ;(a, [:], false, seen, out)(collect)
+    ;(b, [:], false, seen, out)(collect)
+    out
+}
+
+// The positions in both a and b.
+;export fn intersect(ref a, ref b) {
+    ;var seen is [:]
+    ;var out is []
+    ;(a, b(keys), true, seen, out)(collect)
+    out
+}
+
+// The positions in a but not in b.
+;export fn minus(ref a, ref b) {
+    ;var seen is [:]
+    ;var out is []
+    ;(a, b(keys), false, seen, out)(collect)
+    out
+}
+
+// The positions in a or b but not both.
+;export fn exclude(ref a, ref b) {
+    ;var seen is [:]
+    ;var out is []
+    ;(a, b(keys), false, seen, out)(collect)
+    ;(b, a(keys), false, seen, out)(collect)
+    out
+}
+
+;end

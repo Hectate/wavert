@@ -65,6 +65,7 @@ const expected = {
   'examples/sort.wvt': {
     out: lines('1 2 3', 'apple fig pear', 'Ada 7, Cy 7, Bo 9', 'Bo 9, Ada 7, Cy 7', 'Bo 9, Cy 7, Ada 7'),
   },
+  'examples/stdlib.wvt': { out: lines('7 10 -4') },
   'examples/terminal.wvt': { out: lines('input: false, output: false', 'no size: stdout is not a terminal') },
   'samples/walk.wvt': {
     input: 'a\x1b[Aawxq',

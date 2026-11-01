@@ -68,5 +68,6 @@ Run `npm test` here (Node ≥ 22.3). The tests need [Zig](https://ziglang.org), 
 | `gc.test.js` | The native runtime's garbage collector: memory stays flat in a long loop, and collecting on every allocation (`WVT_GC_STRESS=1`) changes no output. |
 | `spec.test.js` | The complete programs in [../docs/wavert-spec.md](../docs/wavert-spec.md) compile, and its §14 example runs. |
 | `lib.test.js` | The standard library in [../lib](../lib), and the `$lib/` prefix: importing from anywhere, its errors, and finding `lib/` from where `wvc` is rather than the current directory. |
+| `editor.test.js` | The VS Code extension's documentation: `builtins.json` matches the specification's tables and the checker, every standard library export has a documentation comment, and the scanner behind hovers and completions. |
 | `grammar.test.js` | The VS Code grammar ([../editors/vscode](../editors/vscode)) agrees with the lexer's keywords, the stdlib table and the number syntax. |
 | `convert.test.js` | `tools/wah2wvt.wah`, built with `wahc` from `../wah`: the Γ-- examples convert to Wavert that has the same syntax tree and compiles to the same C. |

@@ -9,6 +9,20 @@ import { join } from 'node:path';
 import { diagnostics, exe, noZig, run, runtimeC, tempDir, wvcExe } from './helpers.js';
 
 const skip = noZig;
+const lines = (...xs) => xs.map((x) => x + '\n').join('');
+
+// The output of a program using the repository's lib/, which must run cleanly.
+function out(source) {
+  const r = run(source + '\n;exit\n');
+  assert.deepEqual({ err: r.err, code: r.code }, { err: '', code: 0 }, source);
+  return r.out;
+}
+// The message of the panic that a program using lib/ ends with.
+function panicOf(source) {
+  const r = run(source + '\n;exit\n');
+  assert.equal(r.code, 1, source);
+  return /uncaught panic: (.*)/.exec(r.err)[1];
+}
 
 // A stand-in standard library: a module that imports its neighbour relatively.
 const stdlib = {
@@ -55,4 +69,245 @@ test('wvc finds lib/ from where it is, not from the current directory', { skip }
   // --lib names another folder.
   const r = run(';import w from "$lib/which.wvt"\n;w.name($print)\n;exit\n', { files: { 'l/which.wvt': ';export const name is "given"\n;end\n' }, lib: 'l' });
   assert.equal(r.out, 'given\n');
+});
+
+// ---- math.wvt ----
+
+test('math: abs, sign, min, max and clamp', { skip }, () => {
+  assert.equal(out(`;import math from "$lib/math.wvt"
+;"{(-7)(math.abs)} {2.5(math.abs)} {(-2.5)(math.sign)} {0(math.sign)} {9(math.sign)} {nan(math.sign)}"($print)
+;"{(3, 9)(math.min)} {(3, 9)(math.max)} {(1, 1.0)(math.min)} {(7, 0, 5)(math.clamp)} {(-1, 0, 5)(math.clamp)} {(3, 0, 5)(math.clamp)}"($print)
+// The bounds may come in either order.
+;"{(7, 5, 0)(math.clamp)} {(-1, 5, 0)(math.clamp)} {(3, 5, 0)(math.clamp)}"($print)`),
+  lines('7 2.5 -1 0 1 0', '3 9 1 5 0 3', '5 0 3'));
+});
+
+test('math: div is floored and exact, isqrt, gcd and lcm', { skip }, () => {
+  assert.equal(out(`;import math from "$lib/math.wvt"
+;"{(7, 2)(math.div)} {(-7, 2)(math.div)} {(7, -2)(math.div)} {(-7, -2)(math.div)} {(6, 3)(math.div)}"($print)
+// Near the largest int, where (a / b)($floor) would round.
+;"{(9007199254740991, 2)(math.div)} {(9007199254740991, 3)(math.div)}"($print)
+;"{0(math.isqrt)} {1(math.isqrt)} {99(math.isqrt)} {100(math.isqrt)} {(94906265 * 94906265)(math.isqrt)} {9007199254740991(math.isqrt)}"($print)
+;"{(12, 18)(math.gcd)} {(-12, 18)(math.gcd)} {(0, 5)(math.gcd)} {(0, 0)(math.gcd)} {(4, 6)(math.lcm)} {(-4, 6)(math.lcm)} {(0, 6)(math.lcm)}"($print)`),
+  lines('3 -4 -4 3 2', '4503599627370495 3002399751580330', '0 1 9 10 94906265 94906265', '6 6 5 0 12 12 0'));
+  assert.equal(panicOf(';import math from "$lib/math.wvt"\n;(1, 0)(math.div)'), 'math.div: division by zero');
+  assert.equal(panicOf(';import math from "$lib/math.wvt"\n;(-1)(math.isqrt)'), 'math.isqrt: -1 is negative');
+});
+
+test('math: sum, minOf, maxOf and lerp', { skip }, () => {
+  assert.equal(out(`;import math from "$lib/math.wvt"
+;"{[1, 2, 3.5](math.sum)} {[](math.sum)} {[3, -1, 2, -1](math.minOf)} {[3, -1, 7, 2](math.maxOf)}"($print)
+;const none is [](math.maxOf)
+    onfail { "none" }
+;"{none} {(0, 10, 0.25)(math.lerp)} {(2, 4, 1.5)(math.lerp)} {(10, 0, 0.5)(math.lerp)}"($print)`),
+  lines('6.5 0 -1 7', 'none 2.5 5.0 5.0'));
+});
+
+// ---- grid.wvt ----
+
+// A Wavert function that shows an area as "x,y x,y ...".
+const showArea = `;fn show(ref area) {
+    ;var parts is []
+    ;var i is 0
+    ;while (i < area($length)) {
+        ;(parts, "{area[i].x},{area[i].y}")($push)
+        ;set i += 1
+    }
+    (parts, " ")($join)
+}`;
+const gridProgram = (body) => `;import grid from "$lib/grid.wvt"\n${showArea}\n${body}`;
+
+test('grid: cells, positions and indexes', { skip }, () => {
+  assert.equal(out(gridProgram(`
+;var map is (4, 3, ".")(grid.new)
+;(map, 1, 2, "#")(grid.put)
+;(map, (3, 0)(grid.pos), "@")(grid.putAt)
+;(map(grid.rows), "|")($join)($print)
+;"{(map, 1, 2)(grid.get)} {(map, (3, 0)(grid.pos))(grid.at)} {(map, 3, 2)(grid.inside)} {(map, 4, 0)(grid.inside)} {(map, -1, 0)(grid.inside)}"($print)
+;const p is (map, 9)(grid.posOf)
+;"{(map, 1, 2)(grid.index)} {p.x},{p.y} {map.width}x{map.height} {(0, 0, 0)(grid.new).cells($length)}"($print)`)),
+  lines('...@|....|.#..', '# @ true false false', '9 1,2 4x3 0'));
+  assert.equal(panicOf(gridProgram(';var g is (4, 3, 0)(grid.new)\n;(g, 4, 0)(grid.get)')), 'grid.get: (4, 0) is outside the 4 x 3 grid');
+  assert.equal(panicOf(gridProgram(';var g is (4, 3, 0)(grid.new)\n;(g, 0, -1, 1)(grid.put)')), 'grid.put: (0, -1) is outside the 4 x 3 grid');
+  assert.equal(panicOf(gridProgram(';var g is (4, 3, 0)(grid.new)\n;(g, 12)(grid.posOf)')), 'grid.posOf: 12 is not a cell of the 4 x 3 grid');
+  assert.equal(panicOf(gridProgram(';(-1, 3, 0)(grid.new)')), 'grid.new: the size -1 x 3 is negative');
+});
+
+test('grid: copies never change each other', { skip }, () => {
+  assert.equal(out(gridProgram(`
+;const base is (3, 1, ".")(grid.new)
+// Two var grids made from one const grid: the first put copies the cells.
+;var a is base
+;var b is base
+;(a, 0, 0, "a")(grid.put)
+;(b, 2, 0, "b")(grid.put)
+;"{a(grid.rows)[0]} {b(grid.rows)[0]} {base(grid.rows)[0]}"($print)
+// copy is a true snapshot, and a second grid to change separately.
+;const snap is a(grid.copy)
+;var c is a(grid.copy)
+;(a, 1, 0, "!")(grid.put)
+;(c, 2, 0, "c")(grid.put)
+;"{a(grid.rows)[0]} {snap(grid.rows)[0]} {c(grid.rows)[0]}"($print)`)),
+  lines('a.. ..b ...', 'a!. a.. a.c'));
+  assert.equal(panicOf(gridProgram(';const g is (2, 2, 0)(grid.new)\n;fn change(ref h) { ;(h, 0, 0, 1)(grid.put) }\n;g(change)')),
+    'cannot modify a field of a frozen record');
+});
+
+test('grid: neighbors, distances and lines', { skip }, () => {
+  assert.equal(out(gridProgram(`
+;const p is (5, 5)(grid.pos)
+;p(grid.neighbors4)(show)($print)
+;p(grid.neighbors8)(show)($print)
+;"{(p, (8, 1)(grid.pos))(grid.manhattan)} {(p, (8, 1)(grid.pos))(grid.chebyshev)}"($print)
+;((0, 0)(grid.pos), (5, 2)(grid.pos))(grid.line)(show)($print)
+;((2, 3)(grid.pos), (2, 0)(grid.pos))(grid.line)(show)($print)
+;((1, 1)(grid.pos), (1, 1)(grid.pos))(grid.line)(show)($print)`)),
+  lines('5,4 6,5 5,6 4,5', '5,4 6,4 6,5 6,6 5,6 4,6 4,5 4,4', '7 4', '0,0 1,0 2,1 3,1 4,2 5,2', '2,3 2,2 2,1 2,0', '1,1'));
+});
+
+test('grid: area shapes', { skip }, () => {
+  assert.equal(out(gridProgram(`
+;const c is (0, 0)(grid.pos)
+;((2, 1)(grid.pos), (0, 0)(grid.pos))(grid.rect)(show)($print)
+;(c, 1)(grid.square)(show)($print)
+;(c, 1)(grid.ring)(show)($print)
+;(c, 1)(grid.diamond)(show)($print)
+;(c, 2)(grid.circle)(show)($print)
+;"{(c, 0)(grid.ring)(show)} {(c, 0)(grid.circle)(show)} [{(c, -1)(grid.square)(show)}]"($print)`)),
+  lines('0,0 1,0 2,0 0,1 1,1 2,1', '-1,-1 0,-1 1,-1 -1,0 0,0 1,0 -1,1 0,1 1,1', '-1,-1 0,-1 1,-1 -1,0 1,0 -1,1 0,1 1,1',
+    '0,-1 -1,0 0,0 1,0 0,1',
+    '-1,-2 0,-2 1,-2 -2,-1 -1,-1 0,-1 1,-1 2,-1 -2,0 -1,0 0,0 1,0 2,0 -2,1 -1,1 0,1 1,1 2,1 -1,2 0,2 1,2', '0,0 0,0 []'));
+});
+
+test('grid: reading and writing through areas', { skip }, () => {
+  assert.equal(out(gridProgram(`
+;var map is (5, 3, ".")(grid.new)
+;const blast is ((0, 0)(grid.pos), 1)(grid.square)
+;const onMap is (map, blast)(grid.within)
+;onMap(show)($print)
+;(map, onMap, "*")(grid.fill)
+;(map(grid.rows), "|")($join)($print)
+;((map, ((3, 1)(grid.pos), (4, 2)(grid.pos))(grid.rect))(grid.valuesAt), "")($join)($print)`)),
+  lines('0,0 1,0 0,1 1,1', '**...|**...|.....', '....'));
+  assert.equal(panicOf(gridProgram(';var g is (2, 1, 0)(grid.new)\n;(g, [(0, 0)(grid.pos), (5, 0)(grid.pos)], 1)(grid.fill)')),
+    'grid.fill: (5, 0) is outside the 2 x 1 grid');
+  assert.equal(panicOf(gridProgram(';var g is (2, 1, 0)(grid.new)\n;(g, [(2, 0)(grid.pos)])(grid.valuesAt)')),
+    'grid.valuesAt: (2, 0) is outside the 2 x 1 grid');
+});
+
+test('grid: combining areas', { skip }, () => {
+  assert.equal(out(gridProgram(`
+;const a is ((0, 0)(grid.pos), (2, 0)(grid.pos))(grid.rect)
+;const b is [(3, 0)(grid.pos), (1, 0)(grid.pos), (2, 0)(grid.pos), (3, 0)(grid.pos)]
+;(a, b)(grid.union)(show)($print)
+;(a, b)(grid.intersect)(show)($print)
+;(a, b)(grid.minus)(show)($print)
+;(a, b)(grid.exclude)(show)($print)
+;(b, a)(grid.union)(show)($print)
+// Positions compare by contents, and every position appears once.
+;const dup is [(1, 1)(grid.pos), { y: 1, x: 1 }, (1, 1)(grid.pos)]
+;"{(dup, [])(grid.union)(show)} [{(a, [])(grid.intersect)(show)}] [{(a, a)(grid.exclude)(show)}]"($print)`)),
+  lines('0,0 1,0 2,0 3,0', '1,0 2,0', '0,0', '0,0 3,0', '3,0 1,0 2,0 0,0', '1,1 [] []'));
+});
+
+// ---- dice.wvt ----
+
+const diceProgram = (body) => `;import dice from "$lib/dice.wvt"\n;var rng is 2026($newRandom)\n${body}`;
+
+test('dice: rolls stay in range and cover it', { skip }, () => {
+  // Over many rolls, every value comes up and none falls outside.
+  assert.equal(out(diceProgram(`
+;fn spread(lo, hi, ref values) {
+    ;var seen is [:]
+    ;var i is 0
+    ;while (i < values($length)) {
+        ;if (values[i] < lo || values[i] > hi) { ;return "out of range: {values[i]}" }
+        ;set seen[values[i]] to true
+        ;set i += 1
+    }
+    seen($length) == hi - lo + 1 ? "ok" : "missed some: {seen($length)}"
+}
+;var d6 is []
+;var d3d6 is []
+;var mid is []
+;var swapped is []
+;var i is 0
+;while (i < 2000) {
+    ;(d6, (rng, 6)(dice.roll))($push)
+    ;(d3d6, (rng, 3, 6)(dice.dice))($push)
+    ;(mid, (rng, -2, 2)(dice.between))($push)
+    ;(swapped, (rng, 2, -2)(dice.between))($push)
+    ;set i += 1
+}
+;"{(1, 6, d6)(spread)} {(3, 18, d3d6)(spread)} {(-2, 2, mid)(spread)} {(-2, 2, swapped)(spread)} {(rng, 0, 6)(dice.dice)} {(rng, 4, 4)(dice.between)}"($print)`)),
+  lines('ok ok ok ok 0 4'));
+  assert.equal(panicOf(diceProgram(';(rng, 0)(dice.roll)')), 'dice.roll: a die needs 1 or more sides, got 0');
+  assert.equal(panicOf(diceProgram(';(rng, -1, 6)(dice.dice)')), 'dice.dice: the count of dice is negative, got -1');
+});
+
+test('dice: chance, pick, shuffled and weighted', { skip }, () => {
+  assert.equal(out(diceProgram(`
+;var hits is 0
+;var never is 0
+;var always is 0
+;var w is [0, 0, 0]
+;var wf is [0, 0]
+;var i is 0
+;while (i < 4000) {
+    ;if ((rng, 25)(dice.chance)) { ;set hits += 1 }
+    ;if ((rng, 0)(dice.chance)) { ;set never += 1 }
+    ;if ((rng, 100)(dice.chance)) { ;set always += 1 }
+    ;set w[(rng, [1, 2, 0, 1])(dice.weighted) % 3] += 1
+    ;set wf[(rng, [0.0, 0.25, 0.75])(dice.weighted) - 1] += 1
+    ;set i += 1
+}
+;"{hits > 900 && hits < 1100} {never} {always}"($print)
+// [1, 2, 0, 1]: index 0 and 3 share a count, 1 is twice either, 2 never comes.
+;"{w[0] > 1800 && w[0] < 2200} {w[1] > 1800 && w[1] < 2200} {w[2]}"($print)
+;"{wf[0] > 850 && wf[0] < 1150}"($print)
+;const xs is [1, 2, 3, 4, 5]
+;const s is (rng, xs)(dice.shuffled)
+;"{(s($sort), " ")($join)} {(xs, " ")($join)} {(rng, ["only"])(dice.pick)}"($print)
+;const none is (rng, [])(dice.pick)
+    onfail { "none" }
+;none($print)`)),
+  lines('true 0 4000', 'true true 0', 'true', '1 2 3 4 5 1 2 3 4 5 only', 'none'));
+  assert.equal(panicOf(diceProgram(';(rng, [0, 0])(dice.weighted)')), 'dice.weighted: the weights add up to 0');
+  assert.equal(panicOf(diceProgram(';(rng, [1, -1])(dice.weighted)')), 'dice.weighted: weight 1 is negative, got -1');
+});
+
+test('dice: notation, check and exact odds', { skip }, () => {
+  assert.equal(out(diceProgram(`
+;fn ok(text) {
+    ;const r is (rng, text)(dice.rollText)
+        onfail { "bad" }
+    r
+}
+;var inRange is true
+;var i is 0
+;while (i < 500) {
+    ;const r is (rng, "2d6+1")(dice.rollText)
+    ;const s is (rng, "d4 - 1")(dice.rollText)
+    ;if (r < 3 || r > 13 || s < 0 || s > 3) { ;set inRange to false }
+    ;set i += 1
+}
+;"{inRange} {"4"(ok)} {"0d6+2"(ok)} {"2D1"(ok)}"($print)
+;([""(ok), "2d"(ok), "d"(ok), "2x6"(ok), "2d6+"(ok), "2d0"(ok), "-1d6"(ok), "2d6+1+1"(ok), "1.5d6"(ok)], " ")($join)($print)
+;const c is (rng, 3, 1, 3)(dice.check)
+;const f is (rng, 1, 1, 2)(dice.check)
+;"{c.total} {c.success} {f.total} {f.success}"($print)
+;const o is (2, 6)(dice.odds)
+;"{o($length)} {o[0]} {o[1]} {o[2] * 36} {o[7] * 6} {o[12] * 36} {(0, 6)(dice.odds)[0]}"($print)`)),
+  lines('true 4 2 2', 'bad bad bad bad bad bad bad bad bad', '3 true 1 false', '13 0.0 0.0 1.0 1.0 1.0 1.0'));
+  assert.equal(out(diceProgram(`
+;fn p(count, sides, target) { (count, sides, target)(dice.chanceAtLeast)(dice.percent) }
+;"{(2, 6, 8)(dice.chanceAtLeast)} {(2, 6, 8)(p)} {(2, 6, 2)(p)} {(2, 6, 13)(p)} {(2, 6, 12)(p)}"($print)
+// Near-certain and near-impossible chances never show as 100% or 0%.
+;"{(3, 6, 4)(p)} {(20, 6, 21)(p)} {(3, 6, 18)(p)} {(4, 6, 24)(p)}"($print)
+;"{("2d6+1", 9)(dice.chanceText)(dice.percent)} {("d20", 11)(dice.chanceText)(dice.percent)} {("5", 5)(dice.chanceText)}"($print)
+;const bad is ("2d", 3)(dice.chanceText)
+    onfail { "bad" }
+;"{bad} {0.0(dice.percent)} {1.0(dice.percent)} {0.004(dice.percent)} {0.995(dice.percent)} {0.5(dice.percent)}"($print)`)),
+  lines('0.4166666666666667 42% 100% 0% 3%', '>99% >99% <1% <1%', '42% 50% 1.0', 'bad 0% 100% <1% >99% 50%'));
+  assert.equal(panicOf(diceProgram(';(2, 0)(dice.odds)')), 'dice.odds: cannot roll 2d0');
 });

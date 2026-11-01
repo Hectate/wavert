@@ -428,11 +428,11 @@ test('$terminalSize fails when stdout is not a terminal', { skip }, () => {
 
 // The code generator checks for a fail only after the stdlib functions in its
 // list, so the list must name every function the specification says can fail:
-// those whose table row says so, and $toInt and $toFloat (§9.5).
+// those whose table row says so.
 test('the code generator knows which stdlib functions fail', () => {
   const signalers = JSON.parse(/;const signalers is (\[[^\]]*\])/.exec(readRepo('wvc/codegen_c.wvt'))[1]);
   const fails = [...readRepo('docs/wavert-spec.md').matchAll(/^\| `\$(\w+)` \|.*\bFails\b/gm)].map((m) => m[1]);
-  assert.deepEqual([...signalers].sort(), [...fails, 'toInt', 'toFloat'].sort());
+  assert.deepEqual([...signalers].sort(), fails.sort());
 });
 
 // ---- Draft 0.5: waiting for a key, the clock and sleeping (§12.2, §12.8) ----

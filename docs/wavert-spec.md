@@ -56,6 +56,12 @@ Source files are UTF-8. A byte-order mark at the start of a file is ignored. Pos
 ### 2.2 Comments
 - Line: `// ...`
 - Block: `/* ... */`. Block comments do not nest. An unterminated block comment is a lex error.
+- **Documentation comments.** By convention, the `//` lines directly above a declaration (`fn`, `const`, `var`, `ref` or `enum`), with no blank line between, document it. Its first sentence says what it is or does; later ones say what it fails or panics on. The `//` lines at the top of a file document the file. Editors show them (the VS Code extension shows them on hover and in completions), and every export of the standard library ([lib/](../lib/)) has one.
+  ```
+  // The positions within r steps of center moving in 4 directions: a diamond.
+  ;export fn diamond(center, r) { ... }
+  ```
+  They are ordinary comments to the compiler, which does not check them.
 
 ### 2.3 Numeric literals
 | Form | Examples | Type |
@@ -506,17 +512,20 @@ Anything else (arrays, records, maps) must be converted explicitly; interpolatin
 This is JavaScript's `Number.prototype.toString` plus step 5. `$toString` and `$join` use the same text.
 
 ### 9.4 String stdlib
+| Builtin | Call | Notes |
+|---|---|---|
+| `$code` | `;c($code)` | The code point of a one-character string, as an int. |
+| `$fromCode` | `;n($fromCode)` | A one-character string holding code point `n`. |
+| `$split` | `;(s, sep)($split)` | An array of the parts of `s` between occurrences of `sep`. `""` splits into code points. |
+| `$toString` | `;x($toString)` | The interpolation text of any value that has one (§9.3). |
+| `$toInt` | `;s($toInt)` | The int that integer text stands for, such as `"42"`. An int is returned unchanged. Fails on anything else (§9.5). |
+| `$toFloat` | `;s($toFloat)` | The float that number text stands for, such as `"1.5"`. An int is converted, and a float is returned unchanged. Fails on anything else (§9.5). |
+
+`$length`, `$at` and `$slice` also work on strings, counting code points, and `$join` builds a string (§10.6):
 ```
-;const n is s($length)
-;const first is (s, 0)($at)          // negative indices count from the end
-;const mid is (s, 1, 3)($slice)      // end-exclusive: code points 1 and 2
-;const c is first($code)             // one code point -> int
-;c($fromCode)                        // int -> a one-character string
-;const parts is (s, ",")($split)     // "" splits into code points
-;(parts, ", ")($join)                // elements converted as by interpolation
-;n($toString)                        // the interpolation text of any convertible value
-;"42"($toInt)                        // fails on anything but integer text (§9.5)
-;"1.5"($toFloat)
+;const first is (s, 0)($at)          // a one-character string
+;const mid is (s, 1, 3)($slice)      // code points 1 and 2
+;(parts, ", ")($join)
 ```
 
 ### 9.5 Numeric text (`$toInt`, `$toFloat`)
@@ -569,18 +578,24 @@ A copy happens **only when mutability changes**:
 - Map keys compare with `$same`, so a record used as a key is found by its contents (§10.11).
 
 ### 10.6 Array stdlib
+| Builtin | Call | Notes |
+|---|---|---|
+| `$length` | `;x($length)` | The number of elements of an array, code points of a string, or keys of a map. |
+| `$at` | `;(x, i)($at)` | Element `i` of an array, the same as `x[i]`, or code point `i` of a string as a one-character string. A negative `i` counts from the end. |
+| `$slice` | `;(x, start, end)($slice)` | The elements or code points from `start` up to, but not including, `end`. Negative indices count from the end. An array result is frozen. |
+| `$push` | `;(arr, x)($push)` | Adds `x` at the end of `arr`. Mutable arrays only. |
+| `$pop` | `;arr($pop)` | Removes the last element of `arr` and returns it. Mutable arrays only; panics if `arr` is empty. |
+| `$join` | `;(parts, sep)($join)` | The elements as text, converted as interpolation converts them (§9.3), with `sep` between them. |
+| `$same` | `;(a, b)($same)` | Deep structural equality (§10.5). |
+| `$sort` | `;arr($sort)` | A new frozen array of the elements, sorted by their own values (below). |
+| `$sortBy` | `;(arr, by)($sortBy)` | A new frozen array of the elements, sorted by their field named `by`, or by an array `by` of one key for each (below). |
+| `$reverse` | `;arr($reverse)` | A new frozen array of the elements in reverse order. |
+
 ```
-;arr($length)                // also works on strings
-;(arr, i)($at)               // same as arr[i]
-;(arr, 1, -1)($slice)        // end-exclusive, negative indices from the end; frozen result
-;(arr, x)($push)             // mutable arrays only
-;arr($pop)                   // mutable arrays only; panics if empty
-;(a, b)($same)
-;(parts, ", ")($join)
-;scores($sort)               // a new frozen array, sorted
+;(arr, 1, -1)($slice)            // all but the first and the last
+;scores($sort)
 ;(monsters, "speed")($sortBy)    // records, sorted by a field
-;(monsters, dists)($sortBy)  // sorted by a parallel array of keys
-;arr($reverse)               // a new frozen array, reversed
+;(monsters, dists)($sortBy)      // sorted by a parallel array of keys
 ```
 
 **Sorting**
@@ -781,14 +796,16 @@ Standard semantics throughout.
   - `-(x ** 2)` and `(-x) ** 2` are valid; `-x ** 2` and `-2 ** 2` are not.
 
 ### 11.3 Numeric stdlib
-```
-;n($toFloat)                                      // int -> float
-;"1.5"($toFloat)                                  // fails unless the text is a number (§9.5)
-;x($floor)  ;x($ceil)  ;x($round)  ;x($trunc)     // float -> int; identity on int
-;x($toUint32)
-;x($isNan)
-```
-- `$round` rounds half away from zero (`2.5` → 3, `-2.5` → -3).
+| Builtin | Call | Notes |
+|---|---|---|
+| `$floor` | `;x($floor)` | `x` rounded down to an int. An int is returned unchanged. |
+| `$ceil` | `;x($ceil)` | `x` rounded up to an int. An int is returned unchanged. |
+| `$round` | `;x($round)` | `x` rounded to the nearest int, halves away from zero (`2.5` → 3, `-2.5` → -3). An int is returned unchanged. |
+| `$trunc` | `;x($trunc)` | `x` rounded toward zero to an int. An int is returned unchanged. |
+| `$toUint32` | `;x($toUint32)` | The low 32 bits of int `x` as an unsigned int, 0 to 4294967295: an unsigned view of a bitwise result. |
+| `$isNan` | `;x($isNan)` | `true` if `x` is `nan`, the only value not equal to itself. |
+
+- `$toFloat` (§9.4) also converts an int to a float.
 - Rounding `nan` or `±inf` panics.
 
 ### 11.4 Precedence (highest to lowest)

@@ -1,0 +1,111 @@
+// math: integer and number helpers.
+//
+// ;import math from "$lib/math.wvt"
+// ;(7, 0, 5)(math.clamp)        // 5
+// ;(-7, 2)(math.div)            // -4, floored like %
+// ;99(math.isqrt)               // 9
+//
+// Functions that take numbers accept ints and floats unless they say "ints".
+
+// The absolute value of x.
+;export fn abs(x) { x < 0 ? -x : x }
+
+// -1, 0 or 1, as x is negative, zero or positive. nan gives 0.
+;export fn sign(x) { x < 0 ? -1 : x > 0 ? 1 : 0 }
+
+// The smaller of a and b; a if they are equal.
+;export fn min(a, b) { b < a ? b : a }
+
+// The larger of a and b; a if they are equal.
+;export fn max(a, b) { b > a ? b : a }
+
+// x limited to the range between a and b, given in either order: (x, 0, 5)
+// and (x, 5, 0) both keep x within 0..5.
+;export fn clamp(x, a, b) {
+    ;const lo is (a, b)(min)
+    ;const hi is (a, b)(max)
+    x < lo ? lo : x > hi ? hi : x
+}
+
+// a divided by b, rounded down: the integer division that matches % (§11.2),
+// so a == (a, b)(div) * b + a % b. Ints. Exact for every int, unlike
+// (a / b)($floor), whose float division can round. Panics if b is 0.
+;export fn div(a, b) {
+    ;if (b == 0) { ;panic "math.div: division by zero" }
+    // a - a % b is a multiple of b, so this float division is exact.
+    ((a - a % b) / b)($trunc)
+}
+
+// The integer square root of n: the largest int whose square is at most n.
+// n is an int, 0 or more.
+;export fn isqrt(n) {
+    ;if (n < 0) { ;panic "math.isqrt: {n} is negative" }
+    ;if (n < 2) { ;return n }
+    // The float square root is close; correct it without squaring, which
+    // could overflow near the largest ints.
+    ;var r is (n ** 0.5)($floor)
+    ;while (r > (n, r)(div)) { ;set r -= 1 }
+    ;while (r + 1 <= (n, r + 1)(div)) { ;set r += 1 }
+    r
+}
+
+// The greatest common divisor of ints a and b, 0 or more; (0, 0) gives 0.
+;export fn gcd(a, b) {
+    ;var x is a(abs)
+    ;var y is b(abs)
+    ;while (y != 0) {
+        ;const r is x % y
+        ;set x to y
+        ;set y to r
+    }
+    x
+}
+
+// The least common multiple of ints a and b, 0 or more; 0 if either is 0.
+;export fn lcm(a, b) {
+    ;if (a == 0 || b == 0) { ;return 0 }
+    ((a, (a, b)(gcd))(div) * b)(abs)
+}
+
+// The sum of an array of numbers; 0 for an empty array.
+;export fn sum(ref xs) {
+    ;var total is 0
+    ;var i is 0
+    ;while (i < xs($length)) {
+        ;set total += xs[i]
+        ;set i += 1
+    }
+    total
+}
+
+// The smallest number in an array, the first if several are equal. Fails on
+// an empty array.
+;export fn minOf(ref xs) {
+    ;if (xs($length) == 0) { ;fail }
+    ;var best is xs[0]
+    ;var i is 1
+    ;while (i < xs($length)) {
+        ;if (xs[i] < best) { ;set best to xs[i] }
+        ;set i += 1
+    }
+    best
+}
+
+// The largest number in an array, the first if several are equal. Fails on
+// an empty array.
+;export fn maxOf(ref xs) {
+    ;if (xs($length) == 0) { ;fail }
+    ;var best is xs[0]
+    ;var i is 1
+    ;while (i < xs($length)) {
+        ;if (xs[i] > best) { ;set best to xs[i] }
+        ;set i += 1
+    }
+    best
+}
+
+// The value a fraction t of the way from a to b: a at 0.0, b at 1.0. t may
+// be outside 0..1, which extends the line.
+;export fn lerp(a, b, t) { a + (b - a) * t }
+
+;end

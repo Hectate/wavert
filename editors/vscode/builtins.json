@@ -1,0 +1,320 @@
+{
+  "appendFile": {
+    "call": ";(path, text)($appendFile)",
+    "notes": "Fails on error.",
+    "arity": 2,
+    "section": "12.3"
+  },
+  "args": {
+    "call": "constant",
+    "notes": "Array of strings, the program's name excluded.",
+    "arity": "constant",
+    "section": "12.4"
+  },
+  "at": {
+    "call": ";(x, i)($at)",
+    "notes": "Element `i` of an array, the same as `x[i]`, or code point `i` of a string as a one-character string. A negative `i` counts from the end.",
+    "arity": 2,
+    "section": "10.6"
+  },
+  "ceil": {
+    "call": ";x($ceil)",
+    "notes": "`x` rounded up to an int. An int is returned unchanged.",
+    "arity": 1,
+    "section": "11.3"
+  },
+  "code": {
+    "call": ";c($code)",
+    "notes": "The code point of a one-character string, as an int.",
+    "arity": 1,
+    "section": "9.4"
+  },
+  "deleteFile": {
+    "call": ";path($deleteFile)",
+    "notes": "Fails on error.",
+    "arity": 1,
+    "section": "12.3"
+  },
+  "elapsed": {
+    "call": ";($elapsed)",
+    "notes": "Milliseconds since the program started, as an int. Never decreases.",
+    "arity": 0,
+    "section": "12.8"
+  },
+  "env": {
+    "call": ";\"HOME\"($env)",
+    "notes": "Fails if unset.",
+    "arity": 1,
+    "section": "12.4"
+  },
+  "eprint": {
+    "call": ";x($eprint)",
+    "notes": "stderr, then a newline",
+    "arity": 1,
+    "section": "12.2"
+  },
+  "fields": {
+    "call": ";node($fields)",
+    "notes": "Frozen array of a record's field names, in literal order (§10.10).",
+    "arity": 1,
+    "section": "12.5"
+  },
+  "fileExists": {
+    "call": ";path($fileExists)",
+    "notes": "`true` / `false`.",
+    "arity": 1,
+    "section": "12.3"
+  },
+  "floor": {
+    "call": ";x($floor)",
+    "notes": "`x` rounded down to an int. An int is returned unchanged.",
+    "arity": 1,
+    "section": "11.3"
+  },
+  "fromCode": {
+    "call": ";n($fromCode)",
+    "notes": "A one-character string holding code point `n`.",
+    "arity": 1,
+    "section": "9.4"
+  },
+  "get": {
+    "call": ";(m, k)($get)",
+    "notes": "The value of `k`. Fails if `k` is missing.",
+    "arity": 2,
+    "section": "10.11"
+  },
+  "has": {
+    "call": ";(m, k)($has)",
+    "notes": "`true` if `k` is there.",
+    "arity": 2,
+    "section": "10.11"
+  },
+  "isNan": {
+    "call": ";x($isNan)",
+    "notes": "`true` if `x` is `nan`, the only value not equal to itself.",
+    "arity": 1,
+    "section": "11.3"
+  },
+  "join": {
+    "call": ";(parts, sep)($join)",
+    "notes": "The elements as text, converted as interpolation converts them (§9.3), with `sep` between them.",
+    "arity": 2,
+    "section": "10.6"
+  },
+  "keys": {
+    "call": ";m($keys)",
+    "notes": "A frozen array of the keys, in order.",
+    "arity": 1,
+    "section": "10.11"
+  },
+  "length": {
+    "call": ";x($length)",
+    "notes": "The number of elements of an array, code points of a string, or keys of a map.",
+    "arity": 1,
+    "section": "10.6"
+  },
+  "listDir": {
+    "call": ";path($listDir)",
+    "notes": "Frozen array of entry names (not full paths), without `.` and `..`, sorted by code point. Fails if not a directory.",
+    "arity": 1,
+    "section": "12.3"
+  },
+  "newRandom": {
+    "call": ";seed($newRandom)",
+    "notes": "A new random number generator, started from an int seed.",
+    "arity": 1,
+    "section": "12.8"
+  },
+  "pop": {
+    "call": ";arr($pop)",
+    "notes": "Removes the last element of `arr` and returns it. Mutable arrays only; panics if `arr` is empty.",
+    "arity": 1,
+    "section": "10.6"
+  },
+  "print": {
+    "call": ";x($print)",
+    "notes": "stdout, then a newline",
+    "arity": 1,
+    "section": "12.2"
+  },
+  "programPath": {
+    "call": "constant",
+    "notes": "Absolute path of the file that was launched (see below).",
+    "arity": "constant",
+    "section": "12.4"
+  },
+  "push": {
+    "call": ";(arr, x)($push)",
+    "notes": "Adds `x` at the end of `arr`. Mutable arrays only.",
+    "arity": 2,
+    "section": "10.6"
+  },
+  "random": {
+    "call": ";(rng, n)($random)",
+    "notes": "A uniformly random int from 0 to `n - 1`. Advances `rng`.",
+    "arity": 2,
+    "section": "12.8"
+  },
+  "randomFloat": {
+    "call": ";rng($randomFloat)",
+    "notes": "A uniformly random float from `0.0` up to, but not including, `1.0`. Advances `rng`.",
+    "arity": 1,
+    "section": "12.8"
+  },
+  "readFile": {
+    "call": ";path($readFile)",
+    "notes": "The whole file as a string. Fails if missing or unreadable.",
+    "arity": 1,
+    "section": "12.3"
+  },
+  "readKey": {
+    "call": ";($readKey)",
+    "notes": "One key press from stdin, without echo and without waiting for Enter (§12.2). Fails at the end of input.",
+    "arity": 0,
+    "section": "12.2"
+  },
+  "readLine": {
+    "call": ";($readLine)",
+    "notes": "One line of stdin, without its line ending. Fails at the end of input.",
+    "arity": 0,
+    "section": "12.2"
+  },
+  "remove": {
+    "call": ";(m, k)($remove)",
+    "notes": "Removes `k` and returns its value. Fails if `k` is missing. Needs a mutable map.",
+    "arity": 2,
+    "section": "10.11"
+  },
+  "reverse": {
+    "call": ";arr($reverse)",
+    "notes": "A new frozen array of the elements in reverse order.",
+    "arity": 1,
+    "section": "10.6"
+  },
+  "round": {
+    "call": ";x($round)",
+    "notes": "`x` rounded to the nearest int, halves away from zero (`2.5` → 3, `-2.5` → -3). An int is returned unchanged.",
+    "arity": 1,
+    "section": "11.3"
+  },
+  "run": {
+    "call": ";(program, args)($run)",
+    "notes": "Runs another program and waits for it. Returns its exit code. Fails if it cannot be started.",
+    "arity": 2,
+    "section": "12.4"
+  },
+  "same": {
+    "call": ";(a, b)($same)",
+    "notes": "Deep structural equality (§10.5).",
+    "arity": 2,
+    "section": "10.6"
+  },
+  "sleep": {
+    "call": ";ms($sleep)",
+    "notes": "Pauses for `ms` milliseconds.",
+    "arity": 1,
+    "section": "12.8"
+  },
+  "slice": {
+    "call": ";(x, start, end)($slice)",
+    "notes": "The elements or code points from `start` up to, but not including, `end`. Negative indices count from the end. An array result is frozen.",
+    "arity": 3,
+    "section": "10.6"
+  },
+  "sort": {
+    "call": ";arr($sort)",
+    "notes": "A new frozen array of the elements, sorted by their own values (§10.6).",
+    "arity": 1,
+    "section": "10.6"
+  },
+  "sortBy": {
+    "call": ";(arr, by)($sortBy)",
+    "notes": "A new frozen array of the elements, sorted by their field named `by`, or by an array `by` of one key for each (§10.6).",
+    "arity": 2,
+    "section": "10.6"
+  },
+  "split": {
+    "call": ";(s, sep)($split)",
+    "notes": "An array of the parts of `s` between occurrences of `sep`. `\"\"` splits into code points.",
+    "arity": 2,
+    "section": "9.4"
+  },
+  "terminal": {
+    "call": ";($terminal)",
+    "notes": "Whether stdin and stdout are terminals, as a record `{ input, output }` of booleans (§12.2).",
+    "arity": 0,
+    "section": "12.2"
+  },
+  "terminalSize": {
+    "call": ";($terminalSize)",
+    "notes": "The size of the terminal on stdout, as a record `{ width, height }` of ints (§12.2). Fails if stdout is not a terminal.",
+    "arity": 0,
+    "section": "12.2"
+  },
+  "time": {
+    "call": ";($time)",
+    "notes": "Milliseconds since 1970-01-01 00:00 UTC, as an int.",
+    "arity": 0,
+    "section": "12.8"
+  },
+  "toFloat": {
+    "call": ";s($toFloat)",
+    "notes": "The float that number text stands for, such as `\"1.5\"`. An int is converted, and a float is returned unchanged. Fails on anything else (§9.5).",
+    "arity": 1,
+    "section": "9.4"
+  },
+  "toInt": {
+    "call": ";s($toInt)",
+    "notes": "The int that integer text stands for, such as `\"42\"`. An int is returned unchanged. Fails on anything else (§9.5).",
+    "arity": 1,
+    "section": "9.4"
+  },
+  "toString": {
+    "call": ";x($toString)",
+    "notes": "The interpolation text of any value that has one (§9.3).",
+    "arity": 1,
+    "section": "9.4"
+  },
+  "toUint32": {
+    "call": ";x($toUint32)",
+    "notes": "The low 32 bits of int `x` as an unsigned int, 0 to 4294967295: an unsigned view of a bitwise result.",
+    "arity": 1,
+    "section": "11.3"
+  },
+  "trunc": {
+    "call": ";x($trunc)",
+    "notes": "`x` rounded toward zero to an int. An int is returned unchanged.",
+    "arity": 1,
+    "section": "11.3"
+  },
+  "typeOf": {
+    "call": ";x($typeOf)",
+    "notes": "`\"int\"`, `\"float\"`, `\"boolean\"`, `\"string\"`, `\"array\"`, `\"record\"`, `\"map\"` or `\"null\"`; for an enum member, the enum's name (§4.1).",
+    "arity": 1,
+    "section": "12.5"
+  },
+  "values": {
+    "call": ";m($values)",
+    "notes": "A frozen array of the values, in the same order as `$keys`.",
+    "arity": 1,
+    "section": "10.11"
+  },
+  "waitKey": {
+    "call": ";ms($waitKey)",
+    "notes": "Like `$readKey`, but waits at most `ms` milliseconds: `null` if no key comes in time (§12.2). Fails at the end of input.",
+    "arity": 1,
+    "section": "12.2"
+  },
+  "write": {
+    "call": ";x($write)",
+    "notes": "stdout, no newline",
+    "arity": 1,
+    "section": "12.2"
+  },
+  "writeFile": {
+    "call": ";(path, text)($writeFile)",
+    "notes": "Creates or overwrites. Fails on error.",
+    "arity": 2,
+    "section": "12.3"
+  }
+}
