@@ -1,0 +1,257 @@
+// view: what the player sees, combined from layers into rows of text.
+//
+// ;import grid from "$lib/grid.wvt"
+// ;import view from "$lib/view.wvt"
+// ;enum Terrain (floor, wall)
+// ;const tiles is [Terrain.floor: ".", Terrain.wall: "#"]
+// ;const layers is [(terrain, tiles)(view.gridLayer), (items, [:])(view.mapLayer), (actors, [:])(view.mapLayer)]
+// ;const window is (player.pos, 80, 22, terrain)(view.follow)
+// ;(memory, terrain, visible)(view.remember)
+// ;(((layers, window, visible, memory, tiles)(view.rows)), "\n")($join)($print)
+//
+// A game keeps one layer per kind of thing (§10.11): a grid for terrain, and
+// maps keyed by position (grid.pos) for things that are only in some places,
+// such as actors, or piles of items as arrays. Layers are listed bottom first,
+// and each cell shows the topmost layer that has something there.
+//
+// Each layer has a glyph table: a map from the values it holds to the text
+// drawn for them, such as [Terrain.wall: "#"]. A value the table does not have
+// is drawn by itself if it is a string, by its glyph field if it is a record
+// (the convention for actors and items), and as "?" otherwise. null, a missing
+// key and an empty pile are empty: the layers below show through.
+//
+// Make the layers when drawing: a layer holds its grid or map as it was then.
+//
+// Memory is what the player remembers of each cell, kept by the game in a grid
+// of its own, separate from the terrain: null where nothing is remembered,
+// else a record { value, age }. Cells that are not visible are drawn from it,
+// never from the terrain, so a world that changes out of sight is remembered
+// as it was until it is seen again. The game changes memory as it likes:
+// remember what is visible, note a sound or a magic map, fade it with age
+// everywhere or in one place, and read or set each cell's age.
+
+;import grid from "grid.wvt"
+;import arrays from "arrays.wvt"
+
+// The kinds of layer.
+;export enum LayerKind (grid, map)
+
+// ---- Layers ----
+
+// A layer of the cells of grid g, drawn with the glyph table glyphs.
+;export fn gridLayer(ref g, glyphs) { { kind: LayerKind.grid, source: g, glyphs: glyphs } }
+
+// A layer of the values of map m, keyed by position, drawn with the glyph
+// table glyphs. A value that is an array is a pile: its last element is drawn.
+;export fn mapLayer(ref m, glyphs) { { kind: LayerKind.map, source: m, glyphs: glyphs } }
+
+// The text drawn for value v with the glyph table glyphs, or null if v is
+// empty.
+;fn glyphOf(v, ref glyphs) {
+    ;const t is v($typeOf)
+    ;if (t == "null") { ;return null }
+    ;if (t == "array") { ;return v($length) == 0 ? null : (v[-1], glyphs)(glyphOf) }
+    // A record, such as an actor, may hold arrays, so it is not a key: it
+    // carries its own glyph.
+    ;if (t == "record") { ;return (v($fields), "glyph")(arrays.contains) ? v.glyph($toString) : "?" }
+    // Floats and maps cannot be keys.
+    ;if (t == "float" || t == "map") { ;return "?" }
+    ;if ((glyphs, v)($has)) { ;return glyphs[v]($toString) }
+    t == "string" ? v : "?"
+}
+
+// The value of layer at position p, or null if it has none there.
+;fn valueAt(ref layer, p) {
+    ;if (layer.kind == LayerKind.grid) {
+        ;const cell is (layer.source, p)(grid.at)
+            onfail { null }
+        ;return cell
+    }
+    ;const entry is (layer.source, p)($get)
+        onfail { null }
+    entry
+}
+
+// The text of the topmost layer that has something at position p, or null.
+;fn top(ref layers, p) {
+    ;var i is layers($length) - 1
+    ;while (i >= 0) {
+        ;const g is ((layers[i], p)(valueAt), layers[i].glyphs)(glyphOf)
+        ;if (g != null) { ;return g }
+        ;set i -= 1
+    }
+    null
+}
+
+// ---- The window ----
+
+// The part of the map to draw: a record { x, y, width, height } of the given
+// size, centred on position center but kept within grid g, so that it stops
+// at the map's edges. Along a side where the map is smaller than the window,
+// the map is centred in the window instead.
+;export fn follow(center, width, height, ref g) {
+    ;fn start(c, size, mapSize) {
+        ;if (mapSize <= size) { ;return ((mapSize - size) / 2)($floor) }
+        ;const s is c - (size / 2)($floor)
+        s < 0 ? 0 : s > mapSize - size ? mapSize - size : s
+    }
+    { x: (center.x, width, g.width)(start), y: (center.y, height, g.height)(start), width: width, height: height }
+}
+
+// ---- Drawing ----
+
+// The window as rows of text, one per row, from layers, listed bottom first.
+// visible is an area (an array of positions) that the player sees now, or
+// null for everything. A cell that is not visible is drawn from memory, with
+// the glyph table memoryGlyphs, or as a space if nothing is remembered there;
+// memory may be null for none.
+;export fn rows(ref layers, window, ref visible, ref memory, ref memoryGlyphs) {
+    ;var seen is null
+    ;if (visible != null) {
+        ;set seen to [:]
+        ;var i is 0
+        ;while (i < visible($length)) {
+            ;set seen[visible[i]] to true
+            ;set i += 1
+        }
+    }
+    ;var out is []
+    ;var y is window.y
+    ;while (y < window.y + window.height) {
+        ;var line is []
+        ;var x is window.x
+        ;while (x < window.x + window.width) {
+            ;const p is (x, y)(grid.pos)
+            ;var g is null
+            ;if (seen == null || (seen, p)($has)) {
+                ;set g to (layers, p)(top)
+            } else if (memory != null) {
+                ;const r is (memory, p)(grid.at)
+                    onfail { null }
+                ;if (r != null) { ;set g to (r.value, memoryGlyphs)(glyphOf) }
+            }
+            ;(line, g == null ? " " : g)($push)
+            ;set x += 1
+        }
+        ;(out, (line, "")($join))($push)
+        ;set y += 1
+    }
+    out
+}
+
+// ---- Memory ----
+
+// Memory for a map of width x height cells, with nothing remembered.
+;export fn newMemory(width, height) { (width, height, null)(grid.new) }
+
+// Remembers the value of grid source at each position of area that is on both
+// grids, with an age of 0: what the player sees now, such as the terrain.
+;export fn remember(ref memory, ref source, ref area) {
+    ;var i is 0
+    ;while (i < area($length)) {
+        ;if ((source, area[i].x, area[i].y)(grid.inside)) {
+            ;(memory, area[i], { value: (source, area[i])(grid.at), age: 0 })(grid.putAt)
+                onfail { null }
+        }
+        ;set i += 1
+    }
+}
+
+// Remembers value at position p, with an age of 0, whether or not it is
+// visible: a sound heard, a magic map, a false memory. Fails if p is not on
+// the memory's grid.
+;export fn note(ref memory, p, value) {
+    ;(memory, p, { value: value, age: 0 })(grid.putAt)
+        onfail { ;fail }
+}
+
+// Forgets position p. Fails if p is not on the memory's grid.
+;export fn forget(ref memory, p) {
+    ;(memory, p, null)(grid.putAt)
+        onfail { ;fail }
+}
+
+// The value remembered at position p. Fails if nothing is remembered there,
+// or p is not on the memory's grid.
+;export fn recalled(ref memory, p) {
+    ;const r is (memory, p)(grid.at)
+        onfail { ;fail }
+    ;if (r == null) { ;fail }
+    r.value
+}
+
+// The age of the memory at position p. Fails if nothing is remembered there,
+// or p is not on the memory's grid.
+;export fn ageOf(ref memory, p) {
+    ;const r is (memory, p)(grid.at)
+        onfail { ;fail }
+    ;if (r == null) { ;fail }
+    r.age
+}
+
+// Sets the age of the memory at position p, such as to make a vivid memory
+// last (a negative age lasts longer than any limit) or to refresh one. Fails
+// if nothing is remembered there, or p is not on the memory's grid.
+;export fn setAge(ref memory, p, age) {
+    ;const r is (memory, p)(grid.at)
+        onfail { ;fail }
+    ;if (r == null) { ;fail }
+    ;(memory, p, { value: r.value, age: age })(grid.putAt)
+}
+
+// setAge for every remembered cell at the positions of area, such as a recall
+// spell or a familiar place. Positions not on the memory's grid, or with
+// nothing remembered, are skipped.
+;export fn setAgeArea(ref memory, ref area, age) {
+    ;var cells is memory.cells
+    ;var i is 0
+    ;while (i < area($length)) {
+        ;const p is area[i]
+        ;if ((memory, p.x, p.y)(grid.inside)) {
+            ;const k is p.y * memory.width + p.x
+            ;if (cells[k] != null) { ;set cells[k] to { value: cells[k].value, age: age } }
+        }
+        ;set i += 1
+    }
+    ;set memory.cells to cells
+}
+
+// Ages cell i of cells by amount, forgetting it if its age is then above limit.
+;fn ageCell(ref cells, i, amount, limit) {
+    ;const r is cells[i]
+    ;if (r == null) { ;return }
+    ;const age is r.age + amount
+    ;set cells[i] to age > limit ? null : { value: r.value, age: age }
+}
+
+// Ages every remembered cell by amount, and forgets those whose age is then
+// above limit. The game chooses both, such as by the player's Intelligence or
+// how strange the place is; cells seen again with remember are 0 once more.
+// A negative amount makes memories younger, so that they last longer; to set
+// ages outright, use setAge or setAgeArea.
+;export fn fade(ref memory, amount, limit) {
+    ;var cells is memory.cells
+    ;var i is 0
+    ;while (i < cells($length)) {
+        ;(cells, i, amount, limit)(ageCell)
+        ;set i += 1
+    }
+    ;set memory.cells to cells
+}
+
+// fade for the remembered cells at the positions of area only, such as a
+// place where memory fails faster, or, with a negative amount, one that is
+// remembered better. Positions not on the memory's grid are skipped, and a
+// position listed twice is aged twice.
+;export fn fadeArea(ref memory, ref area, amount, limit) {
+    ;var cells is memory.cells
+    ;var i is 0
+    ;while (i < area($length)) {
+        ;const p is area[i]
+        ;if ((memory, p.x, p.y)(grid.inside)) { ;(cells, p.y * memory.width + p.x, amount, limit)(ageCell) }
+        ;set i += 1
+    }
+    ;set memory.cells to cells
+}
+
+;end

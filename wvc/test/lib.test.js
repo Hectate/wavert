@@ -458,3 +458,141 @@ test('maps: getOr, add and pushTo', { skip }, () => {
 ;"{(piles["a"], ",")($join)} {(before, ",")($join)}"($print)`),
   lines('3 -1 0 orc,rat', 'coin,gem rock 2', 'x,y x'));
 });
+
+// ---- view.wvt ----
+
+// A 6 x 3 room: walls along the top, a door at 3,2, items and actors on it.
+const viewProgram = (body) => `;import grid from "$lib/grid.wvt"
+;import view from "$lib/view.wvt"
+;import maps from "$lib/maps.wvt"
+;enum Terrain (floor, wall, door)
+;const tiles is [Terrain.floor: ".", Terrain.wall: "#", Terrain.door: "+"]
+;var terrain is (6, 3, Terrain.floor)(grid.new)
+;(terrain, ((0, 0)(grid.pos), (5, 0)(grid.pos))(grid.rect), Terrain.wall)(grid.fill)
+;(terrain, 3, 2, Terrain.door)(grid.put)
+;var items is [:]
+;var actors is [:]
+;const whole is { x: 0, y: 0, width: 6, height: 3 }
+;const all is ((0, 0)(grid.pos), (5, 2)(grid.pos))(grid.rect)
+;const left is ((0, 0)(grid.pos), (2, 2)(grid.pos))(grid.rect)
+;fn layers() { [(terrain, tiles)(view.gridLayer), (items, [:])(view.mapLayer), (actors, [:])(view.mapLayer)] }
+;fn draw(window, ref visible, ref memory) { (((layers), window, visible, memory, tiles)(view.rows), "|")($join)($print) }
+${body}`;
+
+test('view: layers, topmost first, with glyphs for each kind of value', { skip }, () => {
+  assert.equal(out(viewProgram(`
+;(whole, null, null)(draw)
+// A pile shows its last item; an actor record its glyph field; a string itself.
+;(items, (1, 1)(grid.pos), "$")(maps.pushTo)
+;(items, (1, 1)(grid.pos), "!")(maps.pushTo)
+;(items, (3, 2)(grid.pos), "%")(maps.pushTo)
+;set actors[(3, 2)(grid.pos)] to { glyph: "o", hp: 5, bag: [] }
+;set actors[(4, 1)(grid.pos)] to "@"
+;set actors[(5, 1)(grid.pos)] to { hp: 1 }
+;set actors[(5, 2)(grid.pos)] to 1.5
+;(whole, null, null)(draw)
+// Empty piles and null cells are empty: the layers below show through.
+;set items[(1, 1)(grid.pos)] to []
+;set actors[(5, 2)(grid.pos)] to null
+;(whole, null, null)(draw)`)),
+  lines('######|......|...+..', '######|.!..@?|...o.?', '######|....@?|...o..'));
+});
+
+test('view: what is not visible is drawn from memory, which the terrain does not change', { skip }, () => {
+  assert.equal(out(viewProgram(`
+;var memory is (6, 3)(view.newMemory)
+;set actors[(4, 1)(grid.pos)] to "@"
+;(memory, terrain, left)(view.remember)
+;(whole, left, memory)(draw)
+// Seen once, then out of sight: the door becomes a wall unseen, and is still
+// remembered as a door; actors are not remembered.
+;(memory, terrain, all)(view.remember)
+;(terrain, 3, 2, Terrain.wall)(grid.put)
+;(whole, left, memory)(draw)
+// Seen again, the memory is brought up to date.
+;(memory, terrain, all)(view.remember)
+;(whole, left, memory)(draw)
+;"{(memory, (3, 2)(grid.pos))(view.recalled)} {(memory, (0, 0)(grid.pos))(view.ageOf)}"($print)
+// Visible everything: memory is not used.
+;(whole, null, memory)(draw)`)),
+  lines('###   |...   |...   ', '######|......|...+..', '######|......|...#..', 'wall 0', '######|....@.|...#..'));
+});
+
+test('view: noting, forgetting and fading memory', { skip }, () => {
+  assert.equal(out(viewProgram(`
+;var memory is (6, 3)(view.newMemory)
+;(memory, terrain, all)(view.remember)
+// A sound heard out of sight is noted, whatever is visible.
+;(memory, (5, 1)(grid.pos), "!")(view.note)
+;(memory, (4, 1)(grid.pos))(view.forget)
+;(whole, left, memory)(draw)
+;(memory, 3, 5)(view.fade)
+;(memory, terrain, left)(view.remember)
+;"{(memory, (5, 1)(grid.pos))(view.ageOf)} {(memory, (0, 0)(grid.pos))(view.ageOf)}"($print)
+// Ages above the limit are forgotten; what is seen again starts at 0.
+;(memory, 3, 5)(view.fade)
+;(whole, left, memory)(draw)
+;const age is (memory, (5, 1)(grid.pos))(view.ageOf)
+    onfail { "forgotten" }
+;const off is (memory, (9, 9)(grid.pos))(view.recalled)
+    onfail { "off the map" }
+;(memory, (9, 9)(grid.pos), "!")(view.note)
+    onfail { null }
+;"{age} {off}"($print)`)),
+  lines('######|.... !|...+..', '3 0', '###   |...   |...   ', 'forgotten off the map'));
+});
+
+test('view: setting ages, and fading only an area', { skip }, () => {
+  assert.equal(out(viewProgram(`
+;var memory is (6, 3)(view.newMemory)
+;(memory, terrain, all)(view.remember)
+;(memory, (0, 0)(grid.pos), 3)(view.setAge)
+;(memory, (1, 0)(grid.pos), -100)(view.setAge)
+;"{(memory, (0, 0)(grid.pos))(view.ageOf)} {(memory, (1, 0)(grid.pos))(view.ageOf)}"($print)
+// An age equal to the limit is kept, and one above it forgotten; a vivid
+// memory outlasts the limit.
+;(memory, 2, 5)(view.fade)
+;"{(memory, (0, 0)(grid.pos))(view.ageOf)} {(memory, (1, 0)(grid.pos))(view.ageOf)} {(memory, (2, 0)(grid.pos))(view.ageOf)}"($print)
+;(memory, 2, 5)(view.fade)
+;const gone is (memory, (0, 0)(grid.pos))(view.ageOf)
+    onfail { "forgotten" }
+;"{gone} {(memory, (1, 0)(grid.pos))(view.ageOf)}"($print)
+// Only the right half fades here, like a place where memory fails faster;
+// positions off the grid are skipped.
+;var fresh is (6, 3)(view.newMemory)
+;(fresh, terrain, all)(view.remember)
+;const right is ((3, 0)(grid.pos), (7, 2)(grid.pos))(grid.rect)
+;(fresh, right, 10, 5)(view.fadeArea)
+;(whole, [], fresh)(draw)
+;(fresh, ((0, 0)(grid.pos), 1)(grid.square), 3, 5)(view.fadeArea)
+;"{(fresh, (0, 0)(grid.pos))(view.ageOf)} {(fresh, (1, 1)(grid.pos))(view.ageOf)} {(fresh, (2, 2)(grid.pos))(view.ageOf)}"($print)
+// A negative amount makes memories younger; setAgeArea sets ages outright,
+// skipping cells off the grid and cells with nothing remembered.
+;(fresh, [(0, 0)(grid.pos)], -5, 5)(view.fadeArea)
+;(fresh, [(1, 1)(grid.pos), (5, 0)(grid.pos), (9, 9)(grid.pos)], 7)(view.setAgeArea)
+;const forgotten is (fresh, (5, 1)(grid.pos))(view.ageOf)
+    onfail { "-" }
+;"{(fresh, (0, 0)(grid.pos))(view.ageOf)} {(fresh, (1, 1)(grid.pos))(view.ageOf)} {forgotten}"($print)
+// setAge needs something remembered, on the grid.
+;var none is "set"
+;(fresh, (5, 0)(grid.pos), 1)(view.setAge)
+    onfail { ;set none to "nothing there" }
+;var off is "set"
+;(fresh, (9, 9)(grid.pos), 1)(view.setAge)
+    onfail { ;set off to "off the map" }
+;"{none} {off}"($print)`)),
+  lines('3 -100', '5 -98 2', 'forgotten -96', '###   |...   |...   ', '3 3 0', '-2 7 -', 'nothing there off the map'));
+});
+
+test('view: the window follows a position and stops at the edges', { skip }, () => {
+  assert.equal(out(viewProgram(`
+;fn show(w) { "{w.x},{w.y} {w.width}x{w.height}" }
+;var big is (20, 10, Terrain.floor)(grid.new)
+;"{((10, 5)(grid.pos), 6, 4, big)(view.follow)(show)} {((0, 0)(grid.pos), 6, 4, big)(view.follow)(show)} {((19, 9)(grid.pos), 6, 4, big)(view.follow)(show)}"($print)
+// A map smaller than the window is centred in it.
+;const w is ((1, 1)(grid.pos), 10, 5, terrain)(view.follow)
+;w(show)($print)
+;(w, null, null)(draw)
+;(((0, 2)(grid.pos), 4, 2, terrain)(view.follow), null, null)(draw)`)),
+  lines('7,3 6x4 0,0 6x4 14,6 6x4', '-2,-1 10x5', '          |  ######  |  ......  |  ...+..  |          ', '....|...+'));
+});
