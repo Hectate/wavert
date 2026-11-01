@@ -1,6 +1,8 @@
-# Wavert Language Specification (Draft 0.1)
+# Wavert Language Specification (Draft 0.2)
 
-> Draft 0.1 is the first Wavert specification. Wavert is derived from Γ-- ([wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). It changes Γ--'s syntax and names and keeps its semantics; [hybrid-syntax.md](hybrid-syntax.md) gives the reasons for each change. Section numbers follow the Γ-- specification, so a reference such as §10.4 means the same topic in both.
+> Draft 0.1 was the first Wavert specification. Wavert is derived from Γ-- ([wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). It changes Γ--'s syntax and names and keeps its semantics; [hybrid-syntax.md](hybrid-syntax.md) gives the reasons for each change. Section numbers follow the Γ-- specification, so a reference such as §10.4 means the same topic in both.
+>
+> Draft 0.2 adds key input (`$readKey`) and terminal output on Windows (§12.2), and the clock and random numbers (§12.8).
 
 ## 1. Overview
 
@@ -716,6 +718,7 @@ Standard semantics throughout.
 | `$write` | `;x($write)` | stdout, no newline |
 | `$eprint` | `;x($eprint)` | stderr, then a newline |
 | `$readLine` | `;($readLine)` | One line of stdin, without its line ending. Fails at the end of input. |
+| `$readKey` | `;($readKey)` | One key press from stdin, without echo and without waiting for Enter (below). Fails at the end of input. |
 
 `$print`, `$write` and `$eprint` accept any value with an interpolation conversion (§9.3); other values panic.
 
@@ -728,6 +731,78 @@ Standard semantics throughout.
 - Where the host has signals and leaves `SIGPIPE` at its default, the program is killed by it, and shells report status 141 (128 + 13).
 - Elsewhere (Windows, or a host that ignores `SIGPIPE`, such as Node) the program exits with code 141.
 - It is not a panic or a fail, so nothing can handle it.
+
+**Terminal output.** Output is written unchanged, so ANSI (VT100 and xterm) escape sequences written with `\u{1B}` control a terminal: `;"\u{1B}[2J\u{1B}[H"($write)` clears the screen and moves the cursor to the top left. On Windows the runtime turns on virtual terminal processing for the console at startup, so these sequences work there too.
+
+**Keys.** `$readKey` waits for one key press and returns it as a string:
+```
+;const key is ($readKey)
+;match (key) {
+    case "h", "left" { ;(-1, 0)(move) }
+    case "l", "right" { ;(1, 0)(move) }
+    case "q", "escape" { ;exit }
+}
+```
+- A key that types a character gives that character, with Shift and the keyboard layout applied: `"a"`, `"A"`, `"?"`, `" "`, `"é"`.
+- Every other key has a name of at least two characters, so `key($length) == 1` tells a character from a named key:
+
+| Key | Name |
+|---|---|
+| Enter, numpad Enter | `"enter"` |
+| Tab | `"tab"` |
+| Backspace | `"backspace"` |
+| Escape | `"escape"` |
+| arrows | `"up"`, `"down"`, `"left"`, `"right"` |
+| Home, End, Page Up, Page Down, Insert, Delete | `"home"`, `"end"`, `"pageup"`, `"pagedown"`, `"insert"`, `"delete"` |
+| numpad 5 with Num Lock off | `"clear"` |
+| F1 to F12 | `"f1"` to `"f12"` |
+| Ctrl with a letter | `"ctrl+a"` to `"ctrl+z"`, with the exceptions below |
+| Alt with a character | `"alt+"` and the character: `"alt+x"`, `"alt+X"` |
+
+- **Modifiers.** Shift, Ctrl and Alt with a named key give the key's plain name: Shift+Tab is `"tab"` and Ctrl+Up is `"up"`. Terminals do not report these combinations consistently.
+  - Ctrl+H, Ctrl+I, Ctrl+J and Ctrl+M give `"backspace"`, `"tab"`, `"enter"` and `"enter"` on every platform, because terminals send them as the same bytes as those keys.
+  - Ctrl+C and Ctrl+Z are never returned (Terminal state, below).
+  - AltGr, and Ctrl+Alt where it types a character, gives the character: `"@"` on a German layout, not `"alt+@"`.
+  - Alt+`[` and Alt+`O` are not available, because the bytes they send start escape sequences.
+- Anything else, such as another key, an unrecognized escape sequence or a modifier key on its own, is discarded, and `$readKey` keeps waiting. Releasing a key gives nothing. A key held down gives one key press for each auto-repeat.
+- At the end of input, `$readKey` fails with code 1, like `$readLine`.
+
+**Decoding.** On a POSIX terminal, and on every platform when stdin is not a terminal, `$readKey` decodes stdin as text (§12.1). The Windows console reports keys directly, and the runtime maps them to the same strings. Each call reads one key:
+- `"\r"`, `"\n"` and `"\r\n"` are each one `"enter"`. `"\t"` is `"tab"`. U+0008 and U+007F are `"backspace"`.
+- The other code points from U+0001 to U+001A are `"ctrl+a"` to `"ctrl+z"`, except U+0003 (Ctrl+C) and U+001A (Ctrl+Z), which are discarded when stdin is not a terminal.
+- Any other control character, other than U+001B, is discarded. Every other code point is a character key.
+- U+001B (ESC) begins an escape sequence:
+  - `ESC [` begins a control sequence: parameter bytes `0`–`?`, then intermediate bytes (space to `/`), then one final byte (`@` to `~`). `ESC O` and `ESC [[` (the Linux console's F1 to F5) are each followed by one byte.
+  - The recognized sequences are those in the table below. Parameters after a `;` are modifiers and are ignored, so `ESC [1;5A` (Ctrl+Up) is `"up"`. A complete sequence that is not in the table is discarded.
+  - `ESC` followed by a character key is `"alt+"` and that character.
+  - `ESC` followed by anything else is `"escape"`, and the bytes after it are read as the next keys.
+  - In a terminal, an `ESC` that nothing follows within 50 ms is `"escape"`. Otherwise, an `ESC` at the end of input is `"escape"`.
+
+| Sequence | Key | | Sequence | Key |
+|---|---|---|---|---|
+| `ESC [A`, `ESC OA` | `"up"` | | `ESC [2~` | `"insert"` |
+| `ESC [B`, `ESC OB` | `"down"` | | `ESC [3~` | `"delete"` |
+| `ESC [C`, `ESC OC` | `"right"` | | `ESC [5~` | `"pageup"` |
+| `ESC [D`, `ESC OD` | `"left"` | | `ESC [6~` | `"pagedown"` |
+| `ESC [H`, `ESC OH`, `ESC [1~`, `ESC [7~` | `"home"` | | `ESC [E`, `ESC OE`, `ESC [G` | `"clear"` |
+| `ESC [F`, `ESC OF`, `ESC [4~`, `ESC [8~` | `"end"` | | `ESC OM` | `"enter"` |
+| `ESC OP`, `ESC [11~`, `ESC [[A` | `"f1"` | | `ESC [17~` | `"f6"` |
+| `ESC OQ`, `ESC [12~`, `ESC [[B` | `"f2"` | | `ESC [18~` | `"f7"` |
+| `ESC OR`, `ESC [13~`, `ESC [[C` | `"f3"` | | `ESC [19~` | `"f8"` |
+| `ESC OS`, `ESC [14~`, `ESC [[D` | `"f4"` | | `ESC [20~` | `"f9"` |
+| `ESC [15~`, `ESC [[E` | `"f5"` | | `ESC [21~` | `"f10"` |
+| `ESC [23~` | `"f11"` | | `ESC [24~` | `"f12"` |
+| `ESC [Z` (Shift+Tab) | `"tab"` | | | |
+
+Because redirected input is decoded the same way, a program that reads keys can be tested with a file: `"jjl\u{1B}[A\n"` is `"j"`, `"j"`, `"l"`, `"up"`, `"enter"`.
+
+**Terminal state.** When stdin is a terminal, the first `$readKey` call turns off echo and line buffering, and they stay off until the program ends. Keys pressed while the program is busy are kept for the next `$readKey` and are not shown.
+- Output is not affected: `"\n"` still starts a new line at the left edge.
+- `$readLine` and `$run` restore the normal terminal while they run, and turn key mode back on afterwards. `$readKey` and `$readLine` share one input buffer, so keys read ahead are never lost.
+- The runtime restores the terminal however the program ends: at `;exit`, after a panic, after a broken pipe, and on Ctrl+C.
+- **Ctrl+C** ends the program, at any time, as it does without key mode. It is not a panic or a fail, so nothing can handle it. Where the host has signals, the program is killed by `SIGINT` after the terminal is restored, and shells report status 130 (128 + 2). Elsewhere (Windows) it exits with code 130.
+- **Ctrl+Z** suspends the program on POSIX as usual. The terminal is restored while it is suspended, and key mode comes back when it resumes. On Windows Ctrl+Z is discarded.
+- Other control keys that terminals normally intercept, such as Ctrl+S, Ctrl+Q, Ctrl+V and Ctrl+O, have no special meaning in key mode and are returned as `"ctrl+s"` and so on.
 
 ### 12.3 Files
 | Builtin | Call | Notes |
@@ -770,16 +845,74 @@ Paths are strings. A relative path is relative to the current directory. `/` wor
 | Name | Arity | | Name | Arity |
 |---|---|---|---|---|
 | `$print`, `$write`, `$eprint` | 1 | | `$push`, `$same`, `$at`, `$split`, `$join` | 2 |
-| `$readLine` | 0 | | `$slice` | 3 |
+| `$readLine`, `$readKey` | 0 | | `$slice` | 3 |
 | `$readFile`, `$fileExists`, `$listDir`, `$deleteFile` | 1 | | `$length`, `$code`, `$fromCode`, `$pop` | 1 |
 | `$writeFile`, `$appendFile` | 2 | | `$toString`, `$toInt`, `$toFloat` | 1 |
 | `$env` | 1 | | `$floor`, `$ceil`, `$round`, `$trunc`, `$toUint32`, `$isNan` | 1 |
 | `$run` | 2 | | `$typeOf`, `$fields` | 1 |
-| `$args`, `$programPath` | constant | | | |
+| `$args`, `$programPath` | constant | | `$time` | 0 |
+| `$newRandom`, `$randomFloat` | 1 | | `$random` | 2 |
 
 ### 12.7 Shell usage note
 - In shells, `$name` inside double quotes is expanded by the shell. Quote Wavert source with single quotes.
 - In Makefiles, write `$$print`.
+
+### 12.8 Time and random numbers
+| Builtin | Call | Notes |
+|---|---|---|
+| `$time` | `;($time)` | Milliseconds since 1970-01-01 00:00 UTC, as an int. |
+| `$newRandom` | `;seed($newRandom)` | A new random number generator, started from an int seed. |
+| `$random` | `;(rng, n)($random)` | A uniformly random int from 0 to `n - 1`. Advances `rng`. |
+| `$randomFloat` | `;rng($randomFloat)` | A uniformly random float from `0.0` up to, but not including, `1.0`. Advances `rng`. |
+
+```
+;var rng is ($time)($newRandom)
+;const roll is (rng, 6)($random) + 1        // 1 to 6
+;const chance is rng($randomFloat)          // 0.0 <= chance < 1.0
+```
+
+**`$time`**
+- It reads the system clock, which can be adjusted while a program runs, so a later call may return a smaller value. Use it for seeds and timestamps, not for measuring short intervals.
+
+**Generators**
+- A generator is an ordinary **mutable record** with four fields, `s0`, `s1`, `s2` and `s3`, each an int from 0 to 2^32 − 1. `$newRandom` is the only stdlib function that returns a mutable value, because `$random` and `$randomFloat` advance the generator in place.
+- Hold a generator in a `var` or `ref` binding, and pass it to `var` or `ref` parameters. A `const` binding or a plain parameter takes a frozen snapshot (§10.4), and `$random` on a frozen generator panics: `random generator is frozen; hold it in a var or ref binding`. So a snapshot can never silently repeat numbers.
+- `$random` and `$randomFloat` panic if their argument is not a generator: a record with exactly those four fields, each an int in range, not all zero.
+- `$random` panics unless `n` is an int from 1 to 2^32.
+- The seed is any int. The same seed gives the same numbers on every backend and in every later version of Wavert: the algorithm below is part of this specification.
+- Generators are independent. A program can use one for building levels and another for combat, so a level stays the same when combat code changes how many numbers it draws.
+- A generator's state is plain data. To save it, write its four fields; to restore it, declare a record: `;var rng is { s0: a, s1: b, s2: c, s3: d }`. `;const saved is rng` takes a snapshot, and `;var replay is saved` makes a mutable copy that repeats the numbers drawn since the snapshot.
+
+**The algorithm.** In this section the arithmetic is on unsigned 32-bit words, modulo 2^32. `>>` is a logical shift, and `rotl(x, k)` rotates `x` left by `k` bits.
+
+`mix(z)` is MurmurHash3's finalizer:
+```
+z ^= z >> 16;  z *= 0x85EBCA6B;  z ^= z >> 13;  z *= 0xC2B2AE35;  z ^= z >> 16
+```
+
+`seed($newRandom)`:
+1. Let `a = |seed|`. Let `lo = a mod 2^32`, and `hi = (a / 2^32)($floor)`, plus 2^21 if `seed` is negative. So each int seed gives a different (`lo`, `hi`) pair.
+2. Let `k = mix(hi)` and `c = lo`. For `i` from 0 to 3: `c += 0x9E3779B9`, then `s_i = mix(c) ^ k`.
+   - The four values of `c` are distinct and `mix` is a bijection, so the state is never all zero.
+
+Each draw takes the next word from the state with xoshiro128\*\*:
+```
+result = rotl(s1 * 5, 7) * 9
+t = s1 << 9
+s2 ^= s0;  s3 ^= s1;  s1 ^= s2;  s0 ^= s3;  s2 ^= t;  s3 = rotl(s3, 11)
+```
+
+- `(rng, n)($random)`: if `n` is 2^32, the result is the next word. Otherwise let `limit = 2^32 - (2^32 % n)`; take words until one, `x`, is below `limit`; the result is `x % n`. This rejection keeps every result equally likely.
+- `rng($randomFloat)`: let `a` be the next word `>> 5` and `b` the word after it `>> 6`; the result is `(a * 2^26 + b) / 2^53`. Every float of this form, a multiple of 2^-53, is equally likely, and every step is exact.
+
+**Test vectors.** Each row starts from a new generator:
+
+| Seed | State after `$newRandom` (`s0`, `s1`, `s2`, `s3`) | First three `(rng, 2 ** 32)($random)` | Then ten `(rng, 6)($random) + 1` | Then `$randomFloat` |
+|---|---|---|---|---|
+| `0` | 2462723854, 1020716019, 454327756, 1275600319 | 3809008728, 1133695204, 53579671 | 2 5 6 5 5 2 2 5 2 2 | 0.03675754159325517 |
+| `42` | 939911724, 3948730756, 321366731, 3317318717 | 2837322924, 544945897, 479756282 | 1 1 1 5 5 1 3 4 5 2 | 0.9413209019046839 |
+| `-1` | 1230266541, 3444054614, 1223295138, 2790874657 | 3595603721, 2847986304, 2405519406 | 4 1 6 1 4 1 2 2 2 5 | 0.9764833627496556 |
+| `9007199254740991` | 4221021587, 828809510, 3839744293, 2807036324 | 2234112851, 4039453707, 186702156 | 4 5 1 3 3 5 4 3 4 2 | 0.07880611131754844 |
 
 ---
 
@@ -897,7 +1030,12 @@ More examples are in [examples/](../examples/).
   - A fail sets a pending code and returns. After each call, the caller either handles it with `onfail` or turns it into a panic (the one-frame rule). A panic prints the function stack and ends the program; nothing unwinds.
   - C leaves the order of a call's arguments unspecified, so arguments whose order matters are evaluated into temporaries, left to right.
   - Float text and `$toFloat` are exact on any C library: the runtime corrects `strtod` with an exact comparison. Float `**` uses fdlibm's `pow` (§11.2).
+- **Key input (§12.2).**
+  - On POSIX, key mode clears `ECHO`, `ICANON`, `IEXTEN`, `IXON` and `ICRNL`, and keeps `ISIG` and `OPOST`, so Ctrl+C and Ctrl+Z still raise signals and output keeps its newline handling. Handlers for `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT` and `SIGPIPE` restore the terminal and raise the signal again with its default action. The handler for `SIGTSTP` restores the terminal, stops the program with the default action, and reapplies key mode when the program resumes.
+  - On Windows, key mode clears `ENABLE_ECHO_INPUT` and `ENABLE_LINE_INPUT` and keeps `ENABLE_PROCESSED_INPUT`. Keys come from `ReadConsoleInputW` key-down events and are mapped by virtual-key code and character.
 - **JavaScript backend notes.** Ints are JavaScript numbers and floats are wrapped, so `/`, `==` and interpolation follow §11.2. Frozen arrays and records use `Object.freeze`, mutable records `Object.seal`. Records are null-prototype objects with mangled field names. A fail is thrown and caught at each call that has `onfail`.
+  - `$readKey` uses `process.stdin.setRawMode` and synchronous reads. Node's raw mode also turns off signals, so Ctrl+C ends the program only while `$readKey` is waiting, when the runtime reads it as U+0003, and Ctrl+Z is discarded. The escape-sequence wait is the bytes that arrive in the same read.
+  - `$random` uses `Math.imul` and `>>> 0` for the 32-bit arithmetic.
 - **Editor support.** [editors/vscode/](../editors/vscode/) has syntax highlighting and snippets for VS Code.
 - **Tests.** `wvc/test` runs every example on both backends, checks this specification's syntax and diagnostics, and checks the bootstrap fixed point.
 
@@ -916,6 +1054,8 @@ More examples are in [examples/](../examples/).
 - Maps: a separate type from records, with a literal syntax, key types, `map[key]` indexing, and builtins such as `$keys`, `$has` and `$remove`.
 - A pipeline operator `|>`. It is a syntax error today, so it can be added later without breaking code. Postfix calls already read as a pipeline; revisit after counting real inside-out chains.
 - A type test operator. It should not be spelled `is`, which is a contextual keyword in declarations (§2.5).
+- More terminal support: the terminal's size, whether stdin or stdout is a terminal, waiting for a key with a timeout, and mouse input. Today `$readKey` always blocks.
+- A monotonic clock for measuring intervals, and a way to sleep.
 
 **Rejected**
 - Methods or uniform call syntax: `.` stays member access only, and calls stay postfix (§10.8).
@@ -923,3 +1063,4 @@ More examples are in [examples/](../examples/).
 
 **Runtime**
 - Copy-on-write storage for the copies of §10.4. It would change no behavior, only memory use.
+- Reclaiming memory. The C backend's arena is never freed (§15), so a long-running program, such as a game that redraws the screen every turn, grows without limit. Options include a garbage collector, or an arena that the program can reset between turns.

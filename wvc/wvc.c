@@ -25,10 +25,14 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <termios.h>
+#include <time.h>
 #include <unistd.h>
 extern char **environ;
 #endif
@@ -78,9 +82,10 @@ static inline double nv(wv x) { return x.tag == T_INT ? (double)x.i : x.f; }
 
 static char *ar_p, *ar_end;
 static void rt_flush(void);
+static void term_restore(void);
 static void *xmalloc(size_t n) {
   void *p = malloc(n ? n : 1);
-  if (!p) { rt_flush(); fputs("out of memory\n", stderr); exit(1); } // output written before the failure still appears
+  if (!p) { rt_flush(); term_restore(); fputs("out of memory\n", stderr); exit(1); } // output written before the failure still appears
   return p;
 }
 static void *rt_alloc(size_t n) {
@@ -328,7 +333,7 @@ static void write_raw(int fd, const char *p, size_t n) {
     DWORD done;
     if (!WriteFile(h, p, n > 0x40000000 ? 0x40000000 : (DWORD)n, &done, NULL)) {
       DWORD e = GetLastError();
-      if (e == ERROR_NO_DATA || e == ERROR_BROKEN_PIPE) ExitProcess(BROKEN_PIPE);
+      if (e == ERROR_NO_DATA || e == ERROR_BROKEN_PIPE) { term_restore(); ExitProcess(BROKEN_PIPE); }
       return;
     }
     p += done;
@@ -342,7 +347,7 @@ static void write_raw(int fd, const char *p, size_t n) {
     ssize_t k = write(fd, p, n);
     if (k < 0) {
       if (errno == EINTR || errno == EAGAIN) continue;
-      if (errno == EPIPE) _exit(BROKEN_PIPE);
+      if (errno == EPIPE) { term_restore(); _exit(BROKEN_PIPE); }
       return;
     }
     p += k;
@@ -1160,6 +1165,7 @@ static _Noreturn void rt_panic(wv v) {
 
 static void rt_exit_code(int64_t code) {
   rt_flush();
+  term_restore();
 #ifdef _WIN32
   ExitProcess((UINT)code);
 #else
@@ -1310,9 +1316,389 @@ static wv print_to(int fd, wv v, int nl) {
 static wv std_print(wv v) { return print_to(1, v, 1); }
 static wv std_write(wv v) { return print_to(1, v, 0); }
 static wv std_eprint(wv v) { return print_to(2, v, 1); }
+
+// ---- the terminal and keys (§12.2) ----
+// The first $readKey on a terminal turns on key mode: no echo and no line
+// buffering. $readLine and $run turn it off while they run, and term_restore
+// turns it off however the program ends. On Windows, console output also gets
+// virtual terminal processing from startup, so escape sequences work.
+
+#ifdef _WIN32
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
+#define ENABLE_VIRTUAL_TERMINAL_INPUT 0x0200
+#endif
+static HANDLE key_in, vt_out[2];
+static DWORD key_saved, vt_saved[2];
+#else
+static struct termios key_saved;
+#endif
+static int key_started, key_tty, key_on, key_applied; // key_on: key mode is in use
+
+static void key_apply(int on) {
+  if (!key_on || key_applied == on) return;
+#ifdef _WIN32
+  DWORD raw = (key_saved & ~(DWORD)(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT)) | ENABLE_PROCESSED_INPUT;
+  SetConsoleMode(key_in, on ? raw : key_saved);
+#else
+  struct termios t = key_saved;
+  if (on) {
+    t.c_lflag &= ~(ECHO | ICANON | IEXTEN);
+    t.c_iflag &= ~(IXON | ICRNL);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+  }
+  tcsetattr(0, TCSANOW, &t);
+#endif
+  key_applied = on;
+}
+
+static void term_restore(void) {
+  key_apply(0);
+#ifdef _WIN32
+  for (int i = 1; i >= 0; i--) if (vt_out[i]) SetConsoleMode(vt_out[i], vt_saved[i]);
+#endif
+}
+
+#ifdef _WIN32
+static void vt_start(void) {
+  DWORD ids[2] = { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }, mode;
+  for (int i = 0; i < 2; i++) {
+    HANDLE h = GetStdHandle(ids[i]);
+    if (!GetConsoleMode(h, &mode)) continue;
+    vt_out[i] = h;
+    vt_saved[i] = mode;
+    SetConsoleMode(h, mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+  }
+}
+// Ctrl+C ends the program with 130 (§12.2); the console calls this on its own thread.
+static BOOL WINAPI key_ctrl(DWORD type) {
+  term_restore();
+  if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) ExitProcess(130);
+  return FALSE;
+}
+#else
+// A signal that ends the program: restore the terminal, then take the default action.
+static void key_signal(int sig) {
+  term_restore();
+  signal(sig, SIG_DFL);
+  raise(sig); // delivered when the handler returns
+}
+// Ctrl+Z: restore the terminal, stop, and turn key mode back on when resumed.
+static void key_stop(int sig) {
+  int was = key_applied;
+  term_restore();
+  signal(SIGTSTP, SIG_DFL);
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGTSTP);
+  pthread_sigmask(SIG_UNBLOCK, &s, NULL);
+  raise(SIGTSTP);
+  signal(SIGTSTP, key_stop);
+  if (was) key_apply(1);
+}
+static void key_catch(int sig, void (*handler)(int)) {
+  if (signal(sig, handler) == SIG_IGN) signal(sig, SIG_IGN); // a signal the parent ignored stays ignored
+}
+#endif
+
+static void key_start(void) {
+  if (key_started) return;
+  key_started = 1;
+#ifdef _WIN32
+  key_in = GetStdHandle(STD_INPUT_HANDLE);
+  key_tty = GetConsoleMode(key_in, &key_saved) != 0;
+  if (!key_tty) return;
+  SetConsoleCtrlHandler(key_ctrl, TRUE);
+#else
+  key_tty = isatty(0) && tcgetattr(0, &key_saved) == 0;
+  if (!key_tty) return;
+  int ends[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGPIPE };
+  for (int i = 0; i < 5; i++) key_catch(ends[i], key_signal);
+  key_catch(SIGTSTP, key_stop);
+#endif
+  key_on = 1;
+}
+
 static wv std_readLine(void) {
+  key_apply(0);
   wv line;
-  return read_line(&line) ? line : rt_std_fail("$readLine");
+  int ok = read_line(&line);
+  key_apply(1);
+  return ok ? line : rt_std_fail("$readLine");
+}
+
+// How long to wait for the bytes of a key: until they come, at most 50 ms in a
+// terminal, or not at all (only bytes already read).
+enum { K_WAIT, K_BRIEF, K_HAVE };
+
+// Byte i after in_pos, or -1 if it does not come.
+static int key_byte(size_t i, int mode) {
+  while (in_n - in_pos <= i) {
+    if (in_end || mode == K_HAVE) return -1;
+#ifndef _WIN32
+    if (mode == K_BRIEF && key_tty) {
+      struct pollfd p = { .fd = 0, .events = POLLIN };
+      if (poll(&p, 1, 50) <= 0) return -1;
+    }
+#endif
+    if (!read_more()) { in_end = 1; return -1; }
+  }
+  return (unsigned char)in_buf[in_pos + i];
+}
+
+// The code point that starts at byte i after in_pos, decoded by the
+// maximal-subpart rule (§12.1); *len is set to its length in bytes. -1 if there
+// is no byte at i. The rest of a character comes with its first byte, so mode
+// only decides whether to wait for the first.
+static int64_t key_cp(size_t i, int mode, int *len) {
+  int b = key_byte(i, mode);
+  if (b < 0) return -1;
+  *len = 1;
+  if (b < 0x80) return b;
+  int need = b >= 0xC2 && b <= 0xDF ? 1 : b >= 0xE0 && b <= 0xEF ? 2 : b >= 0xF0 && b <= 0xF4 ? 3 : 0;
+  if (!need) return 0xFFFD;
+  uint32_t cp = b & (need == 1 ? 0x1F : need == 2 ? 0x0F : 0x07);
+  int lo = b == 0xE0 ? 0xA0 : b == 0xF0 ? 0x90 : 0x80, hi = b == 0xED ? 0x9F : b == 0xF4 ? 0x8F : 0xBF;
+  for (int k = 1; k <= need; k++) {
+    int c = key_byte(i + k, mode == K_HAVE ? K_HAVE : K_WAIT);
+    if (c < lo || c > hi) return 0xFFFD;
+    cp = (cp << 6) | (c & 0x3F);
+    lo = 0x80;
+    hi = 0xBF;
+    *len = k + 1;
+  }
+  return cp;
+}
+
+// A code point that types a character: not a control character.
+static int is_char(int64_t c) { return c >= 0x20 && !(c >= 0x7F && c <= 0x9F); }
+
+static wv key_char(const char *prefix, uint32_t c) {
+  sb b = { 0 };
+  sb_puts(&b, prefix);
+  utf8_put(&b, c);
+  return sb_str(&b);
+}
+
+// Ctrl with a letter, c from 1 (Ctrl+A) to 26; 0 if it is discarded.
+static int ctrl_key(int c, wv *out) {
+  if (c == 3 || c == 26) return 0; // Ctrl+C and Ctrl+Z are signals, never keys
+  const char *name = c == 8 ? "backspace" : c == 9 ? "tab" : c == 10 || c == 13 ? "enter" : NULL;
+  *out = name ? rt_cstr(name) : key_char("ctrl+", 'a' + c - 1);
+  return 1;
+}
+
+static const char *const key_fs[] = { "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12" };
+
+// The key named by ESC [ params final, with no intermediate bytes; NULL if none.
+static const char *csi_key(const char *p, size_t n, int final) {
+  int num = -1; // the first parameter; -1 if it is empty
+  for (size_t k = 0; k < n && p[k] != ';'; k++) {
+    if (p[k] < '0' || p[k] > '9' || num > 1000) return NULL;
+    num = (num < 0 ? 0 : num * 10) + (p[k] - '0');
+  }
+  if (final == '~') {
+    switch (num) {
+      case 1: case 7: return "home";
+      case 2: return "insert";
+      case 3: return "delete";
+      case 4: case 8: return "end";
+      case 5: return "pageup";
+      case 6: return "pagedown";
+      case 23: return "f11";
+      case 24: return "f12";
+    }
+    if (num >= 11 && num <= 15) return key_fs[num - 11];
+    if (num >= 17 && num <= 21) return key_fs[num - 12];
+    return NULL;
+  }
+  if (num != -1 && num != 1) return NULL;
+  switch (final) {
+    case 'A': return "up";
+    case 'B': return "down";
+    case 'C': return "right";
+    case 'D': return "left";
+    case 'H': return "home";
+    case 'F': return "end";
+    case 'E': case 'G': return "clear";
+    case 'Z': return "tab";
+  }
+  return NULL;
+}
+// The key named by ESC O final.
+static const char *ss3_key(int final) {
+  switch (final) {
+    case 'A': return "up";
+    case 'B': return "down";
+    case 'C': return "right";
+    case 'D': return "left";
+    case 'H': return "home";
+    case 'F': return "end";
+    case 'E': return "clear";
+    case 'M': return "enter";
+    case 'P': return "f1";
+    case 'Q': return "f2";
+    case 'R': return "f3";
+    case 'S': return "f4";
+  }
+  return NULL;
+}
+
+// A key that starts with ESC: 1 with *out set, or 0 if it is discarded.
+static int esc_key(wv *out, int brief) {
+  int b1 = key_byte(1, brief);
+  if (b1 == '[' || b1 == 'O') {
+    int b2 = key_byte(2, brief);
+    if (b1 == 'O' || b2 == '[') {
+      // ESC O x, or the Linux console's ESC [[ x for F1 to F5
+      size_t at = b1 == 'O' ? 2 : 3;
+      int f = b1 == 'O' ? b2 : key_byte(3, brief);
+      if (f >= 0) {
+        in_pos += at + 1;
+        const char *name = b1 == 'O' ? ss3_key(f) : f >= 'A' && f <= 'E' ? key_fs[f - 'A'] : NULL;
+        if (!name) return 0;
+        *out = rt_cstr(name);
+        return 1;
+      }
+    } else {
+      // ESC [ parameter bytes, intermediate bytes, final byte
+      size_t i = 2, params;
+      int b = b2;
+      while (b >= 0x30 && b <= 0x3F) b = key_byte(++i, brief);
+      params = i;
+      while (b >= 0x20 && b <= 0x2F) b = key_byte(++i, brief);
+      if (b >= 0x40 && b <= 0x7E) {
+        const char *name = params == i ? csi_key(in_buf + in_pos + 2, params - 2, b) : NULL;
+        in_pos += i + 1;
+        if (!name) return 0;
+        *out = rt_cstr(name);
+        return 1;
+      }
+    }
+  } else if (b1 >= 0) {
+    int len;
+    int64_t c = key_cp(1, brief, &len);
+    if (is_char(c)) {
+      in_pos += 1 + len;
+      *out = key_char("alt+", (uint32_t)c);
+      return 1;
+    }
+  }
+  // Anything else: Escape, and what follows is read as the next keys.
+  in_pos += 1;
+  *out = rt_cstr("escape");
+  return 1;
+}
+
+// The next key from the bytes of stdin: 1 with *out set, 0 if it was
+// discarded, -1 at the end of input. wait is for a key's first byte, brief for
+// the rest of an escape sequence, and crlf for a "\n" after "\r".
+static int byte_key(wv *out, int wait, int brief, int crlf) {
+  int len;
+  int64_t c = key_cp(0, wait, &len);
+  if (c < 0) return -1;
+  if (c == 0x1B) return esc_key(out, brief);
+  in_pos += len;
+  if (c == '\r') {
+    if (key_byte(0, crlf) == '\n') in_pos++;
+    *out = rt_cstr("enter");
+    return 1;
+  }
+  if (c == 0x7F) { *out = rt_cstr("backspace"); return 1; }
+  if (c >= 1 && c <= 26) return ctrl_key((int)c, out);
+  if (!is_char(c)) return 0;
+  *out = key_char("", (uint32_t)c);
+  return 1;
+}
+
+#ifdef _WIN32
+// The next key from the console's key events, with the same results as byte_key.
+static wv key_repeat;
+static int key_repeats;
+static wchar_t key_high;
+static int console_key(wv *out) {
+  if (key_repeats > 0) {
+    key_repeats--;
+    *out = key_repeat;
+    return 1;
+  }
+  rt_flush();
+  INPUT_RECORD r;
+  DWORD got;
+  if (!ReadConsoleInputW(key_in, &r, 1, &got) || got == 0) return -1;
+  if (r.EventType != KEY_EVENT || !r.Event.KeyEvent.bKeyDown) return 0;
+  const KEY_EVENT_RECORD *k = &r.Event.KeyEvent;
+  int ctrl = (k->dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
+  int alt = (k->dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
+  WORD vk = k->wVirtualKeyCode;
+  uint32_t ch = k->uChar.UnicodeChar;
+  const char *name = NULL;
+  switch (vk) {
+    case VK_RETURN: name = "enter"; break;
+    case VK_TAB: name = "tab"; break;
+    case VK_BACK: name = "backspace"; break;
+    case VK_ESCAPE: name = "escape"; break;
+    case VK_UP: name = "up"; break;
+    case VK_DOWN: name = "down"; break;
+    case VK_LEFT: name = "left"; break;
+    case VK_RIGHT: name = "right"; break;
+    case VK_HOME: name = "home"; break;
+    case VK_END: name = "end"; break;
+    case VK_PRIOR: name = "pageup"; break;
+    case VK_NEXT: name = "pagedown"; break;
+    case VK_INSERT: name = "insert"; break;
+    case VK_DELETE: name = "delete"; break;
+    case VK_CLEAR: name = "clear"; break;
+  }
+  if (vk >= VK_F1 && vk <= VK_F12) name = key_fs[vk - VK_F1];
+  wv v;
+  if (name) {
+    v = rt_cstr(name);
+  } else if (ctrl && !alt && vk >= 'A' && vk <= 'Z') {
+    if (!ctrl_key(vk - 'A' + 1, &v)) return 0;
+  } else {
+    // A character outside the BMP comes as two events, one for each surrogate.
+    if (ch >= 0xD800 && ch <= 0xDBFF) { key_high = (wchar_t)ch; return 0; }
+    if (ch >= 0xDC00 && ch <= 0xDFFF) {
+      if (!key_high) return 0;
+      ch = 0x10000 + ((uint32_t)(key_high - 0xD800) << 10) + (ch - 0xDC00);
+      key_high = 0;
+    }
+    if (!is_char(ch)) return 0;
+    v = key_char(alt && !ctrl ? "alt+" : "", ch); // Ctrl+Alt is AltGr when it types a character
+  }
+  if (k->wRepeatCount > 1) {
+    key_repeat = v;
+    key_repeats = k->wRepeatCount - 1;
+  }
+  *out = v;
+  return 1;
+}
+#endif
+
+static wv std_readKey(void) {
+  key_start();
+  key_apply(1);
+  // Waiting: a terminal waits only briefly for the rest of an escape sequence,
+  // and does not wait for a "\n" after "\r", since Enter sends "\r" alone.
+  int wait = K_WAIT, brief = key_tty ? K_BRIEF : K_WAIT, crlf = key_tty ? K_HAVE : K_WAIT;
+#ifdef _WIN32
+  if (key_tty) wait = brief = crlf = K_HAVE; // only text left over from $readLine
+#endif
+  for (;;) {
+    wv k;
+    int r;
+#ifdef _WIN32
+    if (key_tty && in_pos == in_n) r = console_key(&k);
+    else
+#endif
+    r = byte_key(&k, wait, brief, crlf);
+    if (r < 0) return rt_std_fail("$readKey");
+    if (r > 0) return k;
+  }
 }
 
 // Reads a whole file; returns 0 on failure.
@@ -1554,7 +1940,7 @@ static wchar_t *find_program(const wchar_t *name) {
 #endif
 
 // Runs a program with this program's stdio and no shell; returns its exit code (§12.4).
-static wv std_run(wv program, wv args) {
+static wv run_program(wv program, wv args) {
   const wstr *prog = a_string(program, "$run");
   warr *a = an_array(args, "$run");
   for (int64_t i = 0; i < a->len; i++) {
@@ -1614,6 +2000,13 @@ static wv std_run(wv program, wv args) {
   if (WIFSIGNALED(status)) return rt_i(128 + WTERMSIG(status));
   return rt_i(WEXITSTATUS(status));
 #endif
+}
+// The program gets the terminal as it normally is (§12.2).
+static wv std_run(wv program, wv args) {
+  key_apply(0);
+  wv r = run_program(program, args);
+  key_apply(1);
+  return r;
 }
 
 static wv std_length(wv x) {
@@ -1850,6 +2243,118 @@ static wv std_fields(wv r) {
   return (wv){ .tag = T_ARR, .a = a };
 }
 
+// ---- time and random numbers (§12.8) ----
+
+static wv std_time(void) {
+#ifdef _WIN32
+  FILETIME ft;
+  GetSystemTimePreciseAsFileTime(&ft);
+  uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime; // 100 ns units since 1601
+  return rt_i((int64_t)(t / 10000) - 11644473600000LL);
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return rt_i((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+#endif
+}
+
+// A generator is a mutable record { s0, s1, s2, s3 } of 32-bit words. Its keys
+// are the program's own keys for those names, if it has them, so that rng.s0
+// and { s0: ... } work as for any record.
+static const wstr *rng_keys[4];
+static void rng_start(void) {
+  if (rng_keys[0]) return;
+  static const char *names[4] = { "s0", "s1", "s2", "s3" };
+  for (int i = 0; i < 4; i++) {
+    wstr probe = { 2, 2, 1, 0, names[i] };
+    const wstr *k = sym_find(&probe);
+    if (!k) {
+      wstr *s = (wstr *)str_new(names[i], 2);
+      s->sym = 1;
+      sym_add(s);
+      k = s;
+    }
+    rng_keys[i] = k;
+  }
+}
+
+// MurmurHash3's finalizer.
+static uint32_t rng_mix(uint32_t z) {
+  z ^= z >> 16;
+  z *= 0x85EBCA6Bu;
+  z ^= z >> 13;
+  z *= 0xC2B2AE35u;
+  z ^= z >> 16;
+  return z;
+}
+static inline uint32_t rotl32(uint32_t x, int k) { return (x << k) | (x >> (32 - k)); }
+
+static wv std_newRandom(wv seed) {
+  int64_t v = an_int(seed, "$newRandom");
+  uint64_t a = v < 0 ? (uint64_t)-v : (uint64_t)v;
+  uint32_t lo = (uint32_t)a, hi = (uint32_t)(a >> 32) | (v < 0 ? 1u << 21 : 0);
+  uint32_t k = rng_mix(hi), c = lo;
+  wv vals[4];
+  for (int i = 0; i < 4; i++) {
+    c += 0x9E3779B9u;
+    vals[i] = rt_i(rng_mix(c) ^ k);
+  }
+  rng_start();
+  return rt_rec(1, 4, rng_keys, vals);
+}
+
+// The four state words of a generator, in s0..s3 order; panics unless rng is one.
+static void rng_words(wv rng, const char *fn, wv **s) {
+  rng_start();
+  int ok = rng.tag == T_REC && rng.r->n == 4;
+  int64_t any = 0;
+  for (int i = 0; ok && i < 4; i++) {
+    s[i] = NULL;
+    for (int j = 0; j < 4; j++) if (rng.r->keys[j] == rng_keys[i]) s[i] = &rng.r->vals[j];
+    ok = s[i] && s[i]->tag == T_INT && s[i]->i >= 0 && s[i]->i <= 0xFFFFFFFFLL;
+    if (ok) any |= s[i]->i;
+  }
+  if (!ok || !any) rt_fail("%s: the argument is not a random generator", fn);
+  if (!rng.r->is_mut) rt_fail("random generator is frozen; hold it in a var or ref binding");
+}
+
+// The next word, by xoshiro128**.
+static uint32_t rng_next(wv **s) {
+  uint32_t s0 = (uint32_t)s[0]->i, s1 = (uint32_t)s[1]->i, s2 = (uint32_t)s[2]->i, s3 = (uint32_t)s[3]->i;
+  uint32_t result = rotl32(s1 * 5, 7) * 9, t = s1 << 9;
+  s2 ^= s0;
+  s3 ^= s1;
+  s1 ^= s2;
+  s0 ^= s3;
+  s2 ^= t;
+  s3 = rotl32(s3, 11);
+  *s[0] = rt_i(s0);
+  *s[1] = rt_i(s1);
+  *s[2] = rt_i(s2);
+  *s[3] = rt_i(s3);
+  return result;
+}
+
+static wv std_random(wv rng, wv n) {
+  wv *s[4];
+  rng_words(rng, "$random", s);
+  int64_t m = an_int(n, "$random");
+  if (m < 1 || m > 0x100000000LL) rt_fail("$random: n must be from 1 to 4294967296, got %lld", (long long)m);
+  if (m == 0x100000000LL) return rt_i(rng_next(s));
+  // Rejecting the top partial range keeps every result equally likely.
+  uint64_t limit = 0x100000000ULL - 0x100000000ULL % (uint64_t)m;
+  for (;;) {
+    uint32_t x = rng_next(s);
+    if (x < limit) return rt_i(x % (uint64_t)m);
+  }
+}
+static wv std_randomFloat(wv rng) {
+  wv *s[4];
+  rng_words(rng, "$randomFloat", s);
+  uint32_t a = rng_next(s) >> 5, b = rng_next(s) >> 6;
+  return rt_f(((double)a * 67108864.0 + b) / 9007199254740992.0); // (a * 2^26 + b) / 2^53, exactly
+}
+
 // ---- startup ----
 
 // The compiled program: library initialization, then the entry file's body.
@@ -1878,6 +2383,7 @@ int main(int argc, char **argv) {
   size_t stack = (size_t)1 << 30;
 #ifdef _WIN32
   SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+  vt_start();
   HANDLE t = CreateThread(NULL, stack, rt_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
   if (!t) { rt_thread(NULL); return 0; }
   WaitForSingleObject(t, INFINITE);
@@ -2222,379 +2728,384 @@ static const wstr S324 = { 5, 5, 1, 0, "print" };
 static const wstr S325 = { 5, 5, 1, 0, "write" };
 static const wstr S326 = { 6, 6, 1, 0, "eprint" };
 static const wstr S327 = { 8, 8, 1, 0, "readLine" };
-static const wstr S328 = { 8, 8, 1, 0, "readFile" };
-static const wstr S329 = { 9, 9, 1, 0, "writeFile" };
-static const wstr S330 = { 10, 10, 1, 0, "appendFile" };
-static const wstr S331 = { 10, 10, 1, 0, "fileExists" };
-static const wstr S332 = { 7, 7, 1, 0, "listDir" };
-static const wstr S333 = { 10, 10, 1, 0, "deleteFile" };
-static const wstr S334 = { 4, 4, 1, 0, "args" };
-static const wstr S335 = { 3, 3, 1, 0, "env" };
-static const wstr S336 = { 11, 11, 1, 0, "programPath" };
-static const wstr S337 = { 3, 3, 1, 0, "run" };
-static const wstr S338 = { 6, 6, 1, 0, "length" };
-static const wstr S339 = { 2, 2, 1, 0, "at" };
-static const wstr S340 = { 5, 5, 1, 0, "slice" };
-static const wstr S341 = { 4, 4, 1, 0, "code" };
-static const wstr S342 = { 8, 8, 1, 0, "fromCode" };
-static const wstr S343 = { 5, 5, 1, 0, "split" };
-static const wstr S344 = { 4, 4, 1, 0, "join" };
-static const wstr S345 = { 8, 8, 1, 0, "toString" };
-static const wstr S346 = { 5, 5, 1, 0, "toInt" };
-static const wstr S347 = { 7, 7, 1, 0, "toFloat" };
-static const wstr S348 = { 4, 4, 1, 0, "push" };
-static const wstr S349 = { 3, 3, 1, 0, "pop" };
-static const wstr S350 = { 4, 4, 1, 0, "same" };
-static const wstr S351 = { 6, 6, 1, 0, "typeOf" };
-static const wstr S352 = { 6, 6, 1, 0, "fields" };
-static const wstr S353 = { 5, 5, 1, 0, "floor" };
-static const wstr S354 = { 4, 4, 1, 0, "ceil" };
-static const wstr S355 = { 5, 5, 1, 0, "round" };
-static const wstr S356 = { 5, 5, 1, 0, "trunc" };
-static const wstr S357 = { 8, 8, 1, 0, "toUint32" };
-static const wstr S358 = { 5, 5, 1, 0, "isNan" };
-static const wstr S359 = { 9, 9, 1, 0, " function" };
-static const wstr S360 = { 6, 6, 1, 0, "n enum" };
-static const wstr S361 = { 9, 9, 1, 0, " argument" };
-static const wstr S362 = { 1, 1, 1, 0, "s" };
-static const wstr S363 = { 4, 4, 1, 0, "str:" };
-static const wstr S364 = { 4, 4, 1, 0, "mem:" };
-static const wstr S365 = { 55, 55, 1, 0, "this block's value is used, but it does not produce one" };
-static const wstr S366 = { 62, 62, 1, 0, "end the block with its value, or with null if that is intended" };
-static const wstr S367 = { 42, 42, 1, 0, "' is already declared in this scope (line " };
-static const wstr S368 = { 11, 11, 1, 0, "' shadows '" };
-static const wstr S369 = { 32, 32, 1, 0, "' from an enclosing scope (line " };
-static const wstr S370 = { 45, 45, 1, 0, "Wavert forbids shadowing; choose another name" };
-static const wstr S371 = { 14, 14, 1, 0, "unknown name '" };
-static const wstr S372 = { 39, 39, 1, 0, "' is used before its declaration (line " };
-static const wstr S373 = { 5, 5, 1, 0, "param" };
-static const wstr S374 = { 27, 27, 1, 0, "'return' outside a function" };
-static const wstr S375 = { 16, 16, 1, 0, "' outside a loop" };
-static const wstr S376 = { 56, 56, 1, 0, "'fail' outside a function: there is no caller to fail to" };
-static const wstr S377 = { 65, 65, 1, 0, "'onfail' handles a call, but this statement's value is not a call" };
-static const wstr S378 = { 87, 87, 1, 0, "the call must be the outermost expression, e.g. ;const n is s(parse) onfail (c) { ... }" };
-static const wstr S379 = { 44, 44, 1, 0, "a match cannot mix literals and enum members" };
-static const wstr S380 = { 31, 31, 1, 0, "a match cannot mix members of '" };
-static const wstr S381 = { 7, 7, 1, 0, "' and '" };
-static const wstr S382 = { 21, 21, 1, 0, "duplicate case value " };
-static const wstr S383 = { 7, 7, 1, 0, " (line " };
-static const wstr S384 = { 22, 22, 1, 0, "match does not handle " };
-static const wstr S385 = { 2, 2, 1, 0, ", " };
-static const wstr S386 = { 57, 57, 1, 0, "add a case for each, or end the match with 'else { ... }'" };
-static const wstr S387 = { 52, 52, 1, 0, "a match used as a value must end with 'else { ... }'" };
-static const wstr S388 = { 6, 6, 1, 0, "module" };
-static const wstr S389 = { 19, 19, 1, 0, "' does not export '" };
-static const wstr S390 = { 17, 17, 1, 0, "' is not a module" };
-static const wstr S391 = { 16, 16, 1, 0, "unknown module '" };
-static const wstr S392 = { 41, 41, 1, 0, "' is a function; functions are not values" };
-static const wstr S393 = { 20, 20, 1, 0, "to call it, write x(" };
-static const wstr S394 = { 7, 7, 1, 0, "), or (" };
-static const wstr S395 = { 19, 19, 1, 0, ") with no arguments" };
-static const wstr S396 = { 25, 25, 1, 0, "' is an enum, not a value" };
-static const wstr S397 = { 24, 24, 1, 0, "its members are written " };
-static const wstr S398 = { 7, 7, 1, 0, ".member" };
-static const wstr S399 = { 54, 54, 1, 0, "case values are literals or enum members (Enum.member)" };
-static const wstr S400 = { 16, 16, 1, 0, "' is not an enum" };
-static const wstr S401 = { 14, 14, 1, 0, "unknown enum '" };
-static const wstr S402 = { 11, 11, 1, 0, "no member '" };
-static const wstr S403 = { 11, 11, 1, 0, "' in enum '" };
-static const wstr S404 = { 16, 16, 1, 0, "its members are " };
-static const wstr S405 = { 66, 66, 1, 0, "a conditional used as a value must end with a plain 'else { ... }'" };
-static const wstr S406 = { 12, 12, 1, 0, "cannot set '" };
-static const wstr S407 = { 25, 25, 1, 0, "': it is not a var or ref" };
-static const wstr S408 = { 7, 7, 1, 0, "a field" };
-static const wstr S409 = { 10, 10, 1, 0, "an element" };
-static const wstr S410 = { 29, 29, 1, 0, "': enum members are constants" };
-static const wstr S411 = { 9, 9, 1, 0, "': only '" };
-static const wstr S412 = { 12, 12, 1, 0, "' may set it" };
-static const wstr S413 = { 14, 14, 1, 0, "cannot modify " };
-static const wstr S414 = { 5, 5, 1, 0, " of '" };
-static const wstr S415 = { 18, 18, 1, 0, "': it is not a var" };
-static const wstr S416 = { 6, 6, 1, 0, "' is a" };
-static const wstr S417 = { 15, 15, 1, 0, ", not a binding" };
-static const wstr S418 = { 24, 24, 1, 0, "mark the parameter (ref " };
-static const wstr S419 = { 24, 24, 1, 0, ") to rebind it, or (var " };
-static const wstr S420 = { 20, 20, 1, 0, ") for a mutable copy" };
-static const wstr S421 = { 29, 29, 1, 0, "mark the parameter var: (var " };
-static const wstr S422 = { 22, 22, 1, 0, "declare it with ';ref " };
-static const wstr S423 = { 32, 32, 1, 0, " is ...' to rebind it, or ';var " };
-static const wstr S424 = { 27, 27, 1, 0, " is ...' for a mutable copy" };
-static const wstr S425 = { 22, 22, 1, 0, "declare it with ';var " };
-static const wstr S426 = { 8, 8, 1, 0, " is ...'" };
-static const wstr S427 = { 32, 32, 1, 0, "unknown standard library name '$" };
-static const wstr S428 = { 26, 26, 1, 0, "' is a module, not a value" };
-static const wstr S429 = { 27, 27, 1, 0, "what it exports is written " };
-static const wstr S430 = { 5, 5, 1, 0, ".name" };
-static const wstr S431 = { 32, 32, 1, 0, "' is a function; call it with ($" };
-static const wstr S432 = { 30, 30, 1, 0, "'fail' is a statement: ;fail c" };
-static const wstr S433 = { 24, 24, 1, 0, "checker: unhandled node " };
-static const wstr S434 = { 31, 31, 1, 0, "' is a constant, not a function" };
-static const wstr S435 = { 8, 8, 1, 0, "' takes " };
-static const wstr S436 = { 6, 6, 1, 0, ", got " };
-static const wstr S437 = { 18, 18, 1, 0, "unknown function '" };
-static const wstr S438 = { 71, 71, 1, 0, ") is a call with no arguments; to use the value, remove the parentheses" };
-static const wstr S439 = { 53, 53, 1, 0, "calls are postfix: the function comes last, e.g. x(f)" };
-static const wstr S440 = { 19, 19, 1, 0, "' is not a function" };
-static const wstr S441 = { 21, 21, 1, 0, "' is already imported" };
-static const wstr S442 = { 38, 38, 1, 0, "' is not a library: it ends with ;exit" };
-static const wstr S443 = { 31, 31, 1, 0, "only a library ends with ';end'" };
-static const wstr S444 = { 25, 25, 1, 0, "a program ends with ;exit" };
-static const wstr S445 = { 88, 88, 1, 0, "a library's top level may contain only import, fn, const, var, ref and enum declarations" };
-static const wstr S446 = { 37, 37, 1, 0, "move other statements into a function" };
-static const wstr S447 = { 28, 28, 1, 0, "a library must end with ;end" };
-static const wstr S448 = { 56, 56, 1, 0, "mark what it exports with 'export', and end it with ;end" };
-static const wstr S449 = { 15, 15, 1, 0, "cannot export '" };
-static const wstr S450 = { 38, 38, 1, 0, "': it is not declared at the top level" };
-static const wstr S451 = { 17, 17, 1, 0, "': it is a module" };
-static const wstr S452 = { 5, 5, 1, 0, "line " };
-static const wstr S453 = { 6, 6, 1, 0, " line " };
-static const wstr S454 = { 49, 49, 1, 0, "' never produces a value, but its value is used (" };
-static const wstr S455 = { 65, 65, 1, 0, "end the function with its value, or with null if that is intended" };
-static const wstr S456 = { 29, 29, 1, 0, "a program must end with ;exit" };
-static const wstr S457 = { 50, 50, 1, 0, "end the program with ;exit, or a library with ;end" };
-static const wstr S458 = { 3, 3, 1, 0, "add" };
-static const wstr S459 = { 3, 3, 1, 0, "sub" };
-static const wstr S460 = { 3, 3, 1, 0, "mul" };
-static const wstr S461 = { 3, 3, 1, 0, "div" };
-static const wstr S462 = { 3, 3, 1, 0, "mod" };
-static const wstr S463 = { 3, 3, 1, 0, "pow" };
-static const wstr S464 = { 2, 2, 1, 0, "eq" };
-static const wstr S465 = { 2, 2, 1, 0, "ne" };
-static const wstr S466 = { 2, 2, 1, 0, "lt" };
-static const wstr S467 = { 2, 2, 1, 0, "gt" };
-static const wstr S468 = { 2, 2, 1, 0, "le" };
-static const wstr S469 = { 2, 2, 1, 0, "ge" };
-static const wstr S470 = { 4, 4, 1, 0, "band" };
-static const wstr S471 = { 3, 3, 1, 0, "bor" };
-static const wstr S472 = { 4, 4, 1, 0, "bxor" };
-static const wstr S473 = { 3, 3, 1, 0, "shl" };
-static const wstr S474 = { 3, 3, 1, 0, "shr" };
-static const wstr S475 = { 3, 3, 1, 0, "neg" };
-static const wstr S476 = { 3, 3, 1, 0, "not" };
-static const wstr S477 = { 4, 4, 1, 0, "bnot" };
-static const wstr S478 = { 1, 1, 1, 0, "w" };
-static const wstr S479 = { 1, 1, 1, 0, "l" };
-static const wstr S480 = { 2, 2, 1, 0, "  " };
-static const wstr S481 = { 2, 2, 1, 0, "$t" };
-static const wstr S482 = { 66, 66, 1, 0, "'return' inside a conditional used as a value is not supported yet" };
-static const wstr S483 = { 7, 7, 1, 0, "return " };
-static const wstr S484 = { 16, 16, 1, 0, "throw $rt.panic(" };
-static const wstr S485 = { 2, 2, 1, 0, ");" };
-static const wstr S486 = { 48, 48, 1, 0, "' cannot leave a conditional used as a value yet" };
-static const wstr S487 = { 6, 6, 1, 0, "break;" };
-static const wstr S488 = { 9, 9, 1, 0, "continue;" };
-static const wstr S489 = { 7, 7, 1, 0, "while (" };
-static const wstr S490 = { 9, 9, 1, 0, "$rt.cond(" };
-static const wstr S491 = { 4, 4, 1, 0, ")) {" };
-static const wstr S492 = { 19, 19, 1, 0, "throw $rt.failWith(" };
-static const wstr S493 = { 9, 9, 1, 0, "$rt.exit(" };
-static const wstr S494 = { 3, 3, 1, 0, "let" };
-static const wstr S495 = { 3, 3, 1, 0, " = " };
-static const wstr S496 = { 29, 29, 1, 0, "codegen: unhandled statement " };
-static const wstr S497 = { 9, 9, 1, 0, "function " };
-static const wstr S498 = { 3, 3, 1, 0, ") {" };
-static const wstr S499 = { 12, 12, 1, 0, " = $rt.bind(" };
-static const wstr S500 = { 5, 5, 1, 0, "try {" };
-static const wstr S501 = { 14, 14, 1, 0, "} catch ($e) {" };
-static const wstr S502 = { 22, 22, 1, 0, "  throw $rt.leave($e, " };
-static const wstr S503 = { 7, 7, 1, 0, "const l" };
-static const wstr S504 = { 16, 16, 1, 0, " = $rt.makeEnum(" };
-static const wstr S505 = { 3, 3, 1, 0, ", [" };
-static const wstr S506 = { 3, 3, 1, 0, "]);" };
-static const wstr S507 = { 12, 12, 1, 0, "$rt.frozen([" };
-static const wstr S508 = { 2, 2, 1, 0, "])" };
-static const wstr S509 = { 9, 9, 1, 0, "$rt.bind(" };
-static const wstr S510 = { 6, 6, 1, 0, "const " };
-static const wstr S511 = { 7, 7, 1, 0, " = $rt." };
-static const wstr S512 = { 5, 5, 1, 0, ", \"f_" };
-static const wstr S513 = { 3, 3, 1, 0, "\", " };
-static const wstr S514 = { 11, 11, 1, 0, "$rt.setMem(" };
-static const wstr S515 = { 11, 11, 1, 0, "$rt.updMem(" };
-static const wstr S516 = { 6, 6, 1, 0, ", $rt." };
-static const wstr S517 = { 11, 11, 1, 0, "$rt.setIdx(" };
-static const wstr S518 = { 11, 11, 1, 0, "$rt.updIdx(" };
-static const wstr S519 = { 4, 4, 1, 0, ", f_" };
-static const wstr S520 = { 25, 25, 1, 0, "$rt.rec({ __proto__: null" };
-static const wstr S521 = { 4, 4, 1, 0, " }, " };
-static const wstr S522 = { 2, 2, 1, 0, "$e" };
-static const wstr S523 = { 4, 4, 1, 0, "let " };
-static const wstr S524 = { 9, 9, 1, 0, "} catch (" };
-static const wstr S525 = { 6, 6, 1, 0, "if (!(" };
-static const wstr S526 = { 29, 29, 1, 0, " instanceof $rt.Fail)) throw " };
-static const wstr S527 = { 6, 6, 1, 0, ".code;" };
-static const wstr S528 = { 3, 3, 1, 0, "raw" };
-static const wstr S529 = { 7, 7, 1, 0, "} else " };
-static const wstr S530 = { 4, 4, 1, 0, "if (" };
-static const wstr S531 = { 8, 8, 1, 0, "} else {" };
-static const wstr S532 = { 3, 3, 1, 0, " ? " };
-static const wstr S533 = { 3, 3, 1, 0, " : " };
-static const wstr S534 = { 9, 9, 1, 0, "(() => {\n" };
-static const wstr S535 = { 4, 4, 1, 0, "})()" };
-static const wstr S536 = { 7, 7, 1, 0, "$rt.eq(" };
-static const wstr S537 = { 4, 4, 1, 0, " || " };
-static const wstr S538 = { 11, 11, 1, 0, "$rt.noCase(" };
-static const wstr S539 = { 2, 2, 1, 0, "((" };
-static const wstr S540 = { 5, 5, 1, 0, ") => " };
-static const wstr S541 = { 2, 2, 1, 0, ")(" };
-static const wstr S542 = { 7, 7, 1, 0, ") => {\n" };
-static const wstr S543 = { 3, 3, 1, 0, "})(" };
-static const wstr S544 = { 5, 5, 1, 0, "$std." };
-static const wstr S545 = { 6, 6, 1, 0, "$rt.f(" };
-static const wstr S546 = { 9, 9, 1, 0, "$rt.text(" };
-static const wstr S547 = { 2, 2, 1, 0, "\"\"" };
-static const wstr S548 = { 3, 3, 1, 0, " + " };
-static const wstr S549 = { 7, 7, 1, 0, "$rt.NAN" };
-static const wstr S550 = { 7, 7, 1, 0, "$rt.INF" };
-static const wstr S551 = { 8, 8, 1, 0, "$rt.idx(" };
-static const wstr S552 = { 3, 3, 1, 0, ".m_" };
-static const wstr S553 = { 11, 11, 1, 0, "$rt.get(\"f_" };
-static const wstr S554 = { 4, 4, 1, 0, "$rt." };
-static const wstr S555 = { 10, 10, 1, 0, "($rt.bool(" };
-static const wstr S556 = { 3, 3, 1, 0, ", \"" };
-static const wstr S557 = { 3, 3, 1, 0, "\") " };
-static const wstr S558 = { 10, 10, 1, 0, " $rt.bool(" };
-static const wstr S559 = { 3, 3, 1, 0, "\"))" };
-static const wstr S560 = { 10, 10, 1, 0, "($rt.cond(" };
-static const wstr S561 = { 4, 4, 1, 0, ") ? " };
-static const wstr S562 = { 30, 30, 1, 0, "codegen: unhandled expression " };
-static const wstr S563 = { 14, 14, 1, 0, "\"use strict\";\n" };
-static const wstr S564 = { 24, 24, 1, 0, "\n$rt.main(function () {\n" };
-static const wstr S565 = { 5, 5, 1, 0, "\n});\n" };
-static const wstr S566 = { 2, 2, 1, 0, "\\\"" };
-static const wstr S567 = { 2, 2, 1, 0, "\\\\" };
-static const wstr S568 = { 2, 2, 1, 0, "{ " };
-static const wstr S569 = { 5, 5, 1, 0, ", 0, " };
-static const wstr S570 = { 2, 2, 1, 0, " }" };
-static const wstr S571 = { 4, 4, 1, 0, "NULL" };
-static const wstr S572 = { 8, 8, 1, 0, "(wv[]){ " };
-static const wstr S573 = { 1, 1, 1, 0, "v" };
-static const wstr S574 = { 2, 2, 1, 0, "&S" };
-static const wstr S575 = { 3, 3, 1, 0, "&F_" };
-static const wstr S576 = { 19, 19, 1, 0, "static const wmem l" };
-static const wstr S577 = { 7, 7, 1, 0, "[] = { " };
-static const wstr S578 = { 3, 3, 1, 0, " };" };
-static const wstr S579 = { 3, 3, 1, 0, "fr." };
-static const wstr S580 = { 2, 2, 1, 0, "up" };
-static const wstr S581 = { 4, 4, 1, 0, "->up" };
-static const wstr S582 = { 2, 2, 1, 0, "->" };
-static const wstr S583 = { 7, 7, 1, 0, "rt_def(" };
-static const wstr S584 = { 3, 3, 1, 0, "wv " };
-static const wstr S585 = { 3, 3, 1, 0, "({ " };
-static const wstr S586 = { 4, 4, 1, 0, "; })" };
-static const wstr S587 = { 12, 12, 1, 0, " = RT_UNSET;" };
-static const wstr S588 = { 6, 6, 1, 0, "(void)" };
-static const wstr S589 = { 7, 7, 1, 0, "RT_NULL" };
-static const wstr S590 = { 7, 7, 1, 0, "RT_RET(" };
-static const wstr S591 = { 9, 9, 1, 0, "rt_panic(" };
-static const wstr S592 = { 8, 8, 1, 0, "rt_cond(" };
-static const wstr S593 = { 5, 5, 1, 0, "rt_i(" };
-static const wstr S594 = { 8, 8, 1, 0, "rt_exit(" };
-static const wstr S595 = { 7, 7, 1, 0, "rt_i(0)" };
-static const wstr S596 = { 13, 13, 1, 0, "rt_fail_with(" };
-static const wstr S597 = { 16, 16, 1, 0, "RT_RET(RT_NULL);" };
-static const wstr S598 = { 9, 9, 1, 0, "struct fr" };
-static const wstr S599 = { 4, 4, 1, 0, " *up" };
-static const wstr S600 = { 2, 2, 1, 0, "p_" };
-static const wstr S601 = { 10, 10, 1, 0, "static wv " };
-static const wstr S602 = { 4, 4, 1, 0, "void" };
-static const wstr S603 = { 9, 9, 1, 0, "rt_enter(" };
-static const wstr S604 = { 8, 8, 1, 0, " fr = { " };
-static const wstr S605 = { 8, 8, 1, 0, ".up = up" };
-static const wstr S606 = { 8, 8, 1, 0, "rt_bind(" };
-static const wstr S607 = { 13, 13, 1, 0, "(void)rt_def(" };
-static const wstr S608 = { 3, 3, 1, 0, "rt_" };
-static const wstr S609 = { 7, 7, 1, 0, "rt_set_" };
-static const wstr S610 = { 7, 7, 1, 0, "rt_upd_" };
-static const wstr S611 = { 5, 5, 1, 0, ", rt_" };
-static const wstr S612 = { 7, 7, 1, 0, "rt_arr(" };
-static const wstr S613 = { 1, 1, 1, 0, "K" };
-static const wstr S614 = { 7, 7, 1, 0, "rt_rec(" };
-static const wstr S615 = { 18, 18, 1, 0, "if (rt_failcode) {" };
-static const wstr S616 = { 17, 17, 1, 0, "rt_i(rt_failcode)" };
-static const wstr S617 = { 16, 16, 1, 0, "rt_failcode = 0;" };
-static const wstr S618 = { 3, 3, 1, 0, "({\n" };
-static const wstr S619 = { 2, 2, 1, 0, "})" };
-static const wstr S620 = { 3, 3, 1, 0, "eq(" };
-static const wstr S621 = { 12, 12, 1, 0, "(rt_no_case(" };
-static const wstr S622 = { 11, 11, 1, 0, "), RT_NULL)" };
-static const wstr S623 = { 6, 6, 1, 0, "({ wv " };
-static const wstr S624 = { 2, 2, 1, 0, "; " };
-static const wstr S625 = { 4, 4, 1, 0, "std_" };
-static const wstr S626 = { 3, 3, 1, 0, "&fr" };
-static const wstr S627 = { 7, 7, 1, 0, "rt_chk(" };
-static const wstr S628 = { 5, 5, 1, 0, "rt_f(" };
-static const wstr S629 = { 5, 5, 1, 0, "rt_s(" };
-static const wstr S630 = { 8, 8, 1, 0, "rt_text(" };
-static const wstr S631 = { 7, 7, 1, 0, "rt_cat(" };
-static const wstr S632 = { 5, 5, 1, 0, "rt_b(" };
-static const wstr S633 = { 6, 6, 1, 0, "RT_NAN" };
-static const wstr S634 = { 6, 6, 1, 0, "RT_INF" };
-static const wstr S635 = { 2, 2, 1, 0, "()" };
-static const wstr S636 = { 7, 7, 1, 0, "rt_idx(" };
-static const wstr S637 = { 6, 6, 1, 0, "rt_m(&" };
-static const wstr S638 = { 7, 7, 1, 0, "rt_get(" };
-static const wstr S639 = { 13, 13, 1, 0, "rt_b(rt_bool(" };
-static const wstr S640 = { 9, 9, 1, 0, " rt_bool(" };
-static const wstr S641 = { 9, 9, 1, 0, "(rt_cond(" };
-static const wstr S642 = { 2, 2, 1, 0, "\r\n" };
-static const wstr S643 = { 20, 20, 1, 0, "// ---- program ----" };
-static const wstr S644 = { 19, 19, 1, 0, "static const wstr S" };
-static const wstr S645 = { 14, 14, 1, 0, "static wstr F_" };
-static const wstr S646 = { 26, 26, 1, 0, "static const wstr *const K" };
-static const wstr S647 = { 5, 5, 1, 0, " *up;" };
-static const wstr S648 = { 10, 10, 1, 0, "char none;" };
-static const wstr S649 = { 3, 3, 1, 0, " { " };
-static const wstr S650 = { 2, 2, 1, 0, " {" };
-static const wstr S651 = { 28, 28, 1, 0, "static void wvt_main(void) {" };
-static const wstr S652 = { 10, 10, 1, 0, "  rt_syms(" };
-static const wstr S653 = { 19, 19, 1, 0, ", (wstr *const[]){ " };
-static const wstr S654 = { 4, 4, 1, 0, " });" };
-static const wstr S655 = { 4, 4, 1, 0, "  | " };
-static const wstr S656 = { 4, 4, 1, 0, "  { " };
-static const wstr S657 = { 4, 4, 1, 0, "    " };
-static const wstr S658 = { 3, 3, 1, 0, "  }" };
-static const wstr S659 = { 5, 5, 1, 0, "array" };
-static const wstr S660 = { 2, 2, 1, 0, "[]" };
-static const wstr S661 = { 6, 6, 1, 0, "record" };
-static const wstr S662 = { 2, 2, 1, 0, ".." };
-static const wstr S663 = { 14, 14, 1, 0, "import cycle: " };
-static const wstr S664 = { 4, 4, 1, 0, " -> " };
-static const wstr S665 = { 13, 13, 1, 0, "cannot read '" };
-static const wstr S666 = { 3, 1, 0, 0, "﻿" };
-static const wstr S667 = { 7, 7, 1, 0, "usage:\n" };
-static const wstr S668 = { 50, 50, 1, 0, "  wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>]\n" };
-static const wstr S669 = { 64, 64, 1, 0, "  wvc <file.wvt> --target js [-o <out.js>] [--runtime <wvt.js>]\n" };
-static const wstr S670 = { 76, 76, 1, 0, "  wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]\n" };
-static const wstr S671 = { 26, 26, 1, 0, "  wvc --tokens <file.wvt>\n" };
-static const wstr S672 = { 22, 22, 1, 0, "  wvc --ast <file.wvt>" };
-static const wstr S673 = { 17, 17, 1, 0, "wvc: cannot read " };
-static const wstr S674 = { 5, 5, 1, 0, "build" };
-static const wstr S675 = { 8, 8, 1, 0, "--tokens" };
-static const wstr S676 = { 5, 5, 1, 0, "--ast" };
-static const wstr S677 = { 2, 2, 1, 0, "-o" };
-static const wstr S678 = { 9, 9, 1, 0, "--runtime" };
-static const wstr S679 = { 8, 8, 1, 0, "--target" };
-static const wstr S680 = { 4, 4, 1, 0, "--cc" };
-static const wstr S681 = { 2, 2, 1, 0, "js" };
-static const wstr S682 = { 1, 1, 1, 0, "c" };
-static const wstr S683 = { 2, 2, 1, 0, "OS" };
-static const wstr S684 = { 10, 10, 1, 0, "Windows_NT" };
-static const wstr S685 = { 3, 3, 1, 0, "ZIG" };
-static const wstr S686 = { 3, 3, 1, 0, "zig" };
-static const wstr S687 = { 5, 5, 1, 0, "wvc: " };
-static const wstr S688 = { 52, 52, 1, 0, " does not end with .wvt, so name the program with -o" };
-static const wstr S689 = { 4, 4, 1, 0, ".exe" };
-static const wstr S690 = { 13, 13, 1, 0, "runtime/wvt.c" };
-static const wstr S691 = { 14, 14, 1, 0, "runtime/wvt.js" };
-static const wstr S692 = { 3, 3, 1, 0, "../" };
-static const wstr S693 = { 18, 18, 1, 0, "wvc: cannot write " };
-static const wstr S694 = { 2, 2, 1, 0, ".c" };
-static const wstr S695 = { 3, 3, 1, 0, "-O2" };
-static const wstr S696 = { 7, 7, 1, 0, "zig.exe" };
-static const wstr S697 = { 2, 2, 1, 0, "cc" };
-static const wstr S698 = { 16, 16, 1, 0, "wvc: cannot run " };
-static const wstr S699 = { 67, 67, 1, 0, ": install Zig (https://ziglang.org), or name a C compiler with --cc" };
-static const wstr S700 = { 23, 23, 1, 0, " failed with exit code " };
+static const wstr S328 = { 7, 7, 1, 0, "readKey" };
+static const wstr S329 = { 8, 8, 1, 0, "readFile" };
+static const wstr S330 = { 9, 9, 1, 0, "writeFile" };
+static const wstr S331 = { 10, 10, 1, 0, "appendFile" };
+static const wstr S332 = { 10, 10, 1, 0, "fileExists" };
+static const wstr S333 = { 7, 7, 1, 0, "listDir" };
+static const wstr S334 = { 10, 10, 1, 0, "deleteFile" };
+static const wstr S335 = { 4, 4, 1, 0, "args" };
+static const wstr S336 = { 3, 3, 1, 0, "env" };
+static const wstr S337 = { 11, 11, 1, 0, "programPath" };
+static const wstr S338 = { 3, 3, 1, 0, "run" };
+static const wstr S339 = { 6, 6, 1, 0, "length" };
+static const wstr S340 = { 2, 2, 1, 0, "at" };
+static const wstr S341 = { 5, 5, 1, 0, "slice" };
+static const wstr S342 = { 4, 4, 1, 0, "code" };
+static const wstr S343 = { 8, 8, 1, 0, "fromCode" };
+static const wstr S344 = { 5, 5, 1, 0, "split" };
+static const wstr S345 = { 4, 4, 1, 0, "join" };
+static const wstr S346 = { 8, 8, 1, 0, "toString" };
+static const wstr S347 = { 5, 5, 1, 0, "toInt" };
+static const wstr S348 = { 7, 7, 1, 0, "toFloat" };
+static const wstr S349 = { 4, 4, 1, 0, "push" };
+static const wstr S350 = { 3, 3, 1, 0, "pop" };
+static const wstr S351 = { 4, 4, 1, 0, "same" };
+static const wstr S352 = { 6, 6, 1, 0, "typeOf" };
+static const wstr S353 = { 6, 6, 1, 0, "fields" };
+static const wstr S354 = { 5, 5, 1, 0, "floor" };
+static const wstr S355 = { 4, 4, 1, 0, "ceil" };
+static const wstr S356 = { 5, 5, 1, 0, "round" };
+static const wstr S357 = { 5, 5, 1, 0, "trunc" };
+static const wstr S358 = { 8, 8, 1, 0, "toUint32" };
+static const wstr S359 = { 5, 5, 1, 0, "isNan" };
+static const wstr S360 = { 4, 4, 1, 0, "time" };
+static const wstr S361 = { 9, 9, 1, 0, "newRandom" };
+static const wstr S362 = { 6, 6, 1, 0, "random" };
+static const wstr S363 = { 11, 11, 1, 0, "randomFloat" };
+static const wstr S364 = { 9, 9, 1, 0, " function" };
+static const wstr S365 = { 6, 6, 1, 0, "n enum" };
+static const wstr S366 = { 9, 9, 1, 0, " argument" };
+static const wstr S367 = { 1, 1, 1, 0, "s" };
+static const wstr S368 = { 4, 4, 1, 0, "str:" };
+static const wstr S369 = { 4, 4, 1, 0, "mem:" };
+static const wstr S370 = { 55, 55, 1, 0, "this block's value is used, but it does not produce one" };
+static const wstr S371 = { 62, 62, 1, 0, "end the block with its value, or with null if that is intended" };
+static const wstr S372 = { 42, 42, 1, 0, "' is already declared in this scope (line " };
+static const wstr S373 = { 11, 11, 1, 0, "' shadows '" };
+static const wstr S374 = { 32, 32, 1, 0, "' from an enclosing scope (line " };
+static const wstr S375 = { 45, 45, 1, 0, "Wavert forbids shadowing; choose another name" };
+static const wstr S376 = { 14, 14, 1, 0, "unknown name '" };
+static const wstr S377 = { 39, 39, 1, 0, "' is used before its declaration (line " };
+static const wstr S378 = { 5, 5, 1, 0, "param" };
+static const wstr S379 = { 27, 27, 1, 0, "'return' outside a function" };
+static const wstr S380 = { 16, 16, 1, 0, "' outside a loop" };
+static const wstr S381 = { 56, 56, 1, 0, "'fail' outside a function: there is no caller to fail to" };
+static const wstr S382 = { 65, 65, 1, 0, "'onfail' handles a call, but this statement's value is not a call" };
+static const wstr S383 = { 87, 87, 1, 0, "the call must be the outermost expression, e.g. ;const n is s(parse) onfail (c) { ... }" };
+static const wstr S384 = { 44, 44, 1, 0, "a match cannot mix literals and enum members" };
+static const wstr S385 = { 31, 31, 1, 0, "a match cannot mix members of '" };
+static const wstr S386 = { 7, 7, 1, 0, "' and '" };
+static const wstr S387 = { 21, 21, 1, 0, "duplicate case value " };
+static const wstr S388 = { 7, 7, 1, 0, " (line " };
+static const wstr S389 = { 22, 22, 1, 0, "match does not handle " };
+static const wstr S390 = { 2, 2, 1, 0, ", " };
+static const wstr S391 = { 57, 57, 1, 0, "add a case for each, or end the match with 'else { ... }'" };
+static const wstr S392 = { 52, 52, 1, 0, "a match used as a value must end with 'else { ... }'" };
+static const wstr S393 = { 6, 6, 1, 0, "module" };
+static const wstr S394 = { 19, 19, 1, 0, "' does not export '" };
+static const wstr S395 = { 17, 17, 1, 0, "' is not a module" };
+static const wstr S396 = { 16, 16, 1, 0, "unknown module '" };
+static const wstr S397 = { 41, 41, 1, 0, "' is a function; functions are not values" };
+static const wstr S398 = { 20, 20, 1, 0, "to call it, write x(" };
+static const wstr S399 = { 7, 7, 1, 0, "), or (" };
+static const wstr S400 = { 19, 19, 1, 0, ") with no arguments" };
+static const wstr S401 = { 25, 25, 1, 0, "' is an enum, not a value" };
+static const wstr S402 = { 24, 24, 1, 0, "its members are written " };
+static const wstr S403 = { 7, 7, 1, 0, ".member" };
+static const wstr S404 = { 54, 54, 1, 0, "case values are literals or enum members (Enum.member)" };
+static const wstr S405 = { 16, 16, 1, 0, "' is not an enum" };
+static const wstr S406 = { 14, 14, 1, 0, "unknown enum '" };
+static const wstr S407 = { 11, 11, 1, 0, "no member '" };
+static const wstr S408 = { 11, 11, 1, 0, "' in enum '" };
+static const wstr S409 = { 16, 16, 1, 0, "its members are " };
+static const wstr S410 = { 66, 66, 1, 0, "a conditional used as a value must end with a plain 'else { ... }'" };
+static const wstr S411 = { 12, 12, 1, 0, "cannot set '" };
+static const wstr S412 = { 25, 25, 1, 0, "': it is not a var or ref" };
+static const wstr S413 = { 7, 7, 1, 0, "a field" };
+static const wstr S414 = { 10, 10, 1, 0, "an element" };
+static const wstr S415 = { 29, 29, 1, 0, "': enum members are constants" };
+static const wstr S416 = { 9, 9, 1, 0, "': only '" };
+static const wstr S417 = { 12, 12, 1, 0, "' may set it" };
+static const wstr S418 = { 14, 14, 1, 0, "cannot modify " };
+static const wstr S419 = { 5, 5, 1, 0, " of '" };
+static const wstr S420 = { 18, 18, 1, 0, "': it is not a var" };
+static const wstr S421 = { 6, 6, 1, 0, "' is a" };
+static const wstr S422 = { 15, 15, 1, 0, ", not a binding" };
+static const wstr S423 = { 24, 24, 1, 0, "mark the parameter (ref " };
+static const wstr S424 = { 24, 24, 1, 0, ") to rebind it, or (var " };
+static const wstr S425 = { 20, 20, 1, 0, ") for a mutable copy" };
+static const wstr S426 = { 29, 29, 1, 0, "mark the parameter var: (var " };
+static const wstr S427 = { 22, 22, 1, 0, "declare it with ';ref " };
+static const wstr S428 = { 32, 32, 1, 0, " is ...' to rebind it, or ';var " };
+static const wstr S429 = { 27, 27, 1, 0, " is ...' for a mutable copy" };
+static const wstr S430 = { 22, 22, 1, 0, "declare it with ';var " };
+static const wstr S431 = { 8, 8, 1, 0, " is ...'" };
+static const wstr S432 = { 32, 32, 1, 0, "unknown standard library name '$" };
+static const wstr S433 = { 26, 26, 1, 0, "' is a module, not a value" };
+static const wstr S434 = { 27, 27, 1, 0, "what it exports is written " };
+static const wstr S435 = { 5, 5, 1, 0, ".name" };
+static const wstr S436 = { 32, 32, 1, 0, "' is a function; call it with ($" };
+static const wstr S437 = { 30, 30, 1, 0, "'fail' is a statement: ;fail c" };
+static const wstr S438 = { 24, 24, 1, 0, "checker: unhandled node " };
+static const wstr S439 = { 31, 31, 1, 0, "' is a constant, not a function" };
+static const wstr S440 = { 8, 8, 1, 0, "' takes " };
+static const wstr S441 = { 6, 6, 1, 0, ", got " };
+static const wstr S442 = { 18, 18, 1, 0, "unknown function '" };
+static const wstr S443 = { 71, 71, 1, 0, ") is a call with no arguments; to use the value, remove the parentheses" };
+static const wstr S444 = { 53, 53, 1, 0, "calls are postfix: the function comes last, e.g. x(f)" };
+static const wstr S445 = { 19, 19, 1, 0, "' is not a function" };
+static const wstr S446 = { 21, 21, 1, 0, "' is already imported" };
+static const wstr S447 = { 38, 38, 1, 0, "' is not a library: it ends with ;exit" };
+static const wstr S448 = { 31, 31, 1, 0, "only a library ends with ';end'" };
+static const wstr S449 = { 25, 25, 1, 0, "a program ends with ;exit" };
+static const wstr S450 = { 88, 88, 1, 0, "a library's top level may contain only import, fn, const, var, ref and enum declarations" };
+static const wstr S451 = { 37, 37, 1, 0, "move other statements into a function" };
+static const wstr S452 = { 28, 28, 1, 0, "a library must end with ;end" };
+static const wstr S453 = { 56, 56, 1, 0, "mark what it exports with 'export', and end it with ;end" };
+static const wstr S454 = { 15, 15, 1, 0, "cannot export '" };
+static const wstr S455 = { 38, 38, 1, 0, "': it is not declared at the top level" };
+static const wstr S456 = { 17, 17, 1, 0, "': it is a module" };
+static const wstr S457 = { 5, 5, 1, 0, "line " };
+static const wstr S458 = { 6, 6, 1, 0, " line " };
+static const wstr S459 = { 49, 49, 1, 0, "' never produces a value, but its value is used (" };
+static const wstr S460 = { 65, 65, 1, 0, "end the function with its value, or with null if that is intended" };
+static const wstr S461 = { 29, 29, 1, 0, "a program must end with ;exit" };
+static const wstr S462 = { 50, 50, 1, 0, "end the program with ;exit, or a library with ;end" };
+static const wstr S463 = { 3, 3, 1, 0, "add" };
+static const wstr S464 = { 3, 3, 1, 0, "sub" };
+static const wstr S465 = { 3, 3, 1, 0, "mul" };
+static const wstr S466 = { 3, 3, 1, 0, "div" };
+static const wstr S467 = { 3, 3, 1, 0, "mod" };
+static const wstr S468 = { 3, 3, 1, 0, "pow" };
+static const wstr S469 = { 2, 2, 1, 0, "eq" };
+static const wstr S470 = { 2, 2, 1, 0, "ne" };
+static const wstr S471 = { 2, 2, 1, 0, "lt" };
+static const wstr S472 = { 2, 2, 1, 0, "gt" };
+static const wstr S473 = { 2, 2, 1, 0, "le" };
+static const wstr S474 = { 2, 2, 1, 0, "ge" };
+static const wstr S475 = { 4, 4, 1, 0, "band" };
+static const wstr S476 = { 3, 3, 1, 0, "bor" };
+static const wstr S477 = { 4, 4, 1, 0, "bxor" };
+static const wstr S478 = { 3, 3, 1, 0, "shl" };
+static const wstr S479 = { 3, 3, 1, 0, "shr" };
+static const wstr S480 = { 3, 3, 1, 0, "neg" };
+static const wstr S481 = { 3, 3, 1, 0, "not" };
+static const wstr S482 = { 4, 4, 1, 0, "bnot" };
+static const wstr S483 = { 1, 1, 1, 0, "w" };
+static const wstr S484 = { 1, 1, 1, 0, "l" };
+static const wstr S485 = { 2, 2, 1, 0, "  " };
+static const wstr S486 = { 2, 2, 1, 0, "$t" };
+static const wstr S487 = { 66, 66, 1, 0, "'return' inside a conditional used as a value is not supported yet" };
+static const wstr S488 = { 7, 7, 1, 0, "return " };
+static const wstr S489 = { 16, 16, 1, 0, "throw $rt.panic(" };
+static const wstr S490 = { 2, 2, 1, 0, ");" };
+static const wstr S491 = { 48, 48, 1, 0, "' cannot leave a conditional used as a value yet" };
+static const wstr S492 = { 6, 6, 1, 0, "break;" };
+static const wstr S493 = { 9, 9, 1, 0, "continue;" };
+static const wstr S494 = { 7, 7, 1, 0, "while (" };
+static const wstr S495 = { 9, 9, 1, 0, "$rt.cond(" };
+static const wstr S496 = { 4, 4, 1, 0, ")) {" };
+static const wstr S497 = { 19, 19, 1, 0, "throw $rt.failWith(" };
+static const wstr S498 = { 9, 9, 1, 0, "$rt.exit(" };
+static const wstr S499 = { 3, 3, 1, 0, "let" };
+static const wstr S500 = { 3, 3, 1, 0, " = " };
+static const wstr S501 = { 29, 29, 1, 0, "codegen: unhandled statement " };
+static const wstr S502 = { 9, 9, 1, 0, "function " };
+static const wstr S503 = { 3, 3, 1, 0, ") {" };
+static const wstr S504 = { 12, 12, 1, 0, " = $rt.bind(" };
+static const wstr S505 = { 5, 5, 1, 0, "try {" };
+static const wstr S506 = { 14, 14, 1, 0, "} catch ($e) {" };
+static const wstr S507 = { 22, 22, 1, 0, "  throw $rt.leave($e, " };
+static const wstr S508 = { 7, 7, 1, 0, "const l" };
+static const wstr S509 = { 16, 16, 1, 0, " = $rt.makeEnum(" };
+static const wstr S510 = { 3, 3, 1, 0, ", [" };
+static const wstr S511 = { 3, 3, 1, 0, "]);" };
+static const wstr S512 = { 12, 12, 1, 0, "$rt.frozen([" };
+static const wstr S513 = { 2, 2, 1, 0, "])" };
+static const wstr S514 = { 9, 9, 1, 0, "$rt.bind(" };
+static const wstr S515 = { 6, 6, 1, 0, "const " };
+static const wstr S516 = { 7, 7, 1, 0, " = $rt." };
+static const wstr S517 = { 5, 5, 1, 0, ", \"f_" };
+static const wstr S518 = { 3, 3, 1, 0, "\", " };
+static const wstr S519 = { 11, 11, 1, 0, "$rt.setMem(" };
+static const wstr S520 = { 11, 11, 1, 0, "$rt.updMem(" };
+static const wstr S521 = { 6, 6, 1, 0, ", $rt." };
+static const wstr S522 = { 11, 11, 1, 0, "$rt.setIdx(" };
+static const wstr S523 = { 11, 11, 1, 0, "$rt.updIdx(" };
+static const wstr S524 = { 4, 4, 1, 0, ", f_" };
+static const wstr S525 = { 25, 25, 1, 0, "$rt.rec({ __proto__: null" };
+static const wstr S526 = { 4, 4, 1, 0, " }, " };
+static const wstr S527 = { 2, 2, 1, 0, "$e" };
+static const wstr S528 = { 4, 4, 1, 0, "let " };
+static const wstr S529 = { 9, 9, 1, 0, "} catch (" };
+static const wstr S530 = { 6, 6, 1, 0, "if (!(" };
+static const wstr S531 = { 29, 29, 1, 0, " instanceof $rt.Fail)) throw " };
+static const wstr S532 = { 6, 6, 1, 0, ".code;" };
+static const wstr S533 = { 3, 3, 1, 0, "raw" };
+static const wstr S534 = { 7, 7, 1, 0, "} else " };
+static const wstr S535 = { 4, 4, 1, 0, "if (" };
+static const wstr S536 = { 8, 8, 1, 0, "} else {" };
+static const wstr S537 = { 3, 3, 1, 0, " ? " };
+static const wstr S538 = { 3, 3, 1, 0, " : " };
+static const wstr S539 = { 9, 9, 1, 0, "(() => {\n" };
+static const wstr S540 = { 4, 4, 1, 0, "})()" };
+static const wstr S541 = { 7, 7, 1, 0, "$rt.eq(" };
+static const wstr S542 = { 4, 4, 1, 0, " || " };
+static const wstr S543 = { 11, 11, 1, 0, "$rt.noCase(" };
+static const wstr S544 = { 2, 2, 1, 0, "((" };
+static const wstr S545 = { 5, 5, 1, 0, ") => " };
+static const wstr S546 = { 2, 2, 1, 0, ")(" };
+static const wstr S547 = { 7, 7, 1, 0, ") => {\n" };
+static const wstr S548 = { 3, 3, 1, 0, "})(" };
+static const wstr S549 = { 5, 5, 1, 0, "$std." };
+static const wstr S550 = { 6, 6, 1, 0, "$rt.f(" };
+static const wstr S551 = { 9, 9, 1, 0, "$rt.text(" };
+static const wstr S552 = { 2, 2, 1, 0, "\"\"" };
+static const wstr S553 = { 3, 3, 1, 0, " + " };
+static const wstr S554 = { 7, 7, 1, 0, "$rt.NAN" };
+static const wstr S555 = { 7, 7, 1, 0, "$rt.INF" };
+static const wstr S556 = { 8, 8, 1, 0, "$rt.idx(" };
+static const wstr S557 = { 3, 3, 1, 0, ".m_" };
+static const wstr S558 = { 11, 11, 1, 0, "$rt.get(\"f_" };
+static const wstr S559 = { 4, 4, 1, 0, "$rt." };
+static const wstr S560 = { 10, 10, 1, 0, "($rt.bool(" };
+static const wstr S561 = { 3, 3, 1, 0, ", \"" };
+static const wstr S562 = { 3, 3, 1, 0, "\") " };
+static const wstr S563 = { 10, 10, 1, 0, " $rt.bool(" };
+static const wstr S564 = { 3, 3, 1, 0, "\"))" };
+static const wstr S565 = { 10, 10, 1, 0, "($rt.cond(" };
+static const wstr S566 = { 4, 4, 1, 0, ") ? " };
+static const wstr S567 = { 30, 30, 1, 0, "codegen: unhandled expression " };
+static const wstr S568 = { 14, 14, 1, 0, "\"use strict\";\n" };
+static const wstr S569 = { 24, 24, 1, 0, "\n$rt.main(function () {\n" };
+static const wstr S570 = { 5, 5, 1, 0, "\n});\n" };
+static const wstr S571 = { 2, 2, 1, 0, "\\\"" };
+static const wstr S572 = { 2, 2, 1, 0, "\\\\" };
+static const wstr S573 = { 2, 2, 1, 0, "{ " };
+static const wstr S574 = { 5, 5, 1, 0, ", 0, " };
+static const wstr S575 = { 2, 2, 1, 0, " }" };
+static const wstr S576 = { 4, 4, 1, 0, "NULL" };
+static const wstr S577 = { 8, 8, 1, 0, "(wv[]){ " };
+static const wstr S578 = { 1, 1, 1, 0, "v" };
+static const wstr S579 = { 2, 2, 1, 0, "&S" };
+static const wstr S580 = { 3, 3, 1, 0, "&F_" };
+static const wstr S581 = { 19, 19, 1, 0, "static const wmem l" };
+static const wstr S582 = { 7, 7, 1, 0, "[] = { " };
+static const wstr S583 = { 3, 3, 1, 0, " };" };
+static const wstr S584 = { 3, 3, 1, 0, "fr." };
+static const wstr S585 = { 2, 2, 1, 0, "up" };
+static const wstr S586 = { 4, 4, 1, 0, "->up" };
+static const wstr S587 = { 2, 2, 1, 0, "->" };
+static const wstr S588 = { 7, 7, 1, 0, "rt_def(" };
+static const wstr S589 = { 3, 3, 1, 0, "wv " };
+static const wstr S590 = { 3, 3, 1, 0, "({ " };
+static const wstr S591 = { 4, 4, 1, 0, "; })" };
+static const wstr S592 = { 12, 12, 1, 0, " = RT_UNSET;" };
+static const wstr S593 = { 6, 6, 1, 0, "(void)" };
+static const wstr S594 = { 7, 7, 1, 0, "RT_NULL" };
+static const wstr S595 = { 7, 7, 1, 0, "RT_RET(" };
+static const wstr S596 = { 9, 9, 1, 0, "rt_panic(" };
+static const wstr S597 = { 8, 8, 1, 0, "rt_cond(" };
+static const wstr S598 = { 5, 5, 1, 0, "rt_i(" };
+static const wstr S599 = { 8, 8, 1, 0, "rt_exit(" };
+static const wstr S600 = { 7, 7, 1, 0, "rt_i(0)" };
+static const wstr S601 = { 13, 13, 1, 0, "rt_fail_with(" };
+static const wstr S602 = { 16, 16, 1, 0, "RT_RET(RT_NULL);" };
+static const wstr S603 = { 9, 9, 1, 0, "struct fr" };
+static const wstr S604 = { 4, 4, 1, 0, " *up" };
+static const wstr S605 = { 2, 2, 1, 0, "p_" };
+static const wstr S606 = { 10, 10, 1, 0, "static wv " };
+static const wstr S607 = { 4, 4, 1, 0, "void" };
+static const wstr S608 = { 9, 9, 1, 0, "rt_enter(" };
+static const wstr S609 = { 8, 8, 1, 0, " fr = { " };
+static const wstr S610 = { 8, 8, 1, 0, ".up = up" };
+static const wstr S611 = { 8, 8, 1, 0, "rt_bind(" };
+static const wstr S612 = { 13, 13, 1, 0, "(void)rt_def(" };
+static const wstr S613 = { 3, 3, 1, 0, "rt_" };
+static const wstr S614 = { 7, 7, 1, 0, "rt_set_" };
+static const wstr S615 = { 7, 7, 1, 0, "rt_upd_" };
+static const wstr S616 = { 5, 5, 1, 0, ", rt_" };
+static const wstr S617 = { 7, 7, 1, 0, "rt_arr(" };
+static const wstr S618 = { 1, 1, 1, 0, "K" };
+static const wstr S619 = { 7, 7, 1, 0, "rt_rec(" };
+static const wstr S620 = { 18, 18, 1, 0, "if (rt_failcode) {" };
+static const wstr S621 = { 17, 17, 1, 0, "rt_i(rt_failcode)" };
+static const wstr S622 = { 16, 16, 1, 0, "rt_failcode = 0;" };
+static const wstr S623 = { 3, 3, 1, 0, "({\n" };
+static const wstr S624 = { 2, 2, 1, 0, "})" };
+static const wstr S625 = { 3, 3, 1, 0, "eq(" };
+static const wstr S626 = { 12, 12, 1, 0, "(rt_no_case(" };
+static const wstr S627 = { 11, 11, 1, 0, "), RT_NULL)" };
+static const wstr S628 = { 6, 6, 1, 0, "({ wv " };
+static const wstr S629 = { 2, 2, 1, 0, "; " };
+static const wstr S630 = { 4, 4, 1, 0, "std_" };
+static const wstr S631 = { 3, 3, 1, 0, "&fr" };
+static const wstr S632 = { 7, 7, 1, 0, "rt_chk(" };
+static const wstr S633 = { 5, 5, 1, 0, "rt_f(" };
+static const wstr S634 = { 5, 5, 1, 0, "rt_s(" };
+static const wstr S635 = { 8, 8, 1, 0, "rt_text(" };
+static const wstr S636 = { 7, 7, 1, 0, "rt_cat(" };
+static const wstr S637 = { 5, 5, 1, 0, "rt_b(" };
+static const wstr S638 = { 6, 6, 1, 0, "RT_NAN" };
+static const wstr S639 = { 6, 6, 1, 0, "RT_INF" };
+static const wstr S640 = { 2, 2, 1, 0, "()" };
+static const wstr S641 = { 7, 7, 1, 0, "rt_idx(" };
+static const wstr S642 = { 6, 6, 1, 0, "rt_m(&" };
+static const wstr S643 = { 7, 7, 1, 0, "rt_get(" };
+static const wstr S644 = { 13, 13, 1, 0, "rt_b(rt_bool(" };
+static const wstr S645 = { 9, 9, 1, 0, " rt_bool(" };
+static const wstr S646 = { 9, 9, 1, 0, "(rt_cond(" };
+static const wstr S647 = { 2, 2, 1, 0, "\r\n" };
+static const wstr S648 = { 20, 20, 1, 0, "// ---- program ----" };
+static const wstr S649 = { 19, 19, 1, 0, "static const wstr S" };
+static const wstr S650 = { 14, 14, 1, 0, "static wstr F_" };
+static const wstr S651 = { 26, 26, 1, 0, "static const wstr *const K" };
+static const wstr S652 = { 5, 5, 1, 0, " *up;" };
+static const wstr S653 = { 10, 10, 1, 0, "char none;" };
+static const wstr S654 = { 3, 3, 1, 0, " { " };
+static const wstr S655 = { 2, 2, 1, 0, " {" };
+static const wstr S656 = { 28, 28, 1, 0, "static void wvt_main(void) {" };
+static const wstr S657 = { 10, 10, 1, 0, "  rt_syms(" };
+static const wstr S658 = { 19, 19, 1, 0, ", (wstr *const[]){ " };
+static const wstr S659 = { 4, 4, 1, 0, " });" };
+static const wstr S660 = { 4, 4, 1, 0, "  | " };
+static const wstr S661 = { 4, 4, 1, 0, "  { " };
+static const wstr S662 = { 4, 4, 1, 0, "    " };
+static const wstr S663 = { 3, 3, 1, 0, "  }" };
+static const wstr S664 = { 5, 5, 1, 0, "array" };
+static const wstr S665 = { 2, 2, 1, 0, "[]" };
+static const wstr S666 = { 6, 6, 1, 0, "record" };
+static const wstr S667 = { 2, 2, 1, 0, ".." };
+static const wstr S668 = { 14, 14, 1, 0, "import cycle: " };
+static const wstr S669 = { 4, 4, 1, 0, " -> " };
+static const wstr S670 = { 13, 13, 1, 0, "cannot read '" };
+static const wstr S671 = { 3, 1, 0, 0, "﻿" };
+static const wstr S672 = { 7, 7, 1, 0, "usage:\n" };
+static const wstr S673 = { 50, 50, 1, 0, "  wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>]\n" };
+static const wstr S674 = { 64, 64, 1, 0, "  wvc <file.wvt> --target js [-o <out.js>] [--runtime <wvt.js>]\n" };
+static const wstr S675 = { 76, 76, 1, 0, "  wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]\n" };
+static const wstr S676 = { 26, 26, 1, 0, "  wvc --tokens <file.wvt>\n" };
+static const wstr S677 = { 22, 22, 1, 0, "  wvc --ast <file.wvt>" };
+static const wstr S678 = { 17, 17, 1, 0, "wvc: cannot read " };
+static const wstr S679 = { 5, 5, 1, 0, "build" };
+static const wstr S680 = { 8, 8, 1, 0, "--tokens" };
+static const wstr S681 = { 5, 5, 1, 0, "--ast" };
+static const wstr S682 = { 2, 2, 1, 0, "-o" };
+static const wstr S683 = { 9, 9, 1, 0, "--runtime" };
+static const wstr S684 = { 8, 8, 1, 0, "--target" };
+static const wstr S685 = { 4, 4, 1, 0, "--cc" };
+static const wstr S686 = { 2, 2, 1, 0, "js" };
+static const wstr S687 = { 1, 1, 1, 0, "c" };
+static const wstr S688 = { 2, 2, 1, 0, "OS" };
+static const wstr S689 = { 10, 10, 1, 0, "Windows_NT" };
+static const wstr S690 = { 3, 3, 1, 0, "ZIG" };
+static const wstr S691 = { 3, 3, 1, 0, "zig" };
+static const wstr S692 = { 5, 5, 1, 0, "wvc: " };
+static const wstr S693 = { 52, 52, 1, 0, " does not end with .wvt, so name the program with -o" };
+static const wstr S694 = { 4, 4, 1, 0, ".exe" };
+static const wstr S695 = { 13, 13, 1, 0, "runtime/wvt.c" };
+static const wstr S696 = { 14, 14, 1, 0, "runtime/wvt.js" };
+static const wstr S697 = { 3, 3, 1, 0, "../" };
+static const wstr S698 = { 18, 18, 1, 0, "wvc: cannot write " };
+static const wstr S699 = { 2, 2, 1, 0, ".c" };
+static const wstr S700 = { 3, 3, 1, 0, "-O2" };
+static const wstr S701 = { 7, 7, 1, 0, "zig.exe" };
+static const wstr S702 = { 2, 2, 1, 0, "cc" };
+static const wstr S703 = { 16, 16, 1, 0, "wvc: cannot run " };
+static const wstr S704 = { 67, 67, 1, 0, ": install Zig (https://ziglang.org), or name a C compiler with --cc" };
+static const wstr S705 = { 23, 23, 1, 0, " failed with exit code " };
 static wstr F_severity = { 8, 8, 1, 0, "severity" };
 static wstr F_pos = { 3, 3, 1, 0, "pos" };
 static wstr F_message = { 7, 7, 1, 0, "message" };
@@ -4797,9 +5308,9 @@ static wv w5_stdSig(wv v360_name) {
   rt_enter("stdSig");
   v360_name = rt_bind(v360_name, 0);
   wv v361_k = rt_i(0);
-  while (rt_cond(({ wv t569 = v361_k; wv t570 = std_length(rt_def(w5_stdlib, "stdlib")); rt_lt(t569, t570); }))) {
-    if (rt_cond(({ wv t573 = rt_get(&F_name, ({ wv t571 = v361_k; wv t572 = rt_def(w5_stdlib, "stdlib"); rt_idx(t571, t572); })); wv t574 = v360_name; rt_eq(t573, t574); }))) {
-      RT_RET(rt_get(&F_arity, ({ wv t575 = v361_k; wv t576 = rt_def(w5_stdlib, "stdlib"); rt_idx(t575, t576); })));
+  while (rt_cond(({ wv t574 = v361_k; wv t575 = std_length(rt_def(w5_stdlib, "stdlib")); rt_lt(t574, t575); }))) {
+    if (rt_cond(({ wv t578 = rt_get(&F_name, ({ wv t576 = v361_k; wv t577 = rt_def(w5_stdlib, "stdlib"); rt_idx(t576, t577); })); wv t579 = v360_name; rt_eq(t578, t579); }))) {
+      RT_RET(rt_get(&F_arity, ({ wv t580 = v361_k; wv t581 = rt_def(w5_stdlib, "stdlib"); rt_idx(t580, t581); })));
     }
     v361_k = rt_add(v361_k, rt_i(1));
   }
@@ -4815,34 +5326,34 @@ static wv w5_modeOf(wv v362_x) {
 static wv w5_kindText(wv v363_kind) {
   rt_enter("kindText");
   v363_kind = rt_bind(v363_kind, 0);
-  RT_RET((rt_cond(rt_eq(v363_kind, rt_s(&S33))) ? rt_s(&S359) : (rt_cond(rt_eq(v363_kind, rt_s(&S46))) ? rt_s(&S360) : rt_cat(2, (wv[]){ rt_s(&S0), rt_text(v363_kind) }))));
+  RT_RET((rt_cond(rt_eq(v363_kind, rt_s(&S33))) ? rt_s(&S364) : (rt_cond(rt_eq(v363_kind, rt_s(&S46))) ? rt_s(&S365) : rt_cat(2, (wv[]){ rt_s(&S0), rt_text(v363_kind) }))));
 }
 
 static wv w5_plural(wv v364_n) {
   rt_enter("plural");
   v364_n = rt_bind(v364_n, 0);
-  RT_RET(({ wv t577 = rt_cat(2, (wv[]){ rt_text(v364_n), rt_s(&S361) }); wv t578 = (rt_cond(rt_eq(v364_n, rt_i(1))) ? rt_s(&S13) : rt_s(&S362)); rt_add(t577, t578); }));
+  RT_RET(({ wv t582 = rt_cat(2, (wv[]){ rt_text(v364_n), rt_s(&S366) }); wv t583 = (rt_cond(rt_eq(v364_n, rt_i(1))) ? rt_s(&S13) : rt_s(&S367)); rt_add(t582, t583); }));
 }
 
 static wv w5_enumText(wv v365_x) {
   rt_enter("enumText");
   v365_x = rt_bind(v365_x, 0);
-  RT_RET((rt_cond(rt_eq(rt_get(&F_k, v365_x), rt_s(&S211))) ? rt_get(&F_name, v365_x) : ({ wv t579 = rt_text(rt_get(&F_name, rt_get(&F_rec, v365_x))); wv t580 = rt_text(rt_get(&F_field, v365_x)); rt_cat(3, (wv[]){ t579, rt_s(&S129), t580 }); })));
+  RT_RET((rt_cond(rt_eq(rt_get(&F_k, v365_x), rt_s(&S211))) ? rt_get(&F_name, v365_x) : ({ wv t584 = rt_text(rt_get(&F_name, rt_get(&F_rec, v365_x))); wv t585 = rt_text(rt_get(&F_field, v365_x)); rt_cat(3, (wv[]){ t584, rt_s(&S129), t585 }); })));
 }
 
 static wv w5_caseKey(wv v366_v) {
   rt_enter("caseKey");
   v366_v = rt_bind(v366_v, 0);
   if (rt_cond(rt_eq(rt_get(&F_k, v366_v), rt_s(&S171)))) {
-    RT_RET(rt_add(rt_s(&S363), rt_idx(rt_i(0), rt_get(&F_parts, v366_v))));
+    RT_RET(rt_add(rt_s(&S368), rt_idx(rt_i(0), rt_get(&F_parts, v366_v))));
   }
   if (rt_cond(rt_eq(rt_get(&F_k, v366_v), rt_s(&S189)))) {
-    RT_RET(({ wv t581 = rt_text(rt_get(&F_field, v366_v)); wv t582 = rt_text(rt_chk(w5_enumText(rt_get(&F_rec, v366_v)), "caseKey")); rt_cat(4, (wv[]){ rt_s(&S364), t581, rt_s(&S129), t582 }); }));
+    RT_RET(({ wv t586 = rt_text(rt_get(&F_field, v366_v)); wv t587 = rt_text(rt_chk(w5_enumText(rt_get(&F_rec, v366_v)), "caseKey")); rt_cat(4, (wv[]){ rt_s(&S369), t586, rt_s(&S129), t587 }); }));
   }
   if (rt_cond(rt_eq(rt_get(&F_k, v366_v), rt_s(&S51)))) {
     RT_RET(rt_s(&S51));
   }
-  RT_RET(({ wv t583 = rt_text(rt_get(&F_k, v366_v)); wv t584 = rt_text(rt_get(&F_v, v366_v)); rt_cat(3, (wv[]){ t583, rt_s(&S28), t584 }); }));
+  RT_RET(({ wv t588 = rt_text(rt_get(&F_k, v366_v)); wv t589 = rt_text(rt_get(&F_v, v366_v)); rt_cat(3, (wv[]){ t588, rt_s(&S28), t589 }); }));
 }
 
 static wv w5_caseText(wv v367_v) {
@@ -4852,7 +5363,7 @@ static wv w5_caseText(wv v367_v) {
     RT_RET(rt_chk(w1_quote(rt_idx(rt_i(0), rt_get(&F_parts, v367_v))), "caseText"));
   }
   if (rt_cond(rt_eq(rt_get(&F_k, v367_v), rt_s(&S189)))) {
-    RT_RET(({ wv t585 = rt_text(rt_chk(w5_enumText(rt_get(&F_rec, v367_v)), "caseText")); wv t586 = rt_text(rt_get(&F_field, v367_v)); rt_cat(3, (wv[]){ t585, rt_s(&S129), t586 }); }));
+    RT_RET(({ wv t590 = rt_text(rt_chk(w5_enumText(rt_get(&F_rec, v367_v)), "caseText")); wv t591 = rt_text(rt_get(&F_field, v367_v)); rt_cat(3, (wv[]){ t590, rt_s(&S129), t591 }); }));
   }
   if (rt_cond(rt_eq(rt_get(&F_k, v367_v), rt_s(&S51)))) {
     RT_RET(rt_s(&S51));
@@ -4863,7 +5374,7 @@ static wv w5_caseText(wv v367_v) {
 static wv w5_getsAwayWithValue(wv v368_list) {
   rt_enter("getsAwayWithValue");
   wv v369_i = rt_i(0);
-  while (rt_cond(({ wv t587 = v369_i; wv t588 = std_length(v368_list); rt_lt(t587, t588); }))) {
+  while (rt_cond(({ wv t592 = v369_i; wv t593 = std_length(v368_list); rt_lt(t592, t593); }))) {
     wv v370_s = rt_bind(rt_idx(v369_i, v368_list), 0);
     if (rt_cond(rt_b(rt_bool(rt_ne(rt_get(&F_handler, v370_s), RT_NULL), "&&") && rt_bool(rt_chk(w5_getsAwayWithValue(rt_get(&F_stmts, rt_get(&F_body, rt_get(&F_handler, v370_s)))), "getsAwayWithValue"), "&&")))) {
       RT_RET(rt_b(1));
@@ -4876,8 +5387,8 @@ static wv w5_getsAwayWithValue(wv v368_list) {
     }
     if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_k, v370_s), rt_s(&S176)), "&&") && rt_bool(rt_eq(rt_get(&F_k, rt_get(&F_e, v370_s)), rt_s(&S184)), "&&")))) {
       wv v371_b = rt_i(0);
-      while (rt_cond(({ wv t589 = v371_b; wv t590 = std_length(rt_get(&F_branches, rt_get(&F_e, v370_s))); rt_lt(t589, t590); }))) {
-        if (rt_cond(rt_chk(w5_getsAwayWithValue(rt_get(&F_stmts, rt_get(&F_body, ({ wv t591 = v371_b; wv t592 = rt_get(&F_branches, rt_get(&F_e, v370_s)); rt_idx(t591, t592); })))), "getsAwayWithValue"))) {
+      while (rt_cond(({ wv t594 = v371_b; wv t595 = std_length(rt_get(&F_branches, rt_get(&F_e, v370_s))); rt_lt(t594, t595); }))) {
+        if (rt_cond(rt_chk(w5_getsAwayWithValue(rt_get(&F_stmts, rt_get(&F_body, ({ wv t596 = v371_b; wv t597 = rt_get(&F_branches, rt_get(&F_e, v370_s)); rt_idx(t596, t597); })))), "getsAwayWithValue"))) {
           RT_RET(rt_b(1));
         }
         v371_b = rt_add(v371_b, rt_i(1));
@@ -4888,8 +5399,8 @@ static wv w5_getsAwayWithValue(wv v368_list) {
     }
     if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_k, v370_s), rt_s(&S176)), "&&") && rt_bool(rt_eq(rt_get(&F_k, rt_get(&F_e, v370_s)), rt_s(&S44)), "&&")))) {
       wv v372_a = rt_i(0);
-      while (rt_cond(({ wv t593 = v372_a; wv t594 = std_length(rt_get(&F_cases, rt_get(&F_e, v370_s))); rt_lt(t593, t594); }))) {
-        if (rt_cond(rt_chk(w5_getsAwayWithValue(rt_get(&F_stmts, rt_get(&F_body, ({ wv t595 = v372_a; wv t596 = rt_get(&F_cases, rt_get(&F_e, v370_s)); rt_idx(t595, t596); })))), "getsAwayWithValue"))) {
+      while (rt_cond(({ wv t598 = v372_a; wv t599 = std_length(rt_get(&F_cases, rt_get(&F_e, v370_s))); rt_lt(t598, t599); }))) {
+        if (rt_cond(rt_chk(w5_getsAwayWithValue(rt_get(&F_stmts, rt_get(&F_body, ({ wv t600 = v372_a; wv t601 = rt_get(&F_cases, rt_get(&F_e, v370_s)); rt_idx(t600, t601); })))), "getsAwayWithValue"))) {
           RT_RET(rt_b(1));
         }
         v372_a = rt_add(v372_a, rt_i(1));
@@ -4938,19 +5449,19 @@ static wv w5_check(wv p_v378_modules, wv v379_requireExit) {
   fr.v418_topFn = rt_rec(0, 2, K44, (wv[]){ rt_i(0), rt_b(1) });
   wv v419_entry = rt_sub(std_length(fr.v378_modules), rt_i(1));
   wv v420_mi = rt_i(0);
-  while (rt_cond(({ wv t1122 = v420_mi; wv t1123 = std_length(fr.v378_modules); rt_lt(t1122, t1123); }))) {
-    (void)({ wv t1124 = v420_mi; wv t1125 = rt_eq(v420_mi, v419_entry); rt_chk(s417_checkModule(&fr, t1124, t1125), "check"); });
+  while (rt_cond(({ wv t1127 = v420_mi; wv t1128 = std_length(fr.v378_modules); rt_lt(t1127, t1128); }))) {
+    (void)({ wv t1129 = v420_mi; wv t1130 = rt_eq(v420_mi, v419_entry); rt_chk(s417_checkModule(&fr, t1129, t1130), "check"); });
     v420_mi = rt_add(v420_mi, rt_i(1));
   }
   wv v421_si = rt_i(0);
-  while (rt_cond(({ wv t1126 = v421_si; wv t1127 = std_length(fr.v383_functions); rt_lt(t1126, t1127); }))) {
+  while (rt_cond(({ wv t1131 = v421_si; wv t1132 = std_length(fr.v383_functions); rt_lt(t1131, t1132); }))) {
     wv v611_sc = rt_bind(rt_idx(v421_si, fr.v383_functions), 0);
-    wv v612_use = rt_bind(({ wv t1128 = rt_get(&F_mod, v611_sc); wv t1129 = rt_get(&F_namePos, v611_sc); rt_chk(s389_firstUse(&fr, t1128, t1129), "check"); }), 0);
+    wv v612_use = rt_bind(({ wv t1133 = rt_get(&F_mod, v611_sc); wv t1134 = rt_get(&F_namePos, v611_sc); rt_chk(s389_firstUse(&fr, t1133, t1134), "check"); }), 0);
     if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_ne(v612_use, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_value, rt_get(&F_body, v611_sc)), RT_NULL), "&&")), "&&") && rt_bool(rt_not(rt_chk(w5_getsAwayWithValue(rt_get(&F_stmts, rt_get(&F_body, v611_sc))), "check")), "&&")))) {
       (void)rt_chk(s387_enter(&fr, rt_get(&F_mod, v611_sc)), "check");
       wv v613_um = rt_bind(rt_get(&F_useMod, v612_use), 0);
-      wv v614_where = rt_bind((rt_cond(({ wv t1130 = v613_um; wv t1131 = rt_get(&F_mod, v611_sc); rt_eq(t1130, t1131); })) ? rt_cat(2, (wv[]){ rt_s(&S452), rt_text(rt_chk(w5_lineOf(rt_get(&F_pos, v612_use)), "check")) }) : ({ wv t1134 = rt_text(rt_get(&F_file, rt_idx(v613_um, fr.v378_modules))); wv t1135 = rt_text(({ wv t1132 = rt_get(&F_chars, rt_idx(v613_um, fr.v378_modules)); wv t1133 = rt_get(&F_pos, v612_use); rt_chk(w5_lineIn(t1132, t1133), "check"); })); rt_cat(3, (wv[]){ t1134, rt_s(&S453), t1135 }); })), 0);
-      (void)({ wv t1138 = rt_get(&F_namePos, v611_sc); wv t1139 = ({ wv t1136 = rt_text(rt_get(&F_name, v611_sc)); wv t1137 = rt_text(v614_where); rt_cat(5, (wv[]){ rt_s(&S113), t1136, rt_s(&S454), t1137, rt_s(&S16) }); }); rt_chk(s386_error(&fr, t1138, t1139, rt_s(&S455)), "check"); });
+      wv v614_where = rt_bind((rt_cond(({ wv t1135 = v613_um; wv t1136 = rt_get(&F_mod, v611_sc); rt_eq(t1135, t1136); })) ? rt_cat(2, (wv[]){ rt_s(&S457), rt_text(rt_chk(w5_lineOf(rt_get(&F_pos, v612_use)), "check")) }) : ({ wv t1139 = rt_text(rt_get(&F_file, rt_idx(v613_um, fr.v378_modules))); wv t1140 = rt_text(({ wv t1137 = rt_get(&F_chars, rt_idx(v613_um, fr.v378_modules)); wv t1138 = rt_get(&F_pos, v612_use); rt_chk(w5_lineIn(t1137, t1138), "check"); })); rt_cat(3, (wv[]){ t1139, rt_s(&S458), t1140 }); })), 0);
+      (void)({ wv t1143 = rt_get(&F_namePos, v611_sc); wv t1144 = ({ wv t1141 = rt_text(rt_get(&F_name, v611_sc)); wv t1142 = rt_text(v614_where); rt_cat(5, (wv[]){ rt_s(&S113), t1141, rt_s(&S459), t1142, rt_s(&S16) }); }); rt_chk(s386_error(&fr, t1143, t1144, rt_s(&S460)), "check"); });
     }
     v421_si = rt_add(v421_si, rt_i(1));
   }
@@ -4959,14 +5470,14 @@ static wv w5_check(wv p_v378_modules, wv v379_requireExit) {
   if (rt_cond(v379_requireExit)) {
     wv v615_last = RT_NULL;
     wv v616_k = rt_i(0);
-    while (rt_cond(({ wv t1140 = v616_k; wv t1141 = std_length(rt_get(&F_stmts, v422_program)); rt_lt(t1140, t1141); }))) {
-      if (rt_cond(rt_ne(rt_get(&F_k, ({ wv t1142 = v616_k; wv t1143 = rt_get(&F_stmts, v422_program); rt_idx(t1142, t1143); })), rt_s(&S200)))) {
-        v615_last = rt_bind(({ wv t1144 = v616_k; wv t1145 = rt_get(&F_stmts, v422_program); rt_idx(t1144, t1145); }), 1);
+    while (rt_cond(({ wv t1145 = v616_k; wv t1146 = std_length(rt_get(&F_stmts, v422_program)); rt_lt(t1145, t1146); }))) {
+      if (rt_cond(rt_ne(rt_get(&F_k, ({ wv t1147 = v616_k; wv t1148 = rt_get(&F_stmts, v422_program); rt_idx(t1147, t1148); })), rt_s(&S200)))) {
+        v615_last = rt_bind(({ wv t1149 = v616_k; wv t1150 = rt_get(&F_stmts, v422_program); rt_idx(t1149, t1150); }), 1);
       }
       v616_k = rt_add(v616_k, rt_i(1));
     }
     if (rt_cond(rt_b(rt_bool(rt_eq(v615_last, RT_NULL), "||") || rt_bool(rt_ne(rt_get(&F_k, v615_last), rt_s(&S54)), "||")))) {
-      (void)rt_chk(s386_error(&fr, rt_get(&F_end, v422_program), rt_s(&S456), rt_s(&S457)), "check");
+      (void)rt_chk(s386_error(&fr, rt_get(&F_end, v422_program), rt_s(&S461), rt_s(&S462)), "check");
     }
   }
   RT_RET(fr.v380_errors);
@@ -4977,17 +5488,17 @@ static wv s386_error(struct fr99 *up, wv v423_pos, wv v424_message, wv v425_hint
   v423_pos = rt_bind(v423_pos, 0);
   v424_message = rt_bind(v424_message, 0);
   v425_hint = rt_bind(v425_hint, 0);
-  (void)({ wv t597 = rt_def(up->v380_errors, "errors"); wv t598 = rt_chk(w2_err(v423_pos, v424_message, v425_hint), "error"); std_push(t597, t598); });
+  (void)({ wv t602 = rt_def(up->v380_errors, "errors"); wv t603 = rt_chk(w2_err(v423_pos, v424_message, v425_hint), "error"); std_push(t602, t603); });
   RT_RET(RT_NULL);
 }
 
 static wv s387_enter(struct fr99 *up, wv v426_m) {
   rt_enter("enter");
   v426_m = rt_bind(v426_m, 0);
-  wv t599 = rt_bind(v426_m, 1);
+  wv t604 = rt_bind(v426_m, 1);
   (void)rt_def(up->v382_curMod, "curMod");
-  up->v382_curMod = t599;
-  (void)({ wv t600 = rt_get(&F_file, rt_idx(v426_m, up->v378_modules)); wv t601 = rt_get(&F_chars, rt_idx(v426_m, up->v378_modules)); rt_chk(w2_setSource(t600, t601), "enter"); });
+  up->v382_curMod = t604;
+  (void)({ wv t605 = rt_get(&F_file, rt_idx(v426_m, up->v378_modules)); wv t606 = rt_get(&F_chars, rt_idx(v426_m, up->v378_modules)); rt_chk(w2_setSource(t605, t606), "enter"); });
   RT_RET(RT_NULL);
 }
 
@@ -4995,9 +5506,9 @@ static wv s388_enumMembers(struct fr99 *up, wv v427_d) {
   rt_enter("enumMembers");
   v427_d = rt_bind(v427_d, 0);
   wv v428_k = rt_i(0);
-  while (rt_cond(({ wv t602 = v428_k; wv t603 = std_length(rt_def(up->v385_enums, "enums")); rt_lt(t602, t603); }))) {
-    if (rt_cond(rt_b(rt_bool(({ wv t606 = rt_get(&F_mod, ({ wv t604 = v428_k; wv t605 = rt_def(up->v385_enums, "enums"); rt_idx(t604, t605); })); wv t607 = rt_get(&F_mod, v427_d); rt_eq(t606, t607); }), "&&") && rt_bool(({ wv t610 = rt_get(&F_name, ({ wv t608 = v428_k; wv t609 = rt_def(up->v385_enums, "enums"); rt_idx(t608, t609); })); wv t611 = rt_get(&F_name, v427_d); rt_eq(t610, t611); }), "&&")))) {
-      RT_RET(rt_get(&F_members, ({ wv t612 = v428_k; wv t613 = rt_def(up->v385_enums, "enums"); rt_idx(t612, t613); })));
+  while (rt_cond(({ wv t607 = v428_k; wv t608 = std_length(rt_def(up->v385_enums, "enums")); rt_lt(t607, t608); }))) {
+    if (rt_cond(rt_b(rt_bool(({ wv t611 = rt_get(&F_mod, ({ wv t609 = v428_k; wv t610 = rt_def(up->v385_enums, "enums"); rt_idx(t609, t610); })); wv t612 = rt_get(&F_mod, v427_d); rt_eq(t611, t612); }), "&&") && rt_bool(({ wv t615 = rt_get(&F_name, ({ wv t613 = v428_k; wv t614 = rt_def(up->v385_enums, "enums"); rt_idx(t613, t614); })); wv t616 = rt_get(&F_name, v427_d); rt_eq(t615, t616); }), "&&")))) {
+      RT_RET(rt_get(&F_members, ({ wv t617 = v428_k; wv t618 = rt_def(up->v385_enums, "enums"); rt_idx(t617, t618); })));
     }
     v428_k = rt_add(v428_k, rt_i(1));
   }
@@ -5009,9 +5520,9 @@ static wv s389_firstUse(struct fr99 *up, wv v429_mod, wv v430_declPos) {
   v429_mod = rt_bind(v429_mod, 0);
   v430_declPos = rt_bind(v430_declPos, 0);
   wv v431_k = rt_i(0);
-  while (rt_cond(({ wv t614 = v431_k; wv t615 = std_length(rt_def(up->v384_uses, "uses")); rt_lt(t614, t615); }))) {
-    if (rt_cond(rt_b(rt_bool(({ wv t618 = rt_get(&F_mod, ({ wv t616 = v431_k; wv t617 = rt_def(up->v384_uses, "uses"); rt_idx(t616, t617); })); wv t619 = v429_mod; rt_eq(t618, t619); }), "&&") && rt_bool(({ wv t622 = rt_get(&F_namePos, ({ wv t620 = v431_k; wv t621 = rt_def(up->v384_uses, "uses"); rt_idx(t620, t621); })); wv t623 = v430_declPos; rt_eq(t622, t623); }), "&&")))) {
-      RT_RET(({ wv t624 = v431_k; wv t625 = rt_def(up->v384_uses, "uses"); rt_idx(t624, t625); }));
+  while (rt_cond(({ wv t619 = v431_k; wv t620 = std_length(rt_def(up->v384_uses, "uses")); rt_lt(t619, t620); }))) {
+    if (rt_cond(rt_b(rt_bool(({ wv t623 = rt_get(&F_mod, ({ wv t621 = v431_k; wv t622 = rt_def(up->v384_uses, "uses"); rt_idx(t621, t622); })); wv t624 = v429_mod; rt_eq(t623, t624); }), "&&") && rt_bool(({ wv t627 = rt_get(&F_namePos, ({ wv t625 = v431_k; wv t626 = rt_def(up->v384_uses, "uses"); rt_idx(t625, t626); })); wv t628 = v430_declPos; rt_eq(t627, t628); }), "&&")))) {
+      RT_RET(({ wv t629 = v431_k; wv t630 = rt_def(up->v384_uses, "uses"); rt_idx(t629, t630); }));
     }
     v431_k = rt_add(v431_k, rt_i(1));
   }
@@ -5026,16 +5537,16 @@ static wv s390_requireValue(struct fr99 *up, wv v432_b) {
   }
   wv v433_last = RT_NULL;
   wv v434_k = rt_i(0);
-  while (rt_cond(({ wv t626 = v434_k; wv t627 = std_length(rt_get(&F_stmts, v432_b)); rt_lt(t626, t627); }))) {
-    if (rt_cond(rt_ne(rt_get(&F_k, ({ wv t628 = v434_k; wv t629 = rt_get(&F_stmts, v432_b); rt_idx(t628, t629); })), rt_s(&S200)))) {
-      v433_last = rt_bind(({ wv t630 = v434_k; wv t631 = rt_get(&F_stmts, v432_b); rt_idx(t630, t631); }), 1);
+  while (rt_cond(({ wv t631 = v434_k; wv t632 = std_length(rt_get(&F_stmts, v432_b)); rt_lt(t631, t632); }))) {
+    if (rt_cond(rt_ne(rt_get(&F_k, ({ wv t633 = v434_k; wv t634 = rt_get(&F_stmts, v432_b); rt_idx(t633, t634); })), rt_s(&S200)))) {
+      v433_last = rt_bind(({ wv t635 = v434_k; wv t636 = rt_get(&F_stmts, v432_b); rt_idx(t635, t636); }), 1);
     }
     v434_k = rt_add(v434_k, rt_i(1));
   }
-  if (rt_cond(rt_b(rt_bool(rt_ne(v433_last, RT_NULL), "&&") && rt_bool(rt_b(rt_bool(({ wv t632 = rt_def(w5_neverCompletes, "neverCompletes"); wv t633 = rt_get(&F_k, v433_last); rt_chk(w1_contains(t632, t633), "requireValue"); }), "||") || rt_bool(rt_b(rt_bool(rt_eq(rt_get(&F_k, v433_last), rt_s(&S176)), "&&") && rt_bool(rt_eq(rt_get(&F_k, rt_get(&F_e, v433_last)), rt_s(&S183)), "&&")), "||")), "&&")))) {
+  if (rt_cond(rt_b(rt_bool(rt_ne(v433_last, RT_NULL), "&&") && rt_bool(rt_b(rt_bool(({ wv t637 = rt_def(w5_neverCompletes, "neverCompletes"); wv t638 = rt_get(&F_k, v433_last); rt_chk(w1_contains(t637, t638), "requireValue"); }), "||") || rt_bool(rt_b(rt_bool(rt_eq(rt_get(&F_k, v433_last), rt_s(&S176)), "&&") && rt_bool(rt_eq(rt_get(&F_k, rt_get(&F_e, v433_last)), rt_s(&S183)), "&&")), "||")), "&&")))) {
     RT_RET(RT_NULL);
   }
-  (void)rt_chk(s386_error(up, rt_get(&F_close, v432_b), rt_s(&S365), rt_s(&S366)), "requireValue");
+  (void)rt_chk(s386_error(up, rt_get(&F_close, v432_b), rt_s(&S370), rt_s(&S371)), "requireValue");
   RT_RET(RT_NULL);
 }
 
@@ -5055,16 +5566,16 @@ static wv s392_decl(struct fr99 *up, wv v437_kind, wv v438_name, wv v439_mode, w
   v441_visibleAt = rt_bind(v441_visibleAt, 0);
   v442_fnId = rt_bind(v442_fnId, 0);
   v443_arity = rt_bind(v443_arity, 0);
-  RT_RET(({ wv t634 = v437_kind; wv t635 = v438_name; wv t636 = rt_eq(v439_mode, rt_s(&S36)); wv t637 = rt_eq(v439_mode, rt_s(&S37)); wv t638 = v440_namePos; wv t639 = v441_visibleAt; wv t640 = v442_fnId; wv t641 = v443_arity; wv t642 = rt_def(up->v382_curMod, "curMod"); rt_rec(0, 10, K41, (wv[]){ t634, t635, t636, t637, t638, t639, t640, t641, t642, RT_NULL }); }));
+  RT_RET(({ wv t639 = v437_kind; wv t640 = v438_name; wv t641 = rt_eq(v439_mode, rt_s(&S36)); wv t642 = rt_eq(v439_mode, rt_s(&S37)); wv t643 = v440_namePos; wv t644 = v441_visibleAt; wv t645 = v442_fnId; wv t646 = v443_arity; wv t647 = rt_def(up->v382_curMod, "curMod"); rt_rec(0, 10, K41, (wv[]){ t639, t640, t641, t642, t643, t644, t645, t646, t647, RT_NULL }); }));
 }
 
 static wv s393_own(struct fr99 *up, wv v444_scope, wv v445_name) {
   rt_enter("own");
   v445_name = rt_bind(v445_name, 0);
   wv v446_k = rt_i(0);
-  while (rt_cond(({ wv t643 = v446_k; wv t644 = std_length(rt_get(&F_names, v444_scope)); rt_lt(t643, t644); }))) {
-    if (rt_cond(({ wv t647 = rt_get(&F_name, ({ wv t645 = v446_k; wv t646 = rt_get(&F_names, v444_scope); rt_idx(t645, t646); })); wv t648 = v445_name; rt_eq(t647, t648); }))) {
-      RT_RET(({ wv t649 = v446_k; wv t650 = rt_get(&F_names, v444_scope); rt_idx(t649, t650); }));
+  while (rt_cond(({ wv t648 = v446_k; wv t649 = std_length(rt_get(&F_names, v444_scope)); rt_lt(t648, t649); }))) {
+    if (rt_cond(({ wv t652 = rt_get(&F_name, ({ wv t650 = v446_k; wv t651 = rt_get(&F_names, v444_scope); rt_idx(t650, t651); })); wv t653 = v445_name; rt_eq(t652, t653); }))) {
+      RT_RET(({ wv t654 = v446_k; wv t655 = rt_get(&F_names, v444_scope); rt_idx(t654, t655); }));
     }
     v446_k = rt_add(v446_k, rt_i(1));
   }
@@ -5077,19 +5588,19 @@ static wv s394_declare(struct fr99 *up, wv v447_scope, wv v448_name, wv v449_d) 
   v449_d = rt_bind(v449_d, 0);
   wv v450_dup = rt_bind(rt_chk(s393_own(up, v447_scope, v448_name), "declare"), 0);
   if (rt_cond(rt_ne(v450_dup, RT_NULL))) {
-    (void)({ wv t653 = rt_get(&F_namePos, v449_d); wv t654 = ({ wv t651 = rt_text(v448_name); wv t652 = rt_text(rt_chk(w5_lineOf(rt_get(&F_namePos, v450_dup)), "declare")); rt_cat(5, (wv[]){ rt_s(&S113), t651, rt_s(&S367), t652, rt_s(&S16) }); }); rt_chk(s386_error(up, t653, t654, RT_NULL), "declare"); });
+    (void)({ wv t658 = rt_get(&F_namePos, v449_d); wv t659 = ({ wv t656 = rt_text(v448_name); wv t657 = rt_text(rt_chk(w5_lineOf(rt_get(&F_namePos, v450_dup)), "declare")); rt_cat(5, (wv[]){ rt_s(&S113), t656, rt_s(&S372), t657, rt_s(&S16) }); }); rt_chk(s386_error(up, t658, t659, RT_NULL), "declare"); });
     RT_RET(RT_NULL);
   }
   wv v451_s = rt_get(&F_parent, v447_scope);
   while (rt_cond(rt_ne(v451_s, RT_NULL))) {
     wv v452_outer = rt_bind(rt_chk(s393_own(up, v451_s, v448_name), "declare"), 0);
-    if (rt_cond(rt_b(rt_bool(rt_ne(v452_outer, RT_NULL), "&&") && rt_bool(rt_b(rt_bool(rt_ne(rt_get(&F_kind, v452_outer), rt_s(&S177)), "||") || rt_bool(({ wv t655 = rt_get(&F_namePos, v452_outer); wv t656 = rt_get(&F_namePos, v449_d); rt_lt(t655, t656); }), "||")), "&&")))) {
-      (void)({ wv t660 = rt_get(&F_namePos, v449_d); wv t661 = ({ wv t657 = rt_text(v448_name); wv t658 = rt_text(v448_name); wv t659 = rt_text(rt_chk(w5_lineOf(rt_get(&F_namePos, v452_outer)), "declare")); rt_cat(7, (wv[]){ rt_s(&S113), t657, rt_s(&S368), t658, rt_s(&S369), t659, rt_s(&S16) }); }); rt_chk(s386_error(up, t660, t661, rt_s(&S370)), "declare"); });
+    if (rt_cond(rt_b(rt_bool(rt_ne(v452_outer, RT_NULL), "&&") && rt_bool(rt_b(rt_bool(rt_ne(rt_get(&F_kind, v452_outer), rt_s(&S177)), "||") || rt_bool(({ wv t660 = rt_get(&F_namePos, v452_outer); wv t661 = rt_get(&F_namePos, v449_d); rt_lt(t660, t661); }), "||")), "&&")))) {
+      (void)({ wv t665 = rt_get(&F_namePos, v449_d); wv t666 = ({ wv t662 = rt_text(v448_name); wv t663 = rt_text(v448_name); wv t664 = rt_text(rt_chk(w5_lineOf(rt_get(&F_namePos, v452_outer)), "declare")); rt_cat(7, (wv[]){ rt_s(&S113), t662, rt_s(&S373), t663, rt_s(&S374), t664, rt_s(&S16) }); }); rt_chk(s386_error(up, t665, t666, rt_s(&S375)), "declare"); });
       break;
     }
     v451_s = rt_get(&F_parent, v451_s);
   }
-  (void)({ wv t662 = rt_get(&F_names, v447_scope); wv t663 = v449_d; std_push(t662, t663); });
+  (void)({ wv t667 = rt_get(&F_names, v447_scope); wv t668 = v449_d; std_push(t667, t668); });
   RT_RET(RT_NULL);
 }
 
@@ -5115,11 +5626,11 @@ static wv s396_resolve(struct fr99 *up, wv v457_name, wv v458_pos, wv v459_scope
   v460_ctx = rt_bind(v460_ctx, 0);
   wv v461_d = rt_bind(rt_chk(s395_lookup(up, v459_scope, v457_name), "resolve"), 0);
   if (rt_cond(rt_eq(v461_d, RT_NULL))) {
-    (void)({ wv t664 = v458_pos; wv t665 = rt_cat(3, (wv[]){ rt_s(&S371), rt_text(v457_name), rt_s(&S113) }); rt_chk(s386_error(up, t664, t665, RT_NULL), "resolve"); });
+    (void)({ wv t669 = v458_pos; wv t670 = rt_cat(3, (wv[]){ rt_s(&S376), rt_text(v457_name), rt_s(&S113) }); rt_chk(s386_error(up, t669, t670, RT_NULL), "resolve"); });
     RT_RET(RT_NULL);
   }
-  if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_eq(rt_get(&F_kind, v461_d), rt_s(&S177)), "&&") && rt_bool(({ wv t666 = rt_get(&F_fnId, v461_d); wv t667 = rt_get(&F_id, rt_get(&F_func, v460_ctx)); rt_eq(t666, t667); }), "&&")), "&&") && rt_bool(({ wv t668 = v458_pos; wv t669 = rt_get(&F_visibleAt, v461_d); rt_lt(t668, t669); }), "&&")))) {
-    (void)({ wv t672 = v458_pos; wv t673 = ({ wv t670 = rt_text(v457_name); wv t671 = rt_text(rt_chk(w5_lineOf(rt_get(&F_namePos, v461_d)), "resolve")); rt_cat(5, (wv[]){ rt_s(&S113), t670, rt_s(&S372), t671, rt_s(&S16) }); }); rt_chk(s386_error(up, t672, t673, RT_NULL), "resolve"); });
+  if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_eq(rt_get(&F_kind, v461_d), rt_s(&S177)), "&&") && rt_bool(({ wv t671 = rt_get(&F_fnId, v461_d); wv t672 = rt_get(&F_id, rt_get(&F_func, v460_ctx)); rt_eq(t671, t672); }), "&&")), "&&") && rt_bool(({ wv t673 = v458_pos; wv t674 = rt_get(&F_visibleAt, v461_d); rt_lt(t673, t674); }), "&&")))) {
+    (void)({ wv t677 = v458_pos; wv t678 = ({ wv t675 = rt_text(v457_name); wv t676 = rt_text(rt_chk(w5_lineOf(rt_get(&F_namePos, v461_d)), "resolve")); rt_cat(5, (wv[]){ rt_s(&S113), t675, rt_s(&S377), t676, rt_s(&S16) }); }); rt_chk(s386_error(up, t677, t678, RT_NULL), "resolve"); });
   }
   RT_RET(v461_d);
 }
@@ -5129,32 +5640,32 @@ static wv s397_block(struct fr99 *up, wv v462_b, wv v463_scope, wv v464_ctx) {
   v463_scope = rt_bind(v463_scope, 0);
   v464_ctx = rt_bind(v464_ctx, 0);
   wv v465_k = rt_i(0);
-  while (rt_cond(({ wv t674 = v465_k; wv t675 = std_length(rt_get(&F_stmts, v462_b)); rt_lt(t674, t675); }))) {
-    wv v466_s = rt_bind(({ wv t676 = v465_k; wv t677 = rt_get(&F_stmts, v462_b); rt_idx(t676, t677); }), 0);
+  while (rt_cond(({ wv t679 = v465_k; wv t680 = std_length(rt_get(&F_stmts, v462_b)); rt_lt(t679, t680); }))) {
+    wv v466_s = rt_bind(({ wv t681 = v465_k; wv t682 = rt_get(&F_stmts, v462_b); rt_idx(t681, t682); }), 0);
     if (rt_cond(rt_eq(rt_get(&F_k, v466_s), rt_s(&S33)))) {
-      wv v467_d = rt_bind(({ wv t678 = rt_get(&F_name, v466_s); wv t679 = rt_get(&F_namePos, v466_s); wv t680 = rt_get(&F_id, rt_get(&F_func, v464_ctx)); wv t681 = std_length(rt_get(&F_params, v466_s)); rt_chk(s392_decl(up, rt_s(&S33), t678, rt_s(&S13), t679, RT_NULL, t680, t681), "block"); }), 0);
-      (void)({ wv t682 = v463_scope; wv t683 = rt_get(&F_name, v466_s); wv t684 = v467_d; rt_chk(s394_declare(up, t682, t683, t684), "block"); });
-      if (rt_cond(({ wv t687 = ({ wv t685 = v463_scope; wv t686 = rt_get(&F_name, v466_s); rt_chk(s393_own(up, t685, t686), "block"); }); wv t688 = v467_d; rt_eq(t687, t688); }))) {
-        (void)({ wv t693 = rt_def(up->v383_functions, "functions"); wv t694 = ({ wv t689 = rt_def(up->v382_curMod, "curMod"); wv t690 = rt_get(&F_name, v466_s); wv t691 = rt_get(&F_namePos, v466_s); wv t692 = rt_get(&F_body, v466_s); rt_rec(0, 4, K42, (wv[]){ t689, t690, t691, t692 }); }); std_push(t693, t694); });
+      wv v467_d = rt_bind(({ wv t683 = rt_get(&F_name, v466_s); wv t684 = rt_get(&F_namePos, v466_s); wv t685 = rt_get(&F_id, rt_get(&F_func, v464_ctx)); wv t686 = std_length(rt_get(&F_params, v466_s)); rt_chk(s392_decl(up, rt_s(&S33), t683, rt_s(&S13), t684, RT_NULL, t685, t686), "block"); }), 0);
+      (void)({ wv t687 = v463_scope; wv t688 = rt_get(&F_name, v466_s); wv t689 = v467_d; rt_chk(s394_declare(up, t687, t688, t689), "block"); });
+      if (rt_cond(({ wv t692 = ({ wv t690 = v463_scope; wv t691 = rt_get(&F_name, v466_s); rt_chk(s393_own(up, t690, t691), "block"); }); wv t693 = v467_d; rt_eq(t692, t693); }))) {
+        (void)({ wv t698 = rt_def(up->v383_functions, "functions"); wv t699 = ({ wv t694 = rt_def(up->v382_curMod, "curMod"); wv t695 = rt_get(&F_name, v466_s); wv t696 = rt_get(&F_namePos, v466_s); wv t697 = rt_get(&F_body, v466_s); rt_rec(0, 4, K42, (wv[]){ t694, t695, t696, t697 }); }); std_push(t698, t699); });
       }
     } else if (rt_cond(rt_eq(rt_get(&F_k, v466_s), rt_s(&S46)))) {
-      wv v468_d = rt_bind(({ wv t695 = rt_get(&F_name, v466_s); wv t696 = rt_get(&F_namePos, v466_s); wv t697 = rt_get(&F_id, rt_get(&F_func, v464_ctx)); rt_chk(s392_decl(up, rt_s(&S46), t695, rt_s(&S13), t696, RT_NULL, t697, RT_NULL), "block"); }), 0);
-      (void)({ wv t698 = v463_scope; wv t699 = rt_get(&F_name, v466_s); wv t700 = v468_d; rt_chk(s394_declare(up, t698, t699, t700), "block"); });
-      if (rt_cond(({ wv t703 = ({ wv t701 = v463_scope; wv t702 = rt_get(&F_name, v466_s); rt_chk(s393_own(up, t701, t702), "block"); }); wv t704 = v468_d; rt_eq(t703, t704); }))) {
-        (void)({ wv t708 = rt_def(up->v385_enums, "enums"); wv t709 = ({ wv t705 = rt_def(up->v382_curMod, "curMod"); wv t706 = rt_get(&F_name, v466_s); wv t707 = rt_get(&F_members, v466_s); rt_rec(0, 3, K43, (wv[]){ t705, t706, t707 }); }); std_push(t708, t709); });
+      wv v468_d = rt_bind(({ wv t700 = rt_get(&F_name, v466_s); wv t701 = rt_get(&F_namePos, v466_s); wv t702 = rt_get(&F_id, rt_get(&F_func, v464_ctx)); rt_chk(s392_decl(up, rt_s(&S46), t700, rt_s(&S13), t701, RT_NULL, t702, RT_NULL), "block"); }), 0);
+      (void)({ wv t703 = v463_scope; wv t704 = rt_get(&F_name, v466_s); wv t705 = v468_d; rt_chk(s394_declare(up, t703, t704, t705), "block"); });
+      if (rt_cond(({ wv t708 = ({ wv t706 = v463_scope; wv t707 = rt_get(&F_name, v466_s); rt_chk(s393_own(up, t706, t707), "block"); }); wv t709 = v468_d; rt_eq(t708, t709); }))) {
+        (void)({ wv t713 = rt_def(up->v385_enums, "enums"); wv t714 = ({ wv t710 = rt_def(up->v382_curMod, "curMod"); wv t711 = rt_get(&F_name, v466_s); wv t712 = rt_get(&F_members, v466_s); rt_rec(0, 3, K43, (wv[]){ t710, t711, t712 }); }); std_push(t713, t714); });
       }
     } else if (rt_cond(rt_eq(rt_get(&F_k, v466_s), rt_s(&S177)))) {
-      (void)({ wv t715 = v463_scope; wv t716 = rt_get(&F_name, v466_s); wv t717 = ({ wv t710 = rt_get(&F_name, v466_s); wv t711 = rt_chk(w5_modeOf(v466_s), "block"); wv t712 = rt_get(&F_namePos, v466_s); wv t713 = rt_get(&F_end, v466_s); wv t714 = rt_get(&F_id, rt_get(&F_func, v464_ctx)); rt_chk(s392_decl(up, rt_s(&S177), t710, t711, t712, t713, t714, RT_NULL), "block"); }); rt_chk(s394_declare(up, t715, t716, t717), "block"); });
+      (void)({ wv t720 = v463_scope; wv t721 = rt_get(&F_name, v466_s); wv t722 = ({ wv t715 = rt_get(&F_name, v466_s); wv t716 = rt_chk(w5_modeOf(v466_s), "block"); wv t717 = rt_get(&F_namePos, v466_s); wv t718 = rt_get(&F_end, v466_s); wv t719 = rt_get(&F_id, rt_get(&F_func, v464_ctx)); rt_chk(s392_decl(up, rt_s(&S177), t715, t716, t717, t718, t719, RT_NULL), "block"); }); rt_chk(s394_declare(up, t720, t721, t722), "block"); });
     }
     v465_k = rt_add(v465_k, rt_i(1));
   }
   v465_k = rt_i(0);
-  while (rt_cond(({ wv t718 = v465_k; wv t719 = std_length(rt_get(&F_stmts, v462_b)); rt_lt(t718, t719); }))) {
-    (void)({ wv t722 = ({ wv t720 = v465_k; wv t721 = rt_get(&F_stmts, v462_b); rt_idx(t720, t721); }); wv t723 = v463_scope; wv t724 = v464_ctx; rt_chk(s398_stmt(up, t722, t723, t724), "block"); });
+  while (rt_cond(({ wv t723 = v465_k; wv t724 = std_length(rt_get(&F_stmts, v462_b)); rt_lt(t723, t724); }))) {
+    (void)({ wv t727 = ({ wv t725 = v465_k; wv t726 = rt_get(&F_stmts, v462_b); rt_idx(t725, t726); }); wv t728 = v463_scope; wv t729 = v464_ctx; rt_chk(s398_stmt(up, t727, t728, t729), "block"); });
     v465_k = rt_add(v465_k, rt_i(1));
   }
   if (rt_cond(rt_ne(rt_get(&F_value, v462_b), RT_NULL))) {
-    (void)({ wv t725 = rt_get(&F_value, v462_b); wv t726 = v463_scope; wv t727 = v464_ctx; rt_chk(s413_expr(up, t725, t726, t727), "block"); });
+    (void)({ wv t730 = rt_get(&F_value, v462_b); wv t731 = v463_scope; wv t732 = v464_ctx; rt_chk(s413_expr(up, t730, t731, t732), "block"); });
   }
   RT_RET(RT_NULL);
 }
@@ -5172,66 +5683,66 @@ static wv s398_stmt(struct fr99 *up, wv v469_s, wv v470_scope, wv v471_ctx) {
     up->v381_nextFn = rt_add(rt_def(up->v381_nextFn, "nextFn"), rt_i(1));
     wv v474_ps = rt_bind(rt_chk(s391_newScope(up, v470_scope), "stmt"), 0);
     wv v475_k = rt_i(0);
-    while (rt_cond(({ wv t728 = v475_k; wv t729 = std_length(rt_get(&F_params, v469_s)); rt_lt(t728, t729); }))) {
-      wv v476_p = rt_bind(({ wv t730 = v475_k; wv t731 = rt_get(&F_params, v469_s); rt_idx(t730, t731); }), 0);
-      (void)({ wv t736 = v474_ps; wv t737 = rt_get(&F_name, v476_p); wv t738 = ({ wv t732 = rt_get(&F_name, v476_p); wv t733 = rt_chk(w5_modeOf(v476_p), "stmt"); wv t734 = rt_get(&F_pos, v476_p); wv t735 = rt_get(&F_id, v473_func); rt_chk(s392_decl(up, rt_s(&S373), t732, t733, t734, RT_NULL, t735, RT_NULL), "stmt"); }); rt_chk(s394_declare(up, t736, t737, t738), "stmt"); });
+    while (rt_cond(({ wv t733 = v475_k; wv t734 = std_length(rt_get(&F_params, v469_s)); rt_lt(t733, t734); }))) {
+      wv v476_p = rt_bind(({ wv t735 = v475_k; wv t736 = rt_get(&F_params, v469_s); rt_idx(t735, t736); }), 0);
+      (void)({ wv t741 = v474_ps; wv t742 = rt_get(&F_name, v476_p); wv t743 = ({ wv t737 = rt_get(&F_name, v476_p); wv t738 = rt_chk(w5_modeOf(v476_p), "stmt"); wv t739 = rt_get(&F_pos, v476_p); wv t740 = rt_get(&F_id, v473_func); rt_chk(s392_decl(up, rt_s(&S378), t737, t738, t739, RT_NULL, t740, RT_NULL), "stmt"); }); rt_chk(s394_declare(up, t741, t742, t743), "stmt"); });
       v475_k = rt_add(v475_k, rt_i(1));
     }
-    (void)({ wv t739 = rt_get(&F_body, v469_s); wv t740 = rt_chk(s391_newScope(up, v474_ps), "stmt"); wv t741 = rt_rec(0, 2, K45, (wv[]){ v473_func, rt_i(0) }); rt_chk(s397_block(up, t739, t740, t741), "stmt"); });
+    (void)({ wv t744 = rt_get(&F_body, v469_s); wv t745 = rt_chk(s391_newScope(up, v474_ps), "stmt"); wv t746 = rt_rec(0, 2, K45, (wv[]){ v473_func, rt_i(0) }); rt_chk(s397_block(up, t744, t745, t746), "stmt"); });
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v472_kind, rt_s(&S34)))) {
     if (rt_cond(rt_get(&F_top, rt_get(&F_func, v471_ctx)))) {
-      (void)rt_chk(s386_error(up, rt_get(&F_pos, v469_s), rt_s(&S374), RT_NULL), "stmt");
+      (void)rt_chk(s386_error(up, rt_get(&F_pos, v469_s), rt_s(&S379), RT_NULL), "stmt");
     }
     if (rt_cond(rt_ne(rt_get(&F_e, v469_s), RT_NULL))) {
-      (void)({ wv t742 = rt_get(&F_e, v469_s); wv t743 = v470_scope; wv t744 = v471_ctx; rt_chk(s413_expr(up, t742, t743, t744), "stmt"); });
+      (void)({ wv t747 = rt_get(&F_e, v469_s); wv t748 = v470_scope; wv t749 = v471_ctx; rt_chk(s413_expr(up, t747, t748, t749), "stmt"); });
     }
   } else if (rt_cond(rt_eq(v472_kind, rt_s(&S57)))) {
-    (void)({ wv t745 = rt_get(&F_e, v469_s); wv t746 = v470_scope; wv t747 = v471_ctx; rt_chk(s413_expr(up, t745, t746, t747), "stmt"); });
+    (void)({ wv t750 = rt_get(&F_e, v469_s); wv t751 = v470_scope; wv t752 = v471_ctx; rt_chk(s413_expr(up, t750, t751, t752), "stmt"); });
   } else if (rt_cond(rt_b(rt_bool(rt_eq(v472_kind, rt_s(&S42)), "||") || rt_bool(rt_eq(v472_kind, rt_s(&S43)), "||")))) {
     if (rt_cond(rt_eq(rt_get(&F_loops, v471_ctx), rt_i(0)))) {
-      (void)({ wv t748 = rt_get(&F_pos, v469_s); wv t749 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text((rt_cond(rt_eq(v472_kind, rt_s(&S42))) ? rt_s(&S42) : rt_s(&S43))), rt_s(&S375) }); rt_chk(s386_error(up, t748, t749, RT_NULL), "stmt"); });
+      (void)({ wv t753 = rt_get(&F_pos, v469_s); wv t754 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text((rt_cond(rt_eq(v472_kind, rt_s(&S42))) ? rt_s(&S42) : rt_s(&S43))), rt_s(&S380) }); rt_chk(s386_error(up, t753, t754, RT_NULL), "stmt"); });
     }
     RT_RET(RT_NULL);
   } else if (rt_cond(rt_eq(v472_kind, rt_s(&S41)))) {
-    (void)({ wv t750 = rt_get(&F_cond, v469_s); wv t751 = v470_scope; wv t752 = v471_ctx; rt_chk(s413_expr(up, t750, t751, t752), "stmt"); });
-    (void)({ wv t755 = rt_get(&F_body, v469_s); wv t756 = rt_chk(s391_newScope(up, v470_scope), "stmt"); wv t757 = ({ wv t753 = rt_get(&F_func, v471_ctx); wv t754 = rt_add(rt_get(&F_loops, v471_ctx), rt_i(1)); rt_rec(0, 2, K45, (wv[]){ t753, t754 }); }); rt_chk(s397_block(up, t755, t756, t757), "stmt"); });
+    (void)({ wv t755 = rt_get(&F_cond, v469_s); wv t756 = v470_scope; wv t757 = v471_ctx; rt_chk(s413_expr(up, t755, t756, t757), "stmt"); });
+    (void)({ wv t760 = rt_get(&F_body, v469_s); wv t761 = rt_chk(s391_newScope(up, v470_scope), "stmt"); wv t762 = ({ wv t758 = rt_get(&F_func, v471_ctx); wv t759 = rt_add(rt_get(&F_loops, v471_ctx), rt_i(1)); rt_rec(0, 2, K45, (wv[]){ t758, t759 }); }); rt_chk(s397_block(up, t760, t761, t762), "stmt"); });
     RT_RET(RT_NULL);
   } else if (rt_cond(rt_eq(v472_kind, rt_s(&S55)))) {
     if (rt_cond(rt_get(&F_top, rt_get(&F_func, v471_ctx)))) {
-      (void)rt_chk(s386_error(up, rt_get(&F_pos, v469_s), rt_s(&S376), RT_NULL), "stmt");
+      (void)rt_chk(s386_error(up, rt_get(&F_pos, v469_s), rt_s(&S381), RT_NULL), "stmt");
     }
     RT_RET(RT_NULL);
   } else if (rt_cond(rt_eq(v472_kind, rt_s(&S54)))) {
     if (rt_cond(rt_ne(rt_get(&F_e, v469_s), RT_NULL))) {
-      (void)({ wv t758 = rt_get(&F_e, v469_s); wv t759 = v470_scope; wv t760 = v471_ctx; rt_chk(s413_expr(up, t758, t759, t760), "stmt"); });
+      (void)({ wv t763 = rt_get(&F_e, v469_s); wv t764 = v470_scope; wv t765 = v471_ctx; rt_chk(s413_expr(up, t763, t764, t765), "stmt"); });
     }
   } else if (rt_cond(rt_eq(v472_kind, rt_s(&S176)))) {
     if (rt_cond(rt_eq(rt_get(&F_k, rt_get(&F_e, v469_s)), rt_s(&S183)))) {
       if (rt_cond(rt_get(&F_top, rt_get(&F_func, v471_ctx)))) {
-        (void)rt_chk(s386_error(up, rt_get(&F_pos, rt_get(&F_e, v469_s)), rt_s(&S376), RT_NULL), "stmt");
+        (void)rt_chk(s386_error(up, rt_get(&F_pos, rt_get(&F_e, v469_s)), rt_s(&S381), RT_NULL), "stmt");
       }
-      (void)({ wv t761 = rt_get(&F_arg, rt_get(&F_e, v469_s)); wv t762 = v470_scope; wv t763 = v471_ctx; rt_chk(s413_expr(up, t761, t762, t763), "stmt"); });
+      (void)({ wv t766 = rt_get(&F_arg, rt_get(&F_e, v469_s)); wv t767 = v470_scope; wv t768 = v471_ctx; rt_chk(s413_expr(up, t766, t767, t768), "stmt"); });
     } else if (rt_cond(rt_eq(rt_get(&F_k, rt_get(&F_e, v469_s)), rt_s(&S184)))) {
-      (void)({ wv t764 = rt_get(&F_e, v469_s); wv t765 = v470_scope; wv t766 = v471_ctx; rt_chk(s409_chain(up, t764, t765, t766, rt_b(1)), "stmt"); });
+      (void)({ wv t769 = rt_get(&F_e, v469_s); wv t770 = v470_scope; wv t771 = v471_ctx; rt_chk(s409_chain(up, t769, t770, t771, rt_b(1)), "stmt"); });
     } else if (rt_cond(rt_eq(rt_get(&F_k, rt_get(&F_e, v469_s)), rt_s(&S44)))) {
-      (void)({ wv t767 = rt_get(&F_e, v469_s); wv t768 = v470_scope; wv t769 = v471_ctx; rt_chk(s400_checkMatch(up, t767, t768, t769, rt_b(1)), "stmt"); });
+      (void)({ wv t772 = rt_get(&F_e, v469_s); wv t773 = v470_scope; wv t774 = v471_ctx; rt_chk(s400_checkMatch(up, t772, t773, t774, rt_b(1)), "stmt"); });
     } else if (rt_cond(rt_eq(rt_get(&F_k, rt_get(&F_e, v469_s)), rt_s(&S182)))) {
       wv v477_k = rt_i(0);
-      while (rt_cond(({ wv t770 = v477_k; wv t771 = std_length(rt_get(&F_args, rt_get(&F_e, v469_s))); rt_lt(t770, t771); }))) {
-        (void)({ wv t774 = ({ wv t772 = v477_k; wv t773 = rt_get(&F_args, rt_get(&F_e, v469_s)); rt_idx(t772, t773); }); wv t775 = v470_scope; wv t776 = v471_ctx; rt_chk(s413_expr(up, t774, t775, t776), "stmt"); });
+      while (rt_cond(({ wv t775 = v477_k; wv t776 = std_length(rt_get(&F_args, rt_get(&F_e, v469_s))); rt_lt(t775, t776); }))) {
+        (void)({ wv t779 = ({ wv t777 = v477_k; wv t778 = rt_get(&F_args, rt_get(&F_e, v469_s)); rt_idx(t777, t778); }); wv t780 = v470_scope; wv t781 = v471_ctx; rt_chk(s413_expr(up, t779, t780, t781), "stmt"); });
         v477_k = rt_add(v477_k, rt_i(1));
       }
-      (void)({ wv t777 = rt_get(&F_e, v469_s); wv t778 = v470_scope; rt_chk(s414_callee(up, t777, t778, rt_b(0)), "stmt"); });
+      (void)({ wv t782 = rt_get(&F_e, v469_s); wv t783 = v470_scope; rt_chk(s414_callee(up, t782, t783, rt_b(0)), "stmt"); });
     } else {
-      (void)({ wv t779 = rt_get(&F_e, v469_s); wv t780 = v470_scope; wv t781 = v471_ctx; rt_chk(s413_expr(up, t779, t780, t781), "stmt"); });
+      (void)({ wv t784 = rt_get(&F_e, v469_s); wv t785 = v470_scope; wv t786 = v471_ctx; rt_chk(s413_expr(up, t784, t785, t786), "stmt"); });
     }
   } else if (rt_cond(rt_eq(v472_kind, rt_s(&S177)))) {
-    (void)({ wv t782 = rt_get(&F_e, v469_s); wv t783 = v470_scope; wv t784 = v471_ctx; rt_chk(s413_expr(up, t782, t783, t784), "stmt"); });
+    (void)({ wv t787 = rt_get(&F_e, v469_s); wv t788 = v470_scope; wv t789 = v471_ctx; rt_chk(s413_expr(up, t787, t788, t789), "stmt"); });
   } else if (rt_cond(rt_eq(v472_kind, rt_s(&S38)))) {
-    (void)({ wv t785 = rt_get(&F_e, v469_s); wv t786 = v470_scope; wv t787 = v471_ctx; rt_chk(s413_expr(up, t785, t786, t787), "stmt"); });
-    (void)({ wv t788 = rt_get(&F_target, v469_s); wv t789 = v470_scope; wv t790 = v471_ctx; rt_chk(s410_lvalue(up, t788, t789, t790), "stmt"); });
+    (void)({ wv t790 = rt_get(&F_e, v469_s); wv t791 = v470_scope; wv t792 = v471_ctx; rt_chk(s413_expr(up, t790, t791, t792), "stmt"); });
+    (void)({ wv t793 = rt_get(&F_target, v469_s); wv t794 = v470_scope; wv t795 = v471_ctx; rt_chk(s410_lvalue(up, t793, t794, t795), "stmt"); });
   }
   if (rt_cond(rt_ne(rt_get(&F_handler, v469_s), RT_NULL))) {
     (void)rt_chk(s399_onfailHandler(up, v469_s, v470_scope, v471_ctx), "stmt");
@@ -5246,14 +5757,14 @@ static wv s399_onfailHandler(struct fr99 *up, wv v478_s, wv v479_scope, wv v480_
   v480_ctx = rt_bind(v480_ctx, 0);
   wv v481_h = rt_bind(rt_get(&F_handler, v478_s), 0);
   if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_e, v478_s), RT_NULL), "||") || rt_bool(rt_ne(rt_get(&F_k, rt_get(&F_e, v478_s)), rt_s(&S182)), "||")))) {
-    (void)rt_chk(s386_error(up, rt_get(&F_pos, v481_h), rt_s(&S377), rt_s(&S378)), "onfailHandler");
+    (void)rt_chk(s386_error(up, rt_get(&F_pos, v481_h), rt_s(&S382), rt_s(&S383)), "onfailHandler");
   }
   wv v482_hs = rt_bind(rt_chk(s391_newScope(up, v479_scope), "onfailHandler"), 0);
   if (rt_cond(rt_ne(rt_get(&F_param, v481_h), RT_NULL))) {
-    (void)({ wv t794 = v482_hs; wv t795 = rt_get(&F_param, v481_h); wv t796 = ({ wv t791 = rt_get(&F_param, v481_h); wv t792 = rt_get(&F_paramPos, v481_h); wv t793 = rt_get(&F_id, rt_get(&F_func, v480_ctx)); rt_chk(s392_decl(up, rt_s(&S56), t791, rt_s(&S13), t792, RT_NULL, t793, RT_NULL), "onfailHandler"); }); rt_chk(s394_declare(up, t794, t795, t796), "onfailHandler"); });
+    (void)({ wv t799 = v482_hs; wv t800 = rt_get(&F_param, v481_h); wv t801 = ({ wv t796 = rt_get(&F_param, v481_h); wv t797 = rt_get(&F_paramPos, v481_h); wv t798 = rt_get(&F_id, rt_get(&F_func, v480_ctx)); rt_chk(s392_decl(up, rt_s(&S56), t796, rt_s(&S13), t797, RT_NULL, t798, RT_NULL), "onfailHandler"); }); rt_chk(s394_declare(up, t799, t800, t801), "onfailHandler"); });
   }
-  (void)({ wv t797 = rt_get(&F_body, v481_h); wv t798 = rt_chk(s391_newScope(up, v482_hs), "onfailHandler"); wv t799 = v480_ctx; rt_chk(s397_block(up, t797, t798, t799), "onfailHandler"); });
-  if (rt_cond(({ wv t800 = rt_def(w5_onfailValueUsed, "onfailValueUsed"); wv t801 = rt_get(&F_k, v478_s); rt_chk(w1_contains(t800, t801), "onfailHandler"); }))) {
+  (void)({ wv t802 = rt_get(&F_body, v481_h); wv t803 = rt_chk(s391_newScope(up, v482_hs), "onfailHandler"); wv t804 = v480_ctx; rt_chk(s397_block(up, t802, t803, t804), "onfailHandler"); });
+  if (rt_cond(({ wv t805 = rt_def(w5_onfailValueUsed, "onfailValueUsed"); wv t806 = rt_get(&F_k, v478_s); rt_chk(w1_contains(t805, t806), "onfailHandler"); }))) {
     (void)rt_chk(s390_requireValue(up, rt_get(&F_body, v481_h)), "onfailHandler");
   }
   RT_RET(RT_NULL);
@@ -5265,16 +5776,16 @@ static wv s400_checkMatch(struct fr99 *up, wv v483_e, wv v484_scope, wv v485_ctx
   v484_scope = rt_bind(v484_scope, 0);
   v485_ctx = rt_bind(v485_ctx, 0);
   v486_stmtLevel = rt_bind(v486_stmtLevel, 0);
-  (void)({ wv t802 = rt_get(&F_subject, v483_e); wv t803 = v484_scope; wv t804 = v485_ctx; rt_chk(s413_expr(up, t802, t803, t804), "checkMatch"); });
+  (void)({ wv t807 = rt_get(&F_subject, v483_e); wv t808 = v484_scope; wv t809 = v485_ctx; rt_chk(s413_expr(up, t807, t808, t809), "checkMatch"); });
   wv v487_seen = rt_arr(0, NULL, 1);
   wv v488_sort = RT_NULL;
   wv v489_sortEnum = RT_NULL;
   wv v490_a = rt_i(0);
-  while (rt_cond(({ wv t805 = v490_a; wv t806 = std_length(rt_get(&F_cases, v483_e)); rt_lt(t805, t806); }))) {
-    wv v491_al = rt_bind(({ wv t807 = v490_a; wv t808 = rt_get(&F_cases, v483_e); rt_idx(t807, t808); }), 0);
+  while (rt_cond(({ wv t810 = v490_a; wv t811 = std_length(rt_get(&F_cases, v483_e)); rt_lt(t810, t811); }))) {
+    wv v491_al = rt_bind(({ wv t812 = v490_a; wv t813 = rt_get(&F_cases, v483_e); rt_idx(t812, t813); }), 0);
     wv v492_j = rt_i(0);
-    while (rt_cond(({ wv t809 = v492_j; wv t810 = std_length(rt_get(&F_values, v491_al)); rt_lt(t809, t810); }))) {
-      wv v493_v = rt_bind(({ wv t811 = v492_j; wv t812 = rt_get(&F_values, v491_al); rt_idx(t811, t812); }), 0);
+    while (rt_cond(({ wv t814 = v492_j; wv t815 = std_length(rt_get(&F_values, v491_al)); rt_lt(t814, t815); }))) {
+      wv v493_v = rt_bind(({ wv t816 = v492_j; wv t817 = rt_get(&F_values, v491_al); rt_idx(t816, t817); }), 0);
       wv v494_vs = rt_s(&S13);
       if (rt_cond(rt_eq(rt_get(&F_k, v493_v), rt_s(&S189)))) {
         wv v498_d = rt_bind(rt_chk(s407_caseEnum(up, v493_v, v484_scope), "checkMatch"), 0);
@@ -5286,33 +5797,33 @@ static wv s400_checkMatch(struct fr99 *up, wv v483_e, wv v484_scope, wv v485_ctx
       if (rt_cond(rt_eq(v488_sort, RT_NULL))) {
         v488_sort = rt_bind(v494_vs, 1);
       } else if (rt_cond(rt_b(rt_bool(rt_ne(v494_vs, RT_NULL), "&&") && rt_bool(rt_ne(v494_vs, v488_sort), "&&")))) {
-        wv v499_message = rt_bind((rt_cond(rt_b(rt_bool(rt_eq(v488_sort, rt_s(&S13)), "||") || rt_bool(rt_eq(v494_vs, rt_s(&S13)), "||"))) ? rt_s(&S379) : ({ wv t813 = rt_text(v488_sort); wv t814 = rt_text(v494_vs); rt_cat(5, (wv[]){ rt_s(&S380), t813, rt_s(&S381), t814, rt_s(&S113) }); })), 0);
-        (void)({ wv t815 = rt_get(&F_pos, v493_v); wv t816 = v499_message; rt_chk(s386_error(up, t815, t816, RT_NULL), "checkMatch"); });
+        wv v499_message = rt_bind((rt_cond(rt_b(rt_bool(rt_eq(v488_sort, rt_s(&S13)), "||") || rt_bool(rt_eq(v494_vs, rt_s(&S13)), "||"))) ? rt_s(&S384) : ({ wv t818 = rt_text(v488_sort); wv t819 = rt_text(v494_vs); rt_cat(5, (wv[]){ rt_s(&S385), t818, rt_s(&S386), t819, rt_s(&S113) }); })), 0);
+        (void)({ wv t820 = rt_get(&F_pos, v493_v); wv t821 = v499_message; rt_chk(s386_error(up, t820, t821, RT_NULL), "checkMatch"); });
       }
       wv v495_key = rt_bind(rt_chk(w5_caseKey(v493_v), "checkMatch"), 0);
       wv v496_first = RT_NULL;
       wv v497_q = rt_i(0);
-      while (rt_cond(({ wv t817 = v497_q; wv t818 = std_length(v487_seen); rt_lt(t817, t818); }))) {
-        if (rt_cond(({ wv t819 = rt_get(&F_key, rt_idx(v497_q, v487_seen)); wv t820 = v495_key; rt_eq(t819, t820); }))) {
+      while (rt_cond(({ wv t822 = v497_q; wv t823 = std_length(v487_seen); rt_lt(t822, t823); }))) {
+        if (rt_cond(({ wv t824 = rt_get(&F_key, rt_idx(v497_q, v487_seen)); wv t825 = v495_key; rt_eq(t824, t825); }))) {
           v496_first = rt_bind(rt_get(&F_pos, rt_idx(v497_q, v487_seen)), 1);
         }
         v497_q = rt_add(v497_q, rt_i(1));
       }
       if (rt_cond(rt_ne(v496_first, RT_NULL))) {
-        (void)({ wv t823 = rt_get(&F_pos, v493_v); wv t824 = ({ wv t821 = rt_text(rt_chk(w5_caseText(v493_v), "checkMatch")); wv t822 = rt_text(rt_chk(w5_lineOf(v496_first), "checkMatch")); rt_cat(5, (wv[]){ rt_s(&S382), t821, rt_s(&S383), t822, rt_s(&S16) }); }); rt_chk(s386_error(up, t823, t824, RT_NULL), "checkMatch"); });
+        (void)({ wv t828 = rt_get(&F_pos, v493_v); wv t829 = ({ wv t826 = rt_text(rt_chk(w5_caseText(v493_v), "checkMatch")); wv t827 = rt_text(rt_chk(w5_lineOf(v496_first), "checkMatch")); rt_cat(5, (wv[]){ rt_s(&S387), t826, rt_s(&S388), t827, rt_s(&S16) }); }); rt_chk(s386_error(up, t828, t829, RT_NULL), "checkMatch"); });
       } else {
-        (void)({ wv t827 = v487_seen; wv t828 = ({ wv t825 = v495_key; wv t826 = rt_get(&F_pos, v493_v); rt_rec(0, 2, K46, (wv[]){ t825, t826 }); }); std_push(t827, t828); });
+        (void)({ wv t832 = v487_seen; wv t833 = ({ wv t830 = v495_key; wv t831 = rt_get(&F_pos, v493_v); rt_rec(0, 2, K46, (wv[]){ t830, t831 }); }); std_push(t832, t833); });
       }
       v492_j = rt_add(v492_j, rt_i(1));
     }
-    (void)({ wv t829 = rt_get(&F_body, v491_al); wv t830 = rt_chk(s391_newScope(up, v484_scope), "checkMatch"); wv t831 = v485_ctx; rt_chk(s397_block(up, t829, t830, t831), "checkMatch"); });
+    (void)({ wv t834 = rt_get(&F_body, v491_al); wv t835 = rt_chk(s391_newScope(up, v484_scope), "checkMatch"); wv t836 = v485_ctx; rt_chk(s397_block(up, t834, t835, t836), "checkMatch"); });
     if (rt_cond(rt_not(v486_stmtLevel))) {
       (void)rt_chk(s390_requireValue(up, rt_get(&F_body, v491_al)), "checkMatch");
     }
     v490_a = rt_add(v490_a, rt_i(1));
   }
   if (rt_cond(rt_ne(rt_get(&F_els, v483_e), RT_NULL))) {
-    (void)({ wv t832 = rt_get(&F_els, v483_e); wv t833 = rt_chk(s391_newScope(up, v484_scope), "checkMatch"); wv t834 = v485_ctx; rt_chk(s397_block(up, t832, t833, t834), "checkMatch"); });
+    (void)({ wv t837 = rt_get(&F_els, v483_e); wv t838 = rt_chk(s391_newScope(up, v484_scope), "checkMatch"); wv t839 = v485_ctx; rt_chk(s397_block(up, t837, t838, t839), "checkMatch"); });
     if (rt_cond(rt_not(v486_stmtLevel))) {
       (void)rt_chk(s390_requireValue(up, rt_get(&F_els, v483_e)), "checkMatch");
     }
@@ -5320,26 +5831,26 @@ static wv s400_checkMatch(struct fr99 *up, wv v483_e, wv v484_scope, wv v485_ctx
     wv v500_ms = rt_bind(rt_chk(s388_enumMembers(up, v489_sortEnum), "checkMatch"), 0);
     wv v501_missing = rt_arr(0, NULL, 1);
     wv v502_m = rt_i(0);
-    while (rt_cond(({ wv t835 = v502_m; wv t836 = std_length(v500_ms); rt_lt(t835, t836); }))) {
-      wv v503_key = ({ wv t837 = rt_text(rt_get(&F_name, rt_idx(v502_m, v500_ms))); wv t838 = rt_text(v488_sort); rt_cat(4, (wv[]){ rt_s(&S364), t837, rt_s(&S129), t838 }); });
+    while (rt_cond(({ wv t840 = v502_m; wv t841 = std_length(v500_ms); rt_lt(t840, t841); }))) {
+      wv v503_key = ({ wv t842 = rt_text(rt_get(&F_name, rt_idx(v502_m, v500_ms))); wv t843 = rt_text(v488_sort); rt_cat(4, (wv[]){ rt_s(&S369), t842, rt_s(&S129), t843 }); });
       wv v504_handled = rt_b(0);
       wv v505_q = rt_i(0);
-      while (rt_cond(({ wv t839 = v505_q; wv t840 = std_length(v487_seen); rt_lt(t839, t840); }))) {
-        if (rt_cond(({ wv t841 = rt_get(&F_key, rt_idx(v505_q, v487_seen)); wv t842 = v503_key; rt_eq(t841, t842); }))) {
+      while (rt_cond(({ wv t844 = v505_q; wv t845 = std_length(v487_seen); rt_lt(t844, t845); }))) {
+        if (rt_cond(({ wv t846 = rt_get(&F_key, rt_idx(v505_q, v487_seen)); wv t847 = v503_key; rt_eq(t846, t847); }))) {
           v504_handled = rt_b(1);
         }
         v505_q = rt_add(v505_q, rt_i(1));
       }
       if (rt_cond(rt_not(v504_handled))) {
-        (void)({ wv t845 = v501_missing; wv t846 = ({ wv t843 = rt_text(v488_sort); wv t844 = rt_text(rt_get(&F_name, rt_idx(v502_m, v500_ms))); rt_cat(5, (wv[]){ rt_s(&S113), t843, rt_s(&S129), t844, rt_s(&S113) }); }); std_push(t845, t846); });
+        (void)({ wv t850 = v501_missing; wv t851 = ({ wv t848 = rt_text(v488_sort); wv t849 = rt_text(rt_get(&F_name, rt_idx(v502_m, v500_ms))); rt_cat(5, (wv[]){ rt_s(&S113), t848, rt_s(&S129), t849, rt_s(&S113) }); }); std_push(t850, t851); });
       }
       v502_m = rt_add(v502_m, rt_i(1));
     }
     if (rt_cond(rt_gt(std_length(v501_missing), rt_i(0)))) {
-      (void)({ wv t847 = rt_get(&F_pos, v483_e); wv t848 = rt_cat(2, (wv[]){ rt_s(&S384), rt_text(std_join(v501_missing, rt_s(&S385))) }); rt_chk(s386_error(up, t847, t848, rt_s(&S386)), "checkMatch"); });
+      (void)({ wv t852 = rt_get(&F_pos, v483_e); wv t853 = rt_cat(2, (wv[]){ rt_s(&S389), rt_text(std_join(v501_missing, rt_s(&S390))) }); rt_chk(s386_error(up, t852, t853, rt_s(&S391)), "checkMatch"); });
     }
   } else if (rt_cond(rt_not(v486_stmtLevel))) {
-    (void)rt_chk(s386_error(up, rt_get(&F_pos, v483_e), rt_s(&S387), RT_NULL), "checkMatch");
+    (void)rt_chk(s386_error(up, rt_get(&F_pos, v483_e), rt_s(&S392), RT_NULL), "checkMatch");
   }
   RT_RET(RT_NULL);
 }
@@ -5350,8 +5861,8 @@ static wv s401_moduleNamed(struct fr99 *up, wv v506_x, wv v507_scope) {
   if (rt_cond(rt_ne(rt_get(&F_k, v506_x), rt_s(&S211)))) {
     RT_RET(RT_NULL);
   }
-  wv v508_d = rt_bind(({ wv t849 = v507_scope; wv t850 = rt_get(&F_name, v506_x); rt_chk(s395_lookup(up, t849, t850), "moduleNamed"); }), 0);
-  RT_RET((rt_cond(rt_b(rt_bool(rt_ne(v508_d, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_kind, v508_d), rt_s(&S388)), "&&"))) ? v508_d : RT_NULL));
+  wv v508_d = rt_bind(({ wv t854 = v507_scope; wv t855 = rt_get(&F_name, v506_x); rt_chk(s395_lookup(up, t854, t855), "moduleNamed"); }), 0);
+  RT_RET((rt_cond(rt_b(rt_bool(rt_ne(v508_d, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_kind, v508_d), rt_s(&S393)), "&&"))) ? v508_d : RT_NULL));
 }
 
 static wv s402_exported(struct fr99 *up, wv v509_lib, wv v510_name) {
@@ -5360,8 +5871,8 @@ static wv s402_exported(struct fr99 *up, wv v509_lib, wv v510_name) {
   v510_name = rt_bind(v510_name, 0);
   wv v511_xs = rt_bind(rt_get(&F_exports, rt_idx(v509_lib, up->v378_modules)), 0);
   wv v512_k = rt_i(0);
-  while (rt_cond(({ wv t851 = v512_k; wv t852 = std_length(v511_xs); rt_lt(t851, t852); }))) {
-    if (rt_cond(({ wv t853 = rt_get(&F_name, rt_idx(v512_k, v511_xs)); wv t854 = v510_name; rt_eq(t853, t854); }))) {
+  while (rt_cond(({ wv t856 = v512_k; wv t857 = std_length(v511_xs); rt_lt(t856, t857); }))) {
+    if (rt_cond(({ wv t858 = rt_get(&F_name, rt_idx(v512_k, v511_xs)); wv t859 = v510_name; rt_eq(t858, t859); }))) {
       RT_RET(rt_idx(v512_k, v511_xs));
     }
     v512_k = rt_add(v512_k, rt_i(1));
@@ -5373,17 +5884,17 @@ static wv s403_enumNamed(struct fr99 *up, wv v513_x, wv v514_scope) {
   rt_enter("enumNamed");
   v514_scope = rt_bind(v514_scope, 0);
   if (rt_cond(rt_eq(rt_get(&F_k, v513_x), rt_s(&S211)))) {
-    wv v517_d = rt_bind(({ wv t855 = v514_scope; wv t856 = rt_get(&F_name, v513_x); rt_chk(s395_lookup(up, t855, t856), "enumNamed"); }), 0);
+    wv v517_d = rt_bind(({ wv t860 = v514_scope; wv t861 = rt_get(&F_name, v513_x); rt_chk(s395_lookup(up, t860, t861), "enumNamed"); }), 0);
     RT_RET((rt_cond(rt_b(rt_bool(rt_ne(v517_d, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_kind, v517_d), rt_s(&S46)), "&&"))) ? v517_d : RT_NULL));
   }
   if (rt_cond(rt_ne(rt_get(&F_k, v513_x), rt_s(&S189)))) {
     RT_RET(RT_NULL);
   }
-  wv v515_m = rt_bind(({ wv t857 = rt_get(&F_rec, v513_x); wv t858 = v514_scope; rt_chk(s401_moduleNamed(up, t857, t858), "enumNamed"); }), 0);
+  wv v515_m = rt_bind(({ wv t862 = rt_get(&F_rec, v513_x); wv t863 = v514_scope; rt_chk(s401_moduleNamed(up, t862, t863), "enumNamed"); }), 0);
   if (rt_cond(rt_b(rt_bool(rt_eq(v515_m, RT_NULL), "||") || rt_bool(rt_eq(rt_get(&F_lib, v515_m), RT_NULL), "||")))) {
     RT_RET(RT_NULL);
   }
-  wv v516_d = rt_bind(({ wv t859 = rt_get(&F_lib, v515_m); wv t860 = rt_get(&F_field, v513_x); rt_chk(s402_exported(up, t859, t860), "enumNamed"); }), 0);
+  wv v516_d = rt_bind(({ wv t864 = rt_get(&F_lib, v515_m); wv t865 = rt_get(&F_field, v513_x); rt_chk(s402_exported(up, t864, t865), "enumNamed"); }), 0);
   RT_RET((rt_cond(rt_b(rt_bool(rt_ne(v516_d, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_kind, v516_d), rt_s(&S46)), "&&"))) ? v516_d : RT_NULL));
 }
 
@@ -5394,9 +5905,9 @@ static wv s404_exportOf(struct fr99 *up, wv v518_e, wv v519_m) {
   if (rt_cond(rt_eq(rt_get(&F_lib, v519_m), RT_NULL))) {
     RT_RET(RT_NULL);
   }
-  wv v520_d = rt_bind(({ wv t861 = rt_get(&F_lib, v519_m); wv t862 = rt_get(&F_field, v518_e); rt_chk(s402_exported(up, t861, t862), "exportOf"); }), 0);
+  wv v520_d = rt_bind(({ wv t866 = rt_get(&F_lib, v519_m); wv t867 = rt_get(&F_field, v518_e); rt_chk(s402_exported(up, t866, t867), "exportOf"); }), 0);
   if (rt_cond(rt_eq(v520_d, RT_NULL))) {
-    (void)({ wv t867 = rt_get(&F_pos, v518_e); wv t868 = ({ wv t865 = rt_text(rt_get(&F_path, ({ wv t863 = rt_get(&F_lib, v519_m); wv t864 = up->v378_modules; rt_idx(t863, t864); }))); wv t866 = rt_text(rt_get(&F_field, v518_e)); rt_cat(5, (wv[]){ rt_s(&S113), t865, rt_s(&S389), t866, rt_s(&S113) }); }); rt_chk(s386_error(up, t867, t868, RT_NULL), "exportOf"); });
+    (void)({ wv t872 = rt_get(&F_pos, v518_e); wv t873 = ({ wv t870 = rt_text(rt_get(&F_path, ({ wv t868 = rt_get(&F_lib, v519_m); wv t869 = up->v378_modules; rt_idx(t868, t869); }))); wv t871 = rt_text(rt_get(&F_field, v518_e)); rt_cat(5, (wv[]){ rt_s(&S113), t870, rt_s(&S394), t871, rt_s(&S113) }); }); rt_chk(s386_error(up, t872, t873, RT_NULL), "exportOf"); });
   }
   RT_RET(v520_d);
 }
@@ -5405,8 +5916,8 @@ static wv s405_unknownModule(struct fr99 *up, wv v521_x, wv v522_scope) {
   rt_enter("unknownModule");
   v521_x = rt_bind(v521_x, 0);
   v522_scope = rt_bind(v522_scope, 0);
-  wv v523_message = rt_bind((rt_cond(rt_ne(({ wv t869 = v522_scope; wv t870 = rt_get(&F_name, v521_x); rt_chk(s395_lookup(up, t869, t870), "unknownModule"); }), RT_NULL)) ? rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_get(&F_name, v521_x)), rt_s(&S390) }) : rt_cat(3, (wv[]){ rt_s(&S391), rt_text(rt_get(&F_name, v521_x)), rt_s(&S113) })), 0);
-  (void)({ wv t871 = rt_get(&F_pos, v521_x); wv t872 = v523_message; rt_chk(s386_error(up, t871, t872, RT_NULL), "unknownModule"); });
+  wv v523_message = rt_bind((rt_cond(rt_ne(({ wv t874 = v522_scope; wv t875 = rt_get(&F_name, v521_x); rt_chk(s395_lookup(up, t874, t875), "unknownModule"); }), RT_NULL)) ? rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_get(&F_name, v521_x)), rt_s(&S395) }) : rt_cat(3, (wv[]){ rt_s(&S396), rt_text(rt_get(&F_name, v521_x)), rt_s(&S113) })), 0);
+  (void)({ wv t876 = rt_get(&F_pos, v521_x); wv t877 = v523_message; rt_chk(s386_error(up, t876, t877, RT_NULL), "unknownModule"); });
   RT_RET(RT_NULL);
 }
 
@@ -5415,11 +5926,11 @@ static wv s406_qualified(struct fr99 *up, wv v524_e, wv v525_m) {
   v524_e = rt_bind(v524_e, 0);
   v525_m = rt_bind(v525_m, 0);
   wv v526_d = rt_bind(rt_chk(s404_exportOf(up, v524_e, v525_m), "qualified"), 0);
-  wv v527_label = ({ wv t873 = rt_text(rt_get(&F_name, rt_get(&F_rec, v524_e))); wv t874 = rt_text(rt_get(&F_field, v524_e)); rt_cat(3, (wv[]){ t873, rt_s(&S129), t874 }); });
+  wv v527_label = ({ wv t878 = rt_text(rt_get(&F_name, rt_get(&F_rec, v524_e))); wv t879 = rt_text(rt_get(&F_field, v524_e)); rt_cat(3, (wv[]){ t878, rt_s(&S129), t879 }); });
   if (rt_cond(rt_b(rt_bool(rt_ne(v526_d, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_kind, v526_d), rt_s(&S33)), "&&")))) {
-    (void)({ wv t877 = rt_get(&F_pos, v524_e); wv t878 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(v527_label), rt_s(&S392) }); wv t879 = ({ wv t875 = rt_text(v527_label); wv t876 = rt_text(v527_label); rt_cat(5, (wv[]){ rt_s(&S393), t875, rt_s(&S394), t876, rt_s(&S395) }); }); rt_chk(s386_error(up, t877, t878, t879), "qualified"); });
+    (void)({ wv t882 = rt_get(&F_pos, v524_e); wv t883 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(v527_label), rt_s(&S397) }); wv t884 = ({ wv t880 = rt_text(v527_label); wv t881 = rt_text(v527_label); rt_cat(5, (wv[]){ rt_s(&S398), t880, rt_s(&S399), t881, rt_s(&S400) }); }); rt_chk(s386_error(up, t882, t883, t884), "qualified"); });
   } else if (rt_cond(rt_b(rt_bool(rt_ne(v526_d, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_kind, v526_d), rt_s(&S46)), "&&")))) {
-    (void)({ wv t880 = rt_get(&F_pos, v524_e); wv t881 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(v527_label), rt_s(&S396) }); wv t882 = rt_cat(3, (wv[]){ rt_s(&S397), rt_text(v527_label), rt_s(&S398) }); rt_chk(s386_error(up, t880, t881, t882), "qualified"); });
+    (void)({ wv t885 = rt_get(&F_pos, v524_e); wv t886 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(v527_label), rt_s(&S401) }); wv t887 = rt_cat(3, (wv[]){ rt_s(&S402), rt_text(v527_label), rt_s(&S403) }); rt_chk(s386_error(up, t885, t886, t887), "qualified"); });
   }
   RT_RET(RT_NULL);
 }
@@ -5434,17 +5945,17 @@ static wv s407_caseEnum(struct fr99 *up, wv v528_v, wv v529_scope) {
     (void)rt_chk(s408_member(up, v528_v, v531_d), "caseEnum");
     RT_RET(v531_d);
   }
-  wv v532_hint = rt_s(&S399);
+  wv v532_hint = rt_s(&S404);
   if (rt_cond(rt_eq(rt_get(&F_k, v530_x), rt_s(&S211)))) {
-    wv v534_message = rt_bind((rt_cond(rt_ne(({ wv t883 = v529_scope; wv t884 = rt_get(&F_name, v530_x); rt_chk(s395_lookup(up, t883, t884), "caseEnum"); }), RT_NULL)) ? rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_get(&F_name, v530_x)), rt_s(&S400) }) : rt_cat(3, (wv[]){ rt_s(&S401), rt_text(rt_get(&F_name, v530_x)), rt_s(&S113) })), 0);
-    (void)({ wv t885 = rt_get(&F_pos, v530_x); wv t886 = v534_message; wv t887 = v532_hint; rt_chk(s386_error(up, t885, t886, t887), "caseEnum"); });
+    wv v534_message = rt_bind((rt_cond(rt_ne(({ wv t888 = v529_scope; wv t889 = rt_get(&F_name, v530_x); rt_chk(s395_lookup(up, t888, t889), "caseEnum"); }), RT_NULL)) ? rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_get(&F_name, v530_x)), rt_s(&S405) }) : rt_cat(3, (wv[]){ rt_s(&S406), rt_text(rt_get(&F_name, v530_x)), rt_s(&S113) })), 0);
+    (void)({ wv t890 = rt_get(&F_pos, v530_x); wv t891 = v534_message; wv t892 = v532_hint; rt_chk(s386_error(up, t890, t891, t892), "caseEnum"); });
     RT_RET(RT_NULL);
   }
-  wv v533_m = rt_bind(({ wv t888 = rt_get(&F_rec, v530_x); wv t889 = v529_scope; rt_chk(s401_moduleNamed(up, t888, t889), "caseEnum"); }), 0);
+  wv v533_m = rt_bind(({ wv t893 = rt_get(&F_rec, v530_x); wv t894 = v529_scope; rt_chk(s401_moduleNamed(up, t893, t894), "caseEnum"); }), 0);
   if (rt_cond(rt_eq(v533_m, RT_NULL))) {
-    (void)({ wv t890 = rt_get(&F_rec, v530_x); wv t891 = v529_scope; rt_chk(s405_unknownModule(up, t890, t891), "caseEnum"); });
+    (void)({ wv t895 = rt_get(&F_rec, v530_x); wv t896 = v529_scope; rt_chk(s405_unknownModule(up, t895, t896), "caseEnum"); });
   } else if (rt_cond(rt_ne(rt_chk(s404_exportOf(up, v530_x, v533_m), "caseEnum"), RT_NULL))) {
-    (void)({ wv t892 = rt_get(&F_pos, v530_x); wv t893 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_chk(w5_enumText(v530_x), "caseEnum")), rt_s(&S400) }); wv t894 = v532_hint; rt_chk(s386_error(up, t892, t893, t894), "caseEnum"); });
+    (void)({ wv t897 = rt_get(&F_pos, v530_x); wv t898 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_chk(w5_enumText(v530_x), "caseEnum")), rt_s(&S405) }); wv t899 = v532_hint; rt_chk(s386_error(up, t897, t898, t899), "caseEnum"); });
   }
   RT_RET(RT_NULL);
 }
@@ -5457,15 +5968,15 @@ static wv s408_member(struct fr99 *up, wv v535_e, wv v536_d) {
   wv v538_names = rt_arr(0, NULL, 1);
   wv v539_found = rt_b(0);
   wv v540_k = rt_i(0);
-  while (rt_cond(({ wv t895 = v540_k; wv t896 = std_length(v537_ms); rt_lt(t895, t896); }))) {
-    (void)({ wv t897 = v538_names; wv t898 = rt_get(&F_name, rt_idx(v540_k, v537_ms)); std_push(t897, t898); });
-    if (rt_cond(({ wv t899 = rt_get(&F_name, rt_idx(v540_k, v537_ms)); wv t900 = rt_get(&F_field, v535_e); rt_eq(t899, t900); }))) {
+  while (rt_cond(({ wv t900 = v540_k; wv t901 = std_length(v537_ms); rt_lt(t900, t901); }))) {
+    (void)({ wv t902 = v538_names; wv t903 = rt_get(&F_name, rt_idx(v540_k, v537_ms)); std_push(t902, t903); });
+    if (rt_cond(({ wv t904 = rt_get(&F_name, rt_idx(v540_k, v537_ms)); wv t905 = rt_get(&F_field, v535_e); rt_eq(t904, t905); }))) {
       v539_found = rt_b(1);
     }
     v540_k = rt_add(v540_k, rt_i(1));
   }
   if (rt_cond(rt_not(v539_found))) {
-    (void)({ wv t903 = rt_get(&F_pos, v535_e); wv t904 = ({ wv t901 = rt_text(rt_get(&F_field, v535_e)); wv t902 = rt_text(rt_get(&F_name, v536_d)); rt_cat(5, (wv[]){ rt_s(&S402), t901, rt_s(&S403), t902, rt_s(&S113) }); }); wv t905 = rt_cat(2, (wv[]){ rt_s(&S404), rt_text(std_join(v538_names, rt_s(&S385))) }); rt_chk(s386_error(up, t903, t904, t905), "member"); });
+    (void)({ wv t908 = rt_get(&F_pos, v535_e); wv t909 = ({ wv t906 = rt_text(rt_get(&F_field, v535_e)); wv t907 = rt_text(rt_get(&F_name, v536_d)); rt_cat(5, (wv[]){ rt_s(&S407), t906, rt_s(&S408), t907, rt_s(&S113) }); }); wv t910 = rt_cat(2, (wv[]){ rt_s(&S409), rt_text(std_join(v538_names, rt_s(&S390))) }); rt_chk(s386_error(up, t908, t909, t910), "member"); });
   }
   RT_RET(RT_NULL);
 }
@@ -5477,22 +5988,22 @@ static wv s409_chain(struct fr99 *up, wv v541_e, wv v542_scope, wv v543_ctx, wv 
   v543_ctx = rt_bind(v543_ctx, 0);
   v544_stmtLevel = rt_bind(v544_stmtLevel, 0);
   wv v545_k = rt_i(0);
-  while (rt_cond(({ wv t906 = v545_k; wv t907 = std_length(rt_get(&F_branches, v541_e)); rt_lt(t906, t907); }))) {
-    wv v546_b = rt_bind(({ wv t908 = v545_k; wv t909 = rt_get(&F_branches, v541_e); rt_idx(t908, t909); }), 0);
-    (void)({ wv t910 = rt_get(&F_cond, v546_b); wv t911 = v542_scope; wv t912 = v543_ctx; rt_chk(s413_expr(up, t910, t911, t912), "chain"); });
-    (void)({ wv t913 = rt_get(&F_body, v546_b); wv t914 = rt_chk(s391_newScope(up, v542_scope), "chain"); wv t915 = v543_ctx; rt_chk(s397_block(up, t913, t914, t915), "chain"); });
+  while (rt_cond(({ wv t911 = v545_k; wv t912 = std_length(rt_get(&F_branches, v541_e)); rt_lt(t911, t912); }))) {
+    wv v546_b = rt_bind(({ wv t913 = v545_k; wv t914 = rt_get(&F_branches, v541_e); rt_idx(t913, t914); }), 0);
+    (void)({ wv t915 = rt_get(&F_cond, v546_b); wv t916 = v542_scope; wv t917 = v543_ctx; rt_chk(s413_expr(up, t915, t916, t917), "chain"); });
+    (void)({ wv t918 = rt_get(&F_body, v546_b); wv t919 = rt_chk(s391_newScope(up, v542_scope), "chain"); wv t920 = v543_ctx; rt_chk(s397_block(up, t918, t919, t920), "chain"); });
     if (rt_cond(rt_not(v544_stmtLevel))) {
       (void)rt_chk(s390_requireValue(up, rt_get(&F_body, v546_b)), "chain");
     }
     v545_k = rt_add(v545_k, rt_i(1));
   }
   if (rt_cond(rt_ne(rt_get(&F_els, v541_e), RT_NULL))) {
-    (void)({ wv t916 = rt_get(&F_els, v541_e); wv t917 = rt_chk(s391_newScope(up, v542_scope), "chain"); wv t918 = v543_ctx; rt_chk(s397_block(up, t916, t917, t918), "chain"); });
+    (void)({ wv t921 = rt_get(&F_els, v541_e); wv t922 = rt_chk(s391_newScope(up, v542_scope), "chain"); wv t923 = v543_ctx; rt_chk(s397_block(up, t921, t922, t923), "chain"); });
     if (rt_cond(rt_not(v544_stmtLevel))) {
       (void)rt_chk(s390_requireValue(up, rt_get(&F_els, v541_e)), "chain");
     }
   } else if (rt_cond(rt_not(v544_stmtLevel))) {
-    (void)rt_chk(s386_error(up, rt_get(&F_pos, v541_e), rt_s(&S405), RT_NULL), "chain");
+    (void)rt_chk(s386_error(up, rt_get(&F_pos, v541_e), rt_s(&S410), RT_NULL), "chain");
   }
   RT_RET(RT_NULL);
 }
@@ -5502,38 +6013,38 @@ static wv s410_lvalue(struct fr99 *up, wv v547_t, wv v548_scope, wv v549_ctx) {
   v548_scope = rt_bind(v548_scope, 0);
   v549_ctx = rt_bind(v549_ctx, 0);
   if (rt_cond(rt_eq(rt_get(&F_k, v547_t), rt_s(&S211)))) {
-    wv v553_d = rt_bind(({ wv t919 = rt_get(&F_name, v547_t); wv t920 = rt_get(&F_pos, v547_t); wv t921 = v548_scope; wv t922 = v549_ctx; rt_chk(s396_resolve(up, t919, t920, t921, t922), "lvalue"); }), 0);
+    wv v553_d = rt_bind(({ wv t924 = rt_get(&F_name, v547_t); wv t925 = rt_get(&F_pos, v547_t); wv t926 = v548_scope; wv t927 = v549_ctx; rt_chk(s396_resolve(up, t924, t925, t926, t927), "lvalue"); }), 0);
     if (rt_cond(rt_ne(v553_d, RT_NULL))) {
-      (void)({ wv t923 = v553_d; wv t924 = rt_get(&F_name, v547_t); wv t925 = rt_get(&F_pos, v547_t); wv t926 = rt_cat(3, (wv[]){ rt_s(&S406), rt_text(rt_get(&F_name, v547_t)), rt_s(&S407) }); rt_chk(s411_mustBeMutable(up, t923, t924, t925, t926, rt_b(1)), "lvalue"); });
+      (void)({ wv t928 = v553_d; wv t929 = rt_get(&F_name, v547_t); wv t930 = rt_get(&F_pos, v547_t); wv t931 = rt_cat(3, (wv[]){ rt_s(&S411), rt_text(rt_get(&F_name, v547_t)), rt_s(&S412) }); rt_chk(s411_mustBeMutable(up, t928, t929, t930, t931, rt_b(1)), "lvalue"); });
       if (rt_cond(rt_get(&F_isRef, v553_d))) {
-        (void)({ wv t929 = rt_get(&F_refTargets, ({ wv t927 = rt_def(up->v382_curMod, "curMod"); wv t928 = up->v378_modules; rt_idx(t927, t928); })); wv t930 = rt_get(&F_pos, v547_t); std_push(t929, t930); });
+        (void)({ wv t934 = rt_get(&F_refTargets, ({ wv t932 = rt_def(up->v382_curMod, "curMod"); wv t933 = up->v378_modules; rt_idx(t932, t933); })); wv t935 = rt_get(&F_pos, v547_t); std_push(t934, t935); });
       }
     }
     RT_RET(RT_NULL);
   }
   wv v550_isMem = rt_eq(rt_get(&F_k, v547_t), rt_s(&S189));
   wv v551_box = rt_bind((rt_cond(v550_isMem) ? rt_get(&F_rec, v547_t) : rt_get(&F_arr, v547_t)), 0);
-  wv v552_what = rt_bind((rt_cond(v550_isMem) ? rt_s(&S408) : rt_s(&S409)), 0);
+  wv v552_what = rt_bind((rt_cond(v550_isMem) ? rt_s(&S413) : rt_s(&S414)), 0);
   if (rt_cond(rt_eq(rt_get(&F_k, v547_t), rt_s(&S188)))) {
-    (void)({ wv t931 = rt_get(&F_index, v547_t); wv t932 = v548_scope; wv t933 = v549_ctx; rt_chk(s413_expr(up, t931, t932, t933), "lvalue"); });
+    (void)({ wv t936 = rt_get(&F_index, v547_t); wv t937 = v548_scope; wv t938 = v549_ctx; rt_chk(s413_expr(up, t936, t937, t938), "lvalue"); });
   }
   if (rt_cond(v550_isMem)) {
     if (rt_cond(rt_ne(rt_chk(s403_enumNamed(up, v551_box, v548_scope), "lvalue"), RT_NULL))) {
-      (void)({ wv t936 = rt_get(&F_pos, v547_t); wv t937 = ({ wv t934 = rt_text(rt_chk(w5_enumText(v551_box), "lvalue")); wv t935 = rt_text(rt_get(&F_field, v547_t)); rt_cat(5, (wv[]){ rt_s(&S406), t934, rt_s(&S129), t935, rt_s(&S410) }); }); rt_chk(s386_error(up, t936, t937, RT_NULL), "lvalue"); });
+      (void)({ wv t941 = rt_get(&F_pos, v547_t); wv t942 = ({ wv t939 = rt_text(rt_chk(w5_enumText(v551_box), "lvalue")); wv t940 = rt_text(rt_get(&F_field, v547_t)); rt_cat(5, (wv[]){ rt_s(&S411), t939, rt_s(&S129), t940, rt_s(&S415) }); }); rt_chk(s386_error(up, t941, t942, RT_NULL), "lvalue"); });
       RT_RET(RT_NULL);
     }
     wv v554_m = rt_bind(rt_chk(s401_moduleNamed(up, v551_box, v548_scope), "lvalue"), 0);
     if (rt_cond(rt_ne(v554_m, RT_NULL))) {
       if (rt_cond(rt_ne(rt_chk(s404_exportOf(up, v547_t, v554_m), "lvalue"), RT_NULL))) {
-        (void)({ wv t943 = rt_get(&F_pos, v547_t); wv t944 = ({ wv t940 = rt_text(rt_get(&F_name, v551_box)); wv t941 = rt_text(rt_get(&F_field, v547_t)); wv t942 = rt_text(rt_get(&F_path, ({ wv t938 = rt_get(&F_lib, v554_m); wv t939 = up->v378_modules; rt_idx(t938, t939); }))); rt_cat(7, (wv[]){ rt_s(&S406), t940, rt_s(&S129), t941, rt_s(&S411), t942, rt_s(&S412) }); }); rt_chk(s386_error(up, t943, t944, RT_NULL), "lvalue"); });
+        (void)({ wv t948 = rt_get(&F_pos, v547_t); wv t949 = ({ wv t945 = rt_text(rt_get(&F_name, v551_box)); wv t946 = rt_text(rt_get(&F_field, v547_t)); wv t947 = rt_text(rt_get(&F_path, ({ wv t943 = rt_get(&F_lib, v554_m); wv t944 = up->v378_modules; rt_idx(t943, t944); }))); rt_cat(7, (wv[]){ rt_s(&S411), t945, rt_s(&S129), t946, rt_s(&S416), t947, rt_s(&S417) }); }); rt_chk(s386_error(up, t948, t949, RT_NULL), "lvalue"); });
       }
       RT_RET(RT_NULL);
     }
   }
   if (rt_cond(rt_eq(rt_get(&F_k, v551_box), rt_s(&S211)))) {
-    wv v555_d = rt_bind(({ wv t945 = rt_get(&F_name, v551_box); wv t946 = rt_get(&F_pos, v551_box); wv t947 = v548_scope; wv t948 = v549_ctx; rt_chk(s396_resolve(up, t945, t946, t947, t948), "lvalue"); }), 0);
+    wv v555_d = rt_bind(({ wv t950 = rt_get(&F_name, v551_box); wv t951 = rt_get(&F_pos, v551_box); wv t952 = v548_scope; wv t953 = v549_ctx; rt_chk(s396_resolve(up, t950, t951, t952, t953), "lvalue"); }), 0);
     if (rt_cond(rt_ne(v555_d, RT_NULL))) {
-      (void)({ wv t951 = v555_d; wv t952 = rt_get(&F_name, v551_box); wv t953 = rt_get(&F_pos, v551_box); wv t954 = ({ wv t949 = rt_text(v552_what); wv t950 = rt_text(rt_get(&F_name, v551_box)); rt_cat(5, (wv[]){ rt_s(&S413), t949, rt_s(&S414), t950, rt_s(&S415) }); }); rt_chk(s411_mustBeMutable(up, t951, t952, t953, t954, rt_b(0)), "lvalue"); });
+      (void)({ wv t956 = v555_d; wv t957 = rt_get(&F_name, v551_box); wv t958 = rt_get(&F_pos, v551_box); wv t959 = ({ wv t954 = rt_text(v552_what); wv t955 = rt_text(rt_get(&F_name, v551_box)); rt_cat(5, (wv[]){ rt_s(&S418), t954, rt_s(&S419), t955, rt_s(&S420) }); }); rt_chk(s411_mustBeMutable(up, t956, t957, t958, t959, rt_b(0)), "lvalue"); });
     }
   } else {
     (void)rt_chk(s413_expr(up, v551_box, v548_scope, v549_ctx), "lvalue");
@@ -5548,14 +6059,14 @@ static wv s411_mustBeMutable(struct fr99 *up, wv v556_d, wv v557_name, wv v558_p
   v558_pos = rt_bind(v558_pos, 0);
   v559_message = rt_bind(v559_message, 0);
   v560_rebind = rt_bind(v560_rebind, 0);
-  if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_eq(rt_get(&F_kind, v556_d), rt_s(&S33)), "||") || rt_bool(rt_eq(rt_get(&F_kind, v556_d), rt_s(&S46)), "||")), "||") || rt_bool(rt_eq(rt_get(&F_kind, v556_d), rt_s(&S388)), "||")))) {
-    (void)({ wv t957 = v558_pos; wv t958 = ({ wv t955 = rt_text(v557_name); wv t956 = rt_text(rt_chk(w5_kindText(rt_get(&F_kind, v556_d)), "mustBeMutable")); rt_cat(5, (wv[]){ rt_s(&S113), t955, rt_s(&S416), t956, rt_s(&S417) }); }); rt_chk(s386_error(up, t957, t958, RT_NULL), "mustBeMutable"); });
+  if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_eq(rt_get(&F_kind, v556_d), rt_s(&S33)), "||") || rt_bool(rt_eq(rt_get(&F_kind, v556_d), rt_s(&S46)), "||")), "||") || rt_bool(rt_eq(rt_get(&F_kind, v556_d), rt_s(&S393)), "||")))) {
+    (void)({ wv t962 = v558_pos; wv t963 = ({ wv t960 = rt_text(v557_name); wv t961 = rt_text(rt_chk(w5_kindText(rt_get(&F_kind, v556_d)), "mustBeMutable")); rt_cat(5, (wv[]){ rt_s(&S113), t960, rt_s(&S421), t961, rt_s(&S422) }); }); rt_chk(s386_error(up, t962, t963, RT_NULL), "mustBeMutable"); });
   } else if (rt_cond(rt_b(rt_bool(rt_not(rt_get(&F_isVar, v556_d)), "&&") && rt_bool(rt_not(rt_get(&F_isRef, v556_d)), "&&")))) {
     wv v561_hint = RT_NULL;
-    if (rt_cond(rt_eq(rt_get(&F_kind, v556_d), rt_s(&S373)))) {
-      v561_hint = rt_bind((rt_cond(v560_rebind) ? ({ wv t959 = rt_text(v557_name); wv t960 = rt_text(v557_name); rt_cat(5, (wv[]){ rt_s(&S418), t959, rt_s(&S419), t960, rt_s(&S420) }); }) : rt_cat(3, (wv[]){ rt_s(&S421), rt_text(v557_name), rt_s(&S16) })), 1);
+    if (rt_cond(rt_eq(rt_get(&F_kind, v556_d), rt_s(&S378)))) {
+      v561_hint = rt_bind((rt_cond(v560_rebind) ? ({ wv t964 = rt_text(v557_name); wv t965 = rt_text(v557_name); rt_cat(5, (wv[]){ rt_s(&S423), t964, rt_s(&S424), t965, rt_s(&S425) }); }) : rt_cat(3, (wv[]){ rt_s(&S426), rt_text(v557_name), rt_s(&S16) })), 1);
     } else if (rt_cond(rt_eq(rt_get(&F_kind, v556_d), rt_s(&S177)))) {
-      v561_hint = rt_bind((rt_cond(v560_rebind) ? ({ wv t961 = rt_text(v557_name); wv t962 = rt_text(v557_name); rt_cat(5, (wv[]){ rt_s(&S422), t961, rt_s(&S423), t962, rt_s(&S424) }); }) : rt_cat(3, (wv[]){ rt_s(&S425), rt_text(v557_name), rt_s(&S426) })), 1);
+      v561_hint = rt_bind((rt_cond(v560_rebind) ? ({ wv t966 = rt_text(v557_name); wv t967 = rt_text(v557_name); rt_cat(5, (wv[]){ rt_s(&S427), t966, rt_s(&S428), t967, rt_s(&S429) }); }) : rt_cat(3, (wv[]){ rt_s(&S430), rt_text(v557_name), rt_s(&S431) })), 1);
     }
     (void)rt_chk(s386_error(up, v558_pos, v559_message, v561_hint), "mustBeMutable");
   }
@@ -5565,7 +6076,7 @@ static wv s411_mustBeMutable(struct fr99 *up, wv v556_d, wv v557_name, wv v558_p
 static wv s412_unknownStd(struct fr99 *up, wv v562_node) {
   rt_enter("unknownStd");
   v562_node = rt_bind(v562_node, 0);
-  (void)({ wv t963 = rt_get(&F_pos, v562_node); wv t964 = rt_cat(3, (wv[]){ rt_s(&S427), rt_text(rt_get(&F_name, v562_node)), rt_s(&S113) }); rt_chk(s386_error(up, t963, t964, rt_s(&S136)), "unknownStd"); });
+  (void)({ wv t968 = rt_get(&F_pos, v562_node); wv t969 = rt_cat(3, (wv[]){ rt_s(&S432), rt_text(rt_get(&F_name, v562_node)), rt_s(&S113) }); rt_chk(s386_error(up, t968, t969, rt_s(&S136)), "unknownStd"); });
   RT_RET(RT_NULL);
 }
 
@@ -5579,22 +6090,22 @@ static wv s413_expr(struct fr99 *up, wv v563_e, wv v564_scope, wv v565_ctx) {
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S171)))) {
     wv v567_k = rt_i(0);
-    while (rt_cond(({ wv t965 = v567_k; wv t966 = std_length(rt_get(&F_parts, v563_e)); rt_lt(t965, t966); }))) {
-      if (rt_cond(rt_ne(std_typeOf(({ wv t967 = v567_k; wv t968 = rt_get(&F_parts, v563_e); rt_idx(t967, t968); })), rt_s(&S185)))) {
-        (void)({ wv t971 = ({ wv t969 = v567_k; wv t970 = rt_get(&F_parts, v563_e); rt_idx(t969, t970); }); wv t972 = v564_scope; wv t973 = v565_ctx; rt_chk(s413_expr(up, t971, t972, t973), "expr"); });
+    while (rt_cond(({ wv t970 = v567_k; wv t971 = std_length(rt_get(&F_parts, v563_e)); rt_lt(t970, t971); }))) {
+      if (rt_cond(rt_ne(std_typeOf(({ wv t972 = v567_k; wv t973 = rt_get(&F_parts, v563_e); rt_idx(t972, t973); })), rt_s(&S185)))) {
+        (void)({ wv t976 = ({ wv t974 = v567_k; wv t975 = rt_get(&F_parts, v563_e); rt_idx(t974, t975); }); wv t977 = v564_scope; wv t978 = v565_ctx; rt_chk(s413_expr(up, t976, t977, t978), "expr"); });
       }
       v567_k = rt_add(v567_k, rt_i(1));
     }
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S211)))) {
-    wv v568_d = rt_bind(({ wv t974 = rt_get(&F_name, v563_e); wv t975 = rt_get(&F_pos, v563_e); wv t976 = v564_scope; wv t977 = v565_ctx; rt_chk(s396_resolve(up, t974, t975, t976, t977), "expr"); }), 0);
+    wv v568_d = rt_bind(({ wv t979 = rt_get(&F_name, v563_e); wv t980 = rt_get(&F_pos, v563_e); wv t981 = v564_scope; wv t982 = v565_ctx; rt_chk(s396_resolve(up, t979, t980, t981, t982), "expr"); }), 0);
     if (rt_cond(rt_b(rt_bool(rt_ne(v568_d, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_kind, v568_d), rt_s(&S33)), "&&")))) {
-      (void)({ wv t980 = rt_get(&F_pos, v563_e); wv t981 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_get(&F_name, v563_e)), rt_s(&S392) }); wv t982 = ({ wv t978 = rt_text(rt_get(&F_name, v563_e)); wv t979 = rt_text(rt_get(&F_name, v563_e)); rt_cat(5, (wv[]){ rt_s(&S393), t978, rt_s(&S394), t979, rt_s(&S395) }); }); rt_chk(s386_error(up, t980, t981, t982), "expr"); });
+      (void)({ wv t985 = rt_get(&F_pos, v563_e); wv t986 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_get(&F_name, v563_e)), rt_s(&S397) }); wv t987 = ({ wv t983 = rt_text(rt_get(&F_name, v563_e)); wv t984 = rt_text(rt_get(&F_name, v563_e)); rt_cat(5, (wv[]){ rt_s(&S398), t983, rt_s(&S399), t984, rt_s(&S400) }); }); rt_chk(s386_error(up, t985, t986, t987), "expr"); });
     } else if (rt_cond(rt_b(rt_bool(rt_ne(v568_d, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_kind, v568_d), rt_s(&S46)), "&&")))) {
-      (void)({ wv t983 = rt_get(&F_pos, v563_e); wv t984 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_get(&F_name, v563_e)), rt_s(&S396) }); wv t985 = rt_cat(3, (wv[]){ rt_s(&S397), rt_text(rt_get(&F_name, v563_e)), rt_s(&S398) }); rt_chk(s386_error(up, t983, t984, t985), "expr"); });
-    } else if (rt_cond(rt_b(rt_bool(rt_ne(v568_d, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_kind, v568_d), rt_s(&S388)), "&&")))) {
-      (void)({ wv t986 = rt_get(&F_pos, v563_e); wv t987 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_get(&F_name, v563_e)), rt_s(&S428) }); wv t988 = rt_cat(3, (wv[]){ rt_s(&S429), rt_text(rt_get(&F_name, v563_e)), rt_s(&S430) }); rt_chk(s386_error(up, t986, t987, t988), "expr"); });
+      (void)({ wv t988 = rt_get(&F_pos, v563_e); wv t989 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_get(&F_name, v563_e)), rt_s(&S401) }); wv t990 = rt_cat(3, (wv[]){ rt_s(&S402), rt_text(rt_get(&F_name, v563_e)), rt_s(&S403) }); rt_chk(s386_error(up, t988, t989, t990), "expr"); });
+    } else if (rt_cond(rt_b(rt_bool(rt_ne(v568_d, RT_NULL), "&&") && rt_bool(rt_eq(rt_get(&F_kind, v568_d), rt_s(&S393)), "&&")))) {
+      (void)({ wv t991 = rt_get(&F_pos, v563_e); wv t992 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(rt_get(&F_name, v563_e)), rt_s(&S433) }); wv t993 = rt_cat(3, (wv[]){ rt_s(&S434), rt_text(rt_get(&F_name, v563_e)), rt_s(&S435) }); rt_chk(s386_error(up, t991, t992, t993), "expr"); });
     }
     RT_RET(RT_NULL);
   }
@@ -5603,71 +6114,71 @@ static wv s413_expr(struct fr99 *up, wv v563_e, wv v564_scope, wv v565_ctx) {
     if (rt_cond(rt_eq(v569_sig, RT_NULL))) {
       (void)rt_chk(s412_unknownStd(up, v563_e), "expr");
     } else if (rt_cond(rt_ne(v569_sig, rt_s(&S35)))) {
-      (void)({ wv t991 = rt_get(&F_pos, v563_e); wv t992 = ({ wv t989 = rt_text(rt_get(&F_name, v563_e)); wv t990 = rt_text(rt_get(&F_name, v563_e)); rt_cat(5, (wv[]){ rt_s(&S179), t989, rt_s(&S431), t990, rt_s(&S16) }); }); rt_chk(s386_error(up, t991, t992, RT_NULL), "expr"); });
+      (void)({ wv t996 = rt_get(&F_pos, v563_e); wv t997 = ({ wv t994 = rt_text(rt_get(&F_name, v563_e)); wv t995 = rt_text(rt_get(&F_name, v563_e)); rt_cat(5, (wv[]){ rt_s(&S179), t994, rt_s(&S436), t995, rt_s(&S16) }); }); rt_chk(s386_error(up, t996, t997, RT_NULL), "expr"); });
     }
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S186)))) {
     wv v570_k = rt_i(0);
-    while (rt_cond(({ wv t993 = v570_k; wv t994 = std_length(rt_get(&F_items, v563_e)); rt_lt(t993, t994); }))) {
-      (void)({ wv t997 = ({ wv t995 = v570_k; wv t996 = rt_get(&F_items, v563_e); rt_idx(t995, t996); }); wv t998 = v564_scope; wv t999 = v565_ctx; rt_chk(s413_expr(up, t997, t998, t999), "expr"); });
+    while (rt_cond(({ wv t998 = v570_k; wv t999 = std_length(rt_get(&F_items, v563_e)); rt_lt(t998, t999); }))) {
+      (void)({ wv t1002 = ({ wv t1000 = v570_k; wv t1001 = rt_get(&F_items, v563_e); rt_idx(t1000, t1001); }); wv t1003 = v564_scope; wv t1004 = v565_ctx; rt_chk(s413_expr(up, t1002, t1003, t1004), "expr"); });
       v570_k = rt_add(v570_k, rt_i(1));
     }
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S187)))) {
     wv v571_k = rt_i(0);
-    while (rt_cond(({ wv t1000 = v571_k; wv t1001 = std_length(rt_get(&F_fields, v563_e)); rt_lt(t1000, t1001); }))) {
-      (void)({ wv t1004 = rt_get(&F_e, ({ wv t1002 = v571_k; wv t1003 = rt_get(&F_fields, v563_e); rt_idx(t1002, t1003); })); wv t1005 = v564_scope; wv t1006 = v565_ctx; rt_chk(s413_expr(up, t1004, t1005, t1006), "expr"); });
+    while (rt_cond(({ wv t1005 = v571_k; wv t1006 = std_length(rt_get(&F_fields, v563_e)); rt_lt(t1005, t1006); }))) {
+      (void)({ wv t1009 = rt_get(&F_e, ({ wv t1007 = v571_k; wv t1008 = rt_get(&F_fields, v563_e); rt_idx(t1007, t1008); })); wv t1010 = v564_scope; wv t1011 = v565_ctx; rt_chk(s413_expr(up, t1009, t1010, t1011), "expr"); });
       v571_k = rt_add(v571_k, rt_i(1));
     }
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S188)))) {
-    (void)({ wv t1007 = rt_get(&F_index, v563_e); wv t1008 = v564_scope; wv t1009 = v565_ctx; rt_chk(s413_expr(up, t1007, t1008, t1009), "expr"); });
-    (void)({ wv t1010 = rt_get(&F_arr, v563_e); wv t1011 = v564_scope; wv t1012 = v565_ctx; rt_chk(s413_expr(up, t1010, t1011, t1012), "expr"); });
+    (void)({ wv t1012 = rt_get(&F_index, v563_e); wv t1013 = v564_scope; wv t1014 = v565_ctx; rt_chk(s413_expr(up, t1012, t1013, t1014), "expr"); });
+    (void)({ wv t1015 = rt_get(&F_arr, v563_e); wv t1016 = v564_scope; wv t1017 = v565_ctx; rt_chk(s413_expr(up, t1015, t1016, t1017), "expr"); });
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S189)))) {
-    wv v572_lin = rt_bind(({ wv t1013 = rt_get(&F_rec, v563_e); wv t1014 = v564_scope; rt_chk(s403_enumNamed(up, t1013, t1014), "expr"); }), 0);
+    wv v572_lin = rt_bind(({ wv t1018 = rt_get(&F_rec, v563_e); wv t1019 = v564_scope; rt_chk(s403_enumNamed(up, t1018, t1019), "expr"); }), 0);
     if (rt_cond(rt_ne(v572_lin, RT_NULL))) {
       (void)rt_chk(s408_member(up, v563_e, v572_lin), "expr");
       RT_RET(RT_NULL);
     }
-    wv v573_m = rt_bind(({ wv t1015 = rt_get(&F_rec, v563_e); wv t1016 = v564_scope; rt_chk(s401_moduleNamed(up, t1015, t1016), "expr"); }), 0);
+    wv v573_m = rt_bind(({ wv t1020 = rt_get(&F_rec, v563_e); wv t1021 = v564_scope; rt_chk(s401_moduleNamed(up, t1020, t1021), "expr"); }), 0);
     if (rt_cond(rt_ne(v573_m, RT_NULL))) {
       (void)rt_chk(s406_qualified(up, v563_e, v573_m), "expr");
     } else {
-      (void)({ wv t1017 = rt_get(&F_rec, v563_e); wv t1018 = v564_scope; wv t1019 = v565_ctx; rt_chk(s413_expr(up, t1017, t1018, t1019), "expr"); });
+      (void)({ wv t1022 = rt_get(&F_rec, v563_e); wv t1023 = v564_scope; wv t1024 = v565_ctx; rt_chk(s413_expr(up, t1022, t1023, t1024), "expr"); });
     }
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S190)))) {
-    (void)({ wv t1020 = rt_get(&F_e, v563_e); wv t1021 = v564_scope; wv t1022 = v565_ctx; rt_chk(s413_expr(up, t1020, t1021, t1022), "expr"); });
+    (void)({ wv t1025 = rt_get(&F_e, v563_e); wv t1026 = v564_scope; wv t1027 = v565_ctx; rt_chk(s413_expr(up, t1025, t1026, t1027), "expr"); });
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S191)))) {
-    (void)({ wv t1023 = rt_get(&F_l, v563_e); wv t1024 = v564_scope; wv t1025 = v565_ctx; rt_chk(s413_expr(up, t1023, t1024, t1025), "expr"); });
-    (void)({ wv t1026 = rt_get(&F_r, v563_e); wv t1027 = v564_scope; wv t1028 = v565_ctx; rt_chk(s413_expr(up, t1026, t1027, t1028), "expr"); });
+    (void)({ wv t1028 = rt_get(&F_l, v563_e); wv t1029 = v564_scope; wv t1030 = v565_ctx; rt_chk(s413_expr(up, t1028, t1029, t1030), "expr"); });
+    (void)({ wv t1031 = rt_get(&F_r, v563_e); wv t1032 = v564_scope; wv t1033 = v565_ctx; rt_chk(s413_expr(up, t1031, t1032, t1033), "expr"); });
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S192)))) {
-    (void)({ wv t1029 = rt_get(&F_c, v563_e); wv t1030 = v564_scope; wv t1031 = v565_ctx; rt_chk(s413_expr(up, t1029, t1030, t1031), "expr"); });
-    (void)({ wv t1032 = rt_get(&F_a, v563_e); wv t1033 = v564_scope; wv t1034 = v565_ctx; rt_chk(s413_expr(up, t1032, t1033, t1034), "expr"); });
-    (void)({ wv t1035 = rt_get(&F_b, v563_e); wv t1036 = v564_scope; wv t1037 = v565_ctx; rt_chk(s413_expr(up, t1035, t1036, t1037), "expr"); });
+    (void)({ wv t1034 = rt_get(&F_c, v563_e); wv t1035 = v564_scope; wv t1036 = v565_ctx; rt_chk(s413_expr(up, t1034, t1035, t1036), "expr"); });
+    (void)({ wv t1037 = rt_get(&F_a, v563_e); wv t1038 = v564_scope; wv t1039 = v565_ctx; rt_chk(s413_expr(up, t1037, t1038, t1039), "expr"); });
+    (void)({ wv t1040 = rt_get(&F_b, v563_e); wv t1041 = v564_scope; wv t1042 = v565_ctx; rt_chk(s413_expr(up, t1040, t1041, t1042), "expr"); });
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S182)))) {
     wv v574_k = rt_i(0);
-    while (rt_cond(({ wv t1038 = v574_k; wv t1039 = std_length(rt_get(&F_args, v563_e)); rt_lt(t1038, t1039); }))) {
-      (void)({ wv t1042 = ({ wv t1040 = v574_k; wv t1041 = rt_get(&F_args, v563_e); rt_idx(t1040, t1041); }); wv t1043 = v564_scope; wv t1044 = v565_ctx; rt_chk(s413_expr(up, t1042, t1043, t1044), "expr"); });
+    while (rt_cond(({ wv t1043 = v574_k; wv t1044 = std_length(rt_get(&F_args, v563_e)); rt_lt(t1043, t1044); }))) {
+      (void)({ wv t1047 = ({ wv t1045 = v574_k; wv t1046 = rt_get(&F_args, v563_e); rt_idx(t1045, t1046); }); wv t1048 = v564_scope; wv t1049 = v565_ctx; rt_chk(s413_expr(up, t1047, t1048, t1049), "expr"); });
       v574_k = rt_add(v574_k, rt_i(1));
     }
     (void)rt_chk(s414_callee(up, v563_e, v564_scope, rt_b(1)), "expr");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S183)))) {
-    (void)rt_chk(s386_error(up, rt_get(&F_pos, v563_e), rt_s(&S432), RT_NULL), "expr");
+    (void)rt_chk(s386_error(up, rt_get(&F_pos, v563_e), rt_s(&S437), RT_NULL), "expr");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v566_kind, rt_s(&S44)))) {
@@ -5678,7 +6189,7 @@ static wv s413_expr(struct fr99 *up, wv v563_e, wv v564_scope, wv v565_ctx) {
     (void)rt_chk(s409_chain(up, v563_e, v564_scope, v565_ctx, rt_b(0)), "expr");
     RT_RET(RT_NULL);
   }
-  rt_panic(rt_cat(2, (wv[]){ rt_s(&S433), rt_text(v566_kind) }));
+  rt_panic(rt_cat(2, (wv[]){ rt_s(&S438), rt_text(v566_kind) }));
   RT_RET(RT_NULL);
 }
 
@@ -5696,21 +6207,21 @@ static wv s414_callee(struct fr99 *up, wv v575_e, wv v576_scope, wv v577_used) {
       RT_RET(RT_NULL);
     }
     if (rt_cond(rt_eq(v582_sig, rt_s(&S35)))) {
-      (void)({ wv t1045 = rt_get(&F_pos, v578_c); wv t1046 = rt_cat(3, (wv[]){ rt_s(&S179), rt_text(rt_get(&F_name, v578_c)), rt_s(&S434) }); rt_chk(s386_error(up, t1045, t1046, RT_NULL), "callee"); });
+      (void)({ wv t1050 = rt_get(&F_pos, v578_c); wv t1051 = rt_cat(3, (wv[]){ rt_s(&S179), rt_text(rt_get(&F_name, v578_c)), rt_s(&S439) }); rt_chk(s386_error(up, t1050, t1051, RT_NULL), "callee"); });
       RT_RET(RT_NULL);
     }
     if (rt_cond(rt_ne(v582_sig, v579_n))) {
-      (void)({ wv t1050 = rt_get(&F_pos, v578_c); wv t1051 = ({ wv t1047 = rt_text(rt_get(&F_name, v578_c)); wv t1048 = rt_text(rt_chk(w5_plural(v582_sig), "callee")); wv t1049 = rt_text(v579_n); rt_cat(6, (wv[]){ rt_s(&S179), t1047, rt_s(&S435), t1048, rt_s(&S436), t1049 }); }); rt_chk(s386_error(up, t1050, t1051, RT_NULL), "callee"); });
+      (void)({ wv t1055 = rt_get(&F_pos, v578_c); wv t1056 = ({ wv t1052 = rt_text(rt_get(&F_name, v578_c)); wv t1053 = rt_text(rt_chk(w5_plural(v582_sig), "callee")); wv t1054 = rt_text(v579_n); rt_cat(6, (wv[]){ rt_s(&S179), t1052, rt_s(&S440), t1053, rt_s(&S441), t1054 }); }); rt_chk(s386_error(up, t1055, t1056, RT_NULL), "callee"); });
     }
     RT_RET(RT_NULL);
   }
   wv v580_d = RT_NULL;
   wv v581_label = rt_s(&S13);
   if (rt_cond(rt_eq(rt_get(&F_k, v578_c), rt_s(&S189)))) {
-    v581_label = ({ wv t1052 = rt_text(rt_get(&F_name, rt_get(&F_rec, v578_c))); wv t1053 = rt_text(rt_get(&F_field, v578_c)); rt_cat(3, (wv[]){ t1052, rt_s(&S129), t1053 }); });
-    wv v583_m = rt_bind(({ wv t1054 = rt_get(&F_rec, v578_c); wv t1055 = v576_scope; rt_chk(s401_moduleNamed(up, t1054, t1055), "callee"); }), 0);
+    v581_label = ({ wv t1057 = rt_text(rt_get(&F_name, rt_get(&F_rec, v578_c))); wv t1058 = rt_text(rt_get(&F_field, v578_c)); rt_cat(3, (wv[]){ t1057, rt_s(&S129), t1058 }); });
+    wv v583_m = rt_bind(({ wv t1059 = rt_get(&F_rec, v578_c); wv t1060 = v576_scope; rt_chk(s401_moduleNamed(up, t1059, t1060), "callee"); }), 0);
     if (rt_cond(rt_eq(v583_m, RT_NULL))) {
-      (void)({ wv t1056 = rt_get(&F_rec, v578_c); wv t1057 = v576_scope; rt_chk(s405_unknownModule(up, t1056, t1057), "callee"); });
+      (void)({ wv t1061 = rt_get(&F_rec, v578_c); wv t1062 = v576_scope; rt_chk(s405_unknownModule(up, t1061, t1062), "callee"); });
       RT_RET(RT_NULL);
     }
     v580_d = rt_chk(s404_exportOf(up, v578_c, v583_m), "callee");
@@ -5719,22 +6230,22 @@ static wv s414_callee(struct fr99 *up, wv v575_e, wv v576_scope, wv v577_used) {
     }
   } else {
     v581_label = rt_bind(rt_get(&F_name, v578_c), 1);
-    v580_d = ({ wv t1058 = v576_scope; wv t1059 = rt_get(&F_name, v578_c); rt_chk(s395_lookup(up, t1058, t1059), "callee"); });
+    v580_d = ({ wv t1063 = v576_scope; wv t1064 = rt_get(&F_name, v578_c); rt_chk(s395_lookup(up, t1063, t1064), "callee"); });
     if (rt_cond(rt_eq(v580_d, RT_NULL))) {
-      (void)({ wv t1060 = rt_get(&F_pos, v578_c); wv t1061 = rt_cat(3, (wv[]){ rt_s(&S437), rt_text(rt_get(&F_name, v578_c)), rt_s(&S113) }); rt_chk(s386_error(up, t1060, t1061, RT_NULL), "callee"); });
+      (void)({ wv t1065 = rt_get(&F_pos, v578_c); wv t1066 = rt_cat(3, (wv[]){ rt_s(&S442), rt_text(rt_get(&F_name, v578_c)), rt_s(&S113) }); rt_chk(s386_error(up, t1065, t1066, RT_NULL), "callee"); });
       RT_RET(RT_NULL);
     }
   }
   if (rt_cond(rt_ne(rt_get(&F_kind, v580_d), rt_s(&S33)))) {
-    wv v584_hint = rt_bind((rt_cond(rt_eq(v579_n, rt_i(0))) ? rt_cat(3, (wv[]){ rt_s(&S97), rt_text(v581_label), rt_s(&S438) }) : rt_s(&S439)), 0);
-    (void)({ wv t1062 = rt_get(&F_pos, v578_c); wv t1063 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(v581_label), rt_s(&S440) }); wv t1064 = v584_hint; rt_chk(s386_error(up, t1062, t1063, t1064), "callee"); });
+    wv v584_hint = rt_bind((rt_cond(rt_eq(v579_n, rt_i(0))) ? rt_cat(3, (wv[]){ rt_s(&S97), rt_text(v581_label), rt_s(&S443) }) : rt_s(&S444)), 0);
+    (void)({ wv t1067 = rt_get(&F_pos, v578_c); wv t1068 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(v581_label), rt_s(&S445) }); wv t1069 = v584_hint; rt_chk(s386_error(up, t1067, t1068, t1069), "callee"); });
     RT_RET(RT_NULL);
   }
-  if (rt_cond(({ wv t1065 = rt_get(&F_arity, v580_d); wv t1066 = v579_n; rt_ne(t1065, t1066); }))) {
-    (void)({ wv t1070 = rt_get(&F_pos, v578_c); wv t1071 = ({ wv t1067 = rt_text(v581_label); wv t1068 = rt_text(rt_chk(w5_plural(rt_get(&F_arity, v580_d)), "callee")); wv t1069 = rt_text(v579_n); rt_cat(6, (wv[]){ rt_s(&S113), t1067, rt_s(&S435), t1068, rt_s(&S436), t1069 }); }); rt_chk(s386_error(up, t1070, t1071, RT_NULL), "callee"); });
+  if (rt_cond(({ wv t1070 = rt_get(&F_arity, v580_d); wv t1071 = v579_n; rt_ne(t1070, t1071); }))) {
+    (void)({ wv t1075 = rt_get(&F_pos, v578_c); wv t1076 = ({ wv t1072 = rt_text(v581_label); wv t1073 = rt_text(rt_chk(w5_plural(rt_get(&F_arity, v580_d)), "callee")); wv t1074 = rt_text(v579_n); rt_cat(6, (wv[]){ rt_s(&S113), t1072, rt_s(&S440), t1073, rt_s(&S441), t1074 }); }); rt_chk(s386_error(up, t1075, t1076, RT_NULL), "callee"); });
   }
-  if (rt_cond(rt_b(rt_bool(v577_used, "&&") && rt_bool(rt_eq(({ wv t1072 = rt_get(&F_mod, v580_d); wv t1073 = rt_get(&F_namePos, v580_d); rt_chk(s389_firstUse(up, t1072, t1073), "callee"); }), RT_NULL), "&&")))) {
-    (void)({ wv t1078 = rt_def(up->v384_uses, "uses"); wv t1079 = ({ wv t1074 = rt_get(&F_mod, v580_d); wv t1075 = rt_get(&F_namePos, v580_d); wv t1076 = rt_get(&F_pos, v578_c); wv t1077 = rt_def(up->v382_curMod, "curMod"); rt_rec(0, 4, K47, (wv[]){ t1074, t1075, t1076, t1077 }); }); std_push(t1078, t1079); });
+  if (rt_cond(rt_b(rt_bool(v577_used, "&&") && rt_bool(rt_eq(({ wv t1077 = rt_get(&F_mod, v580_d); wv t1078 = rt_get(&F_namePos, v580_d); rt_chk(s389_firstUse(up, t1077, t1078), "callee"); }), RT_NULL), "&&")))) {
+    (void)({ wv t1083 = rt_def(up->v384_uses, "uses"); wv t1084 = ({ wv t1079 = rt_get(&F_mod, v580_d); wv t1080 = rt_get(&F_namePos, v580_d); wv t1081 = rt_get(&F_pos, v578_c); wv t1082 = rt_def(up->v382_curMod, "curMod"); rt_rec(0, 4, K47, (wv[]){ t1079, t1080, t1081, t1082 }); }); std_push(t1083, t1084); });
   }
   RT_RET(RT_NULL);
 }
@@ -5746,22 +6257,22 @@ static wv s415_importNames(struct fr99 *up, wv v585_m, wv v586_scope) {
   wv v587_imports = rt_bind(rt_get(&F_imports, rt_idx(v585_m, up->v378_modules)), 0);
   wv v588_seen = rt_arr(0, NULL, 1);
   wv v589_k = rt_i(0);
-  while (rt_cond(({ wv t1080 = v589_k; wv t1081 = std_length(v587_imports); rt_lt(t1080, t1081); }))) {
+  while (rt_cond(({ wv t1085 = v589_k; wv t1086 = std_length(v587_imports); rt_lt(t1085, t1086); }))) {
     wv v590_node = rt_bind(rt_get(&F_node, rt_idx(v589_k, v587_imports)), 0);
     wv v591_lib = rt_bind(rt_get(&F_lib, rt_idx(v589_k, v587_imports)), 0);
     v589_k = rt_add(v589_k, rt_i(1));
     wv v592_path = rt_bind(rt_get(&F_path, rt_idx(v591_lib, up->v378_modules)), 0);
     wv v593_usable = rt_bind(v591_lib, 1);
     if (rt_cond(rt_chk(w1_contains(v588_seen, v591_lib), "importNames"))) {
-      (void)({ wv t1082 = rt_get(&F_pathPos, v590_node); wv t1083 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(v592_path), rt_s(&S441) }); rt_chk(s386_error(up, t1082, t1083, RT_NULL), "importNames"); });
+      (void)({ wv t1087 = rt_get(&F_pathPos, v590_node); wv t1088 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(v592_path), rt_s(&S446) }); rt_chk(s386_error(up, t1087, t1088, RT_NULL), "importNames"); });
       v593_usable = RT_NULL;
     } else if (rt_cond(rt_get(&F_notLibrary, rt_idx(v591_lib, up->v378_modules)))) {
-      (void)({ wv t1084 = rt_get(&F_pathPos, v590_node); wv t1085 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(v592_path), rt_s(&S442) }); rt_chk(s386_error(up, t1084, t1085, RT_NULL), "importNames"); });
+      (void)({ wv t1089 = rt_get(&F_pathPos, v590_node); wv t1090 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text(v592_path), rt_s(&S447) }); rt_chk(s386_error(up, t1089, t1090, RT_NULL), "importNames"); });
       v593_usable = RT_NULL;
     }
     (void)std_push(v588_seen, v591_lib);
-    wv v594_d = ({ wv t1086 = rt_get(&F_name, v590_node); wv t1087 = rt_get(&F_namePos, v590_node); wv t1088 = rt_def(up->v382_curMod, "curMod"); wv t1089 = v593_usable; rt_rec(0, 10, K41, (wv[]){ rt_s(&S388), t1086, rt_b(0), rt_b(0), t1087, RT_NULL, RT_NULL, RT_NULL, t1088, t1089 }); });
-    (void)({ wv t1090 = v586_scope; wv t1091 = rt_get(&F_name, v590_node); wv t1092 = v594_d; rt_chk(s394_declare(up, t1090, t1091, t1092), "importNames"); });
+    wv v594_d = ({ wv t1091 = rt_get(&F_name, v590_node); wv t1092 = rt_get(&F_namePos, v590_node); wv t1093 = rt_def(up->v382_curMod, "curMod"); wv t1094 = v593_usable; rt_rec(0, 10, K41, (wv[]){ rt_s(&S393), t1091, rt_b(0), rt_b(0), t1092, RT_NULL, RT_NULL, RT_NULL, t1093, t1094 }); });
+    (void)({ wv t1095 = v586_scope; wv t1096 = rt_get(&F_name, v590_node); wv t1097 = v594_d; rt_chk(s394_declare(up, t1095, t1096, t1097), "importNames"); });
   }
   RT_RET(RT_NULL);
 }
@@ -5774,37 +6285,37 @@ static wv s416_libraryRules(struct fr99 *up, wv v595_m, wv v596_scope, wv v597_i
   v598_last = rt_bind(v598_last, 0);
   wv v599_program = rt_bind(rt_get(&F_program, rt_idx(v595_m, up->v378_modules)), 0);
   wv v600_k = rt_i(0);
-  while (rt_cond(({ wv t1093 = v600_k; wv t1094 = std_length(rt_get(&F_stmts, v599_program)); rt_lt(t1093, t1094); }))) {
-    wv v602_s = rt_bind(({ wv t1095 = v600_k; wv t1096 = rt_get(&F_stmts, v599_program); rt_idx(t1095, t1096); }), 0);
+  while (rt_cond(({ wv t1098 = v600_k; wv t1099 = std_length(rt_get(&F_stmts, v599_program)); rt_lt(t1098, t1099); }))) {
+    wv v602_s = rt_bind(({ wv t1100 = v600_k; wv t1101 = rt_get(&F_stmts, v599_program); rt_idx(t1100, t1101); }), 0);
     v600_k = rt_add(v600_k, rt_i(1));
-    if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_k, v602_s), rt_s(&S203)), "&&") && rt_bool(rt_b(rt_bool(v597_isEntry, "||") || rt_bool(({ wv t1097 = rt_get(&F_pos, v602_s); wv t1098 = rt_get(&F_pos, v598_last); rt_ne(t1097, t1098); }), "||")), "&&")))) {
-      (void)rt_chk(s386_error(up, rt_get(&F_pos, v602_s), rt_s(&S443), rt_s(&S444)), "libraryRules");
-    } else if (rt_cond(rt_b(rt_bool(rt_not(v597_isEntry), "&&") && rt_bool(rt_not(({ wv t1099 = rt_def(w5_libraryTop, "libraryTop"); wv t1100 = rt_get(&F_k, v602_s); rt_chk(w1_contains(t1099, t1100), "libraryRules"); })), "&&")))) {
-      (void)rt_chk(s386_error(up, rt_get(&F_pos, v602_s), rt_s(&S445), rt_s(&S446)), "libraryRules");
+    if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_k, v602_s), rt_s(&S203)), "&&") && rt_bool(rt_b(rt_bool(v597_isEntry, "||") || rt_bool(({ wv t1102 = rt_get(&F_pos, v602_s); wv t1103 = rt_get(&F_pos, v598_last); rt_ne(t1102, t1103); }), "||")), "&&")))) {
+      (void)rt_chk(s386_error(up, rt_get(&F_pos, v602_s), rt_s(&S448), rt_s(&S449)), "libraryRules");
+    } else if (rt_cond(rt_b(rt_bool(rt_not(v597_isEntry), "&&") && rt_bool(rt_not(({ wv t1104 = rt_def(w5_libraryTop, "libraryTop"); wv t1105 = rt_get(&F_k, v602_s); rt_chk(w1_contains(t1104, t1105), "libraryRules"); })), "&&")))) {
+      (void)rt_chk(s386_error(up, rt_get(&F_pos, v602_s), rt_s(&S450), rt_s(&S451)), "libraryRules");
     }
   }
   if (rt_cond(v597_isEntry)) {
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_b(rt_bool(rt_eq(v598_last, RT_NULL), "||") || rt_bool(rt_ne(rt_get(&F_k, v598_last), rt_s(&S203)), "||")))) {
-    (void)rt_chk(s386_error(up, rt_get(&F_end, v599_program), rt_s(&S447), rt_s(&S448)), "libraryRules");
+    (void)rt_chk(s386_error(up, rt_get(&F_end, v599_program), rt_s(&S452), rt_s(&S453)), "libraryRules");
     RT_RET(RT_NULL);
   }
   wv v601_exports = rt_arr(0, NULL, 1);
   v600_k = rt_i(0);
-  while (rt_cond(({ wv t1101 = v600_k; wv t1102 = std_length(rt_get(&F_names, v598_last)); rt_lt(t1101, t1102); }))) {
-    wv v603_n = rt_bind(({ wv t1103 = v600_k; wv t1104 = rt_get(&F_names, v598_last); rt_idx(t1103, t1104); }), 0);
+  while (rt_cond(({ wv t1106 = v600_k; wv t1107 = std_length(rt_get(&F_names, v598_last)); rt_lt(t1106, t1107); }))) {
+    wv v603_n = rt_bind(({ wv t1108 = v600_k; wv t1109 = rt_get(&F_names, v598_last); rt_idx(t1108, t1109); }), 0);
     v600_k = rt_add(v600_k, rt_i(1));
-    wv v604_d = rt_bind(({ wv t1105 = v596_scope; wv t1106 = rt_get(&F_name, v603_n); rt_chk(s393_own(up, t1105, t1106), "libraryRules"); }), 0);
+    wv v604_d = rt_bind(({ wv t1110 = v596_scope; wv t1111 = rt_get(&F_name, v603_n); rt_chk(s393_own(up, t1110, t1111), "libraryRules"); }), 0);
     if (rt_cond(rt_eq(v604_d, RT_NULL))) {
-      (void)({ wv t1107 = rt_get(&F_pos, v603_n); wv t1108 = rt_cat(3, (wv[]){ rt_s(&S449), rt_text(rt_get(&F_name, v603_n)), rt_s(&S450) }); rt_chk(s386_error(up, t1107, t1108, RT_NULL), "libraryRules"); });
-    } else if (rt_cond(rt_eq(rt_get(&F_kind, v604_d), rt_s(&S388)))) {
-      (void)({ wv t1109 = rt_get(&F_pos, v603_n); wv t1110 = rt_cat(3, (wv[]){ rt_s(&S449), rt_text(rt_get(&F_name, v603_n)), rt_s(&S451) }); rt_chk(s386_error(up, t1109, t1110, RT_NULL), "libraryRules"); });
+      (void)({ wv t1112 = rt_get(&F_pos, v603_n); wv t1113 = rt_cat(3, (wv[]){ rt_s(&S454), rt_text(rt_get(&F_name, v603_n)), rt_s(&S455) }); rt_chk(s386_error(up, t1112, t1113, RT_NULL), "libraryRules"); });
+    } else if (rt_cond(rt_eq(rt_get(&F_kind, v604_d), rt_s(&S393)))) {
+      (void)({ wv t1114 = rt_get(&F_pos, v603_n); wv t1115 = rt_cat(3, (wv[]){ rt_s(&S454), rt_text(rt_get(&F_name, v603_n)), rt_s(&S456) }); rt_chk(s386_error(up, t1114, t1115, RT_NULL), "libraryRules"); });
     } else {
       (void)std_push(v601_exports, v604_d);
     }
   }
-  ({ wv t1111 = v601_exports; wv t1112 = rt_idx(v595_m, up->v378_modules); rt_set_mem(t1111, &F_exports, t1112); });
+  ({ wv t1116 = v601_exports; wv t1117 = rt_idx(v595_m, up->v378_modules); rt_set_mem(t1116, &F_exports, t1117); });
   RT_RET(RT_NULL);
 }
 
@@ -5816,9 +6327,9 @@ static wv s417_checkModule(struct fr99 *up, wv v605_m, wv v606_isEntry) {
   wv v607_program = rt_bind(rt_get(&F_program, rt_idx(v605_m, up->v378_modules)), 0);
   wv v608_last = RT_NULL;
   wv v609_k = rt_i(0);
-  while (rt_cond(({ wv t1113 = v609_k; wv t1114 = std_length(rt_get(&F_stmts, v607_program)); rt_lt(t1113, t1114); }))) {
-    if (rt_cond(rt_ne(rt_get(&F_k, ({ wv t1115 = v609_k; wv t1116 = rt_get(&F_stmts, v607_program); rt_idx(t1115, t1116); })), rt_s(&S200)))) {
-      v608_last = rt_bind(({ wv t1117 = v609_k; wv t1118 = rt_get(&F_stmts, v607_program); rt_idx(t1117, t1118); }), 1);
+  while (rt_cond(({ wv t1118 = v609_k; wv t1119 = std_length(rt_get(&F_stmts, v607_program)); rt_lt(t1118, t1119); }))) {
+    if (rt_cond(rt_ne(rt_get(&F_k, ({ wv t1120 = v609_k; wv t1121 = rt_get(&F_stmts, v607_program); rt_idx(t1120, t1121); })), rt_s(&S200)))) {
+      v608_last = rt_bind(({ wv t1122 = v609_k; wv t1123 = rt_get(&F_stmts, v607_program); rt_idx(t1122, t1123); }), 1);
     }
     v609_k = rt_add(v609_k, rt_i(1));
   }
@@ -5828,7 +6339,7 @@ static wv s417_checkModule(struct fr99 *up, wv v605_m, wv v606_isEntry) {
   }
   wv v610_scope = rt_bind(rt_chk(s391_newScope(up, RT_NULL), "checkModule"), 0);
   (void)rt_chk(s415_importNames(up, v605_m, v610_scope), "checkModule");
-  (void)({ wv t1119 = rt_rec(0, 2, K48, (wv[]){ rt_get(&F_stmts, v607_program), RT_NULL }); wv t1120 = v610_scope; wv t1121 = rt_rec(0, 2, K45, (wv[]){ rt_def(up->v418_topFn, "topFn"), rt_i(0) }); rt_chk(s397_block(up, t1119, t1120, t1121), "checkModule"); });
+  (void)({ wv t1124 = rt_rec(0, 2, K48, (wv[]){ rt_get(&F_stmts, v607_program), RT_NULL }); wv t1125 = v610_scope; wv t1126 = rt_rec(0, 2, K45, (wv[]){ rt_def(up->v418_topFn, "topFn"), rt_i(0) }); rt_chk(s397_block(up, t1124, t1125, t1126), "checkModule"); });
   (void)rt_chk(s416_libraryRules(up, v605_m, v610_scope, v606_isEntry, v608_last), "checkModule");
   RT_RET(RT_NULL);
 }
@@ -5837,10 +6348,10 @@ static wv w6_binFn(wv v617_op) {
   rt_enter("binFn");
   v617_op = rt_bind(v617_op, 0);
   wv v618_k = rt_i(0);
-  while (rt_cond(({ wv t1148 = ({ wv t1146 = v618_k; wv t1147 = rt_def(w6_binOps, "binOps"); rt_idx(t1146, t1147); }); wv t1149 = v617_op; rt_ne(t1148, t1149); }))) {
+  while (rt_cond(({ wv t1153 = ({ wv t1151 = v618_k; wv t1152 = rt_def(w6_binOps, "binOps"); rt_idx(t1151, t1152); }); wv t1154 = v617_op; rt_ne(t1153, t1154); }))) {
     v618_k = rt_add(v618_k, rt_i(1));
   }
-  RT_RET(({ wv t1150 = v618_k; wv t1151 = rt_def(w6_binFns, "binFns"); rt_idx(t1150, t1151); }));
+  RT_RET(({ wv t1155 = v618_k; wv t1156 = rt_def(w6_binFns, "binFns"); rt_idx(t1155, t1156); }));
 }
 
 static wv w6_modeOf(wv v619_x) {
@@ -5852,7 +6363,7 @@ static wv w6_modeOf(wv v619_x) {
 static wv w6_unFn(wv v620_op) {
   rt_enter("unFn");
   v620_op = rt_bind(v620_op, 0);
-  RT_RET((rt_cond(rt_eq(v620_op, rt_s(&S85))) ? rt_s(&S475) : (rt_cond(rt_eq(v620_op, rt_s(&S94))) ? rt_s(&S476) : rt_s(&S477))));
+  RT_RET((rt_cond(rt_eq(v620_op, rt_s(&S85))) ? rt_s(&S480) : (rt_cond(rt_eq(v620_op, rt_s(&S94))) ? rt_s(&S481) : rt_s(&S482))));
 }
 
 static wv w6_jsBool(wv v621_b) {
@@ -5882,11 +6393,11 @@ static wv w6_jsFloat(wv v626_x) {
   wv v629_out = rt_s(&S13);
   wv v630_k = rt_i(0);
   while (rt_cond(rt_lt(v630_k, v628_len))) {
-    if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_eq(rt_idx(v630_k, v627_cs), rt_s(&S129)), "&&") && rt_bool(rt_eq(({ wv t1152 = rt_add(v630_k, rt_i(1)); wv t1153 = v627_cs; rt_idx(t1152, t1153); }), rt_s(&S4)), "&&")), "&&") && rt_bool(rt_b(rt_bool(({ wv t1154 = rt_add(v630_k, rt_i(2)); wv t1155 = v628_len; rt_eq(t1154, t1155); }), "||") || rt_bool(rt_eq(({ wv t1156 = rt_add(v630_k, rt_i(2)); wv t1157 = v627_cs; rt_idx(t1156, t1157); }), rt_s(&S149)), "||")), "&&")))) {
+    if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_eq(rt_idx(v630_k, v627_cs), rt_s(&S129)), "&&") && rt_bool(rt_eq(({ wv t1157 = rt_add(v630_k, rt_i(1)); wv t1158 = v627_cs; rt_idx(t1157, t1158); }), rt_s(&S4)), "&&")), "&&") && rt_bool(rt_b(rt_bool(({ wv t1159 = rt_add(v630_k, rt_i(2)); wv t1160 = v628_len; rt_eq(t1159, t1160); }), "||") || rt_bool(rt_eq(({ wv t1161 = rt_add(v630_k, rt_i(2)); wv t1162 = v627_cs; rt_idx(t1161, t1162); }), rt_s(&S149)), "||")), "&&")))) {
       v630_k = rt_add(v630_k, rt_i(2));
       continue;
     }
-    v629_out = ({ wv t1158 = v629_out; wv t1159 = rt_idx(v630_k, v627_cs); rt_add(t1158, t1159); });
+    v629_out = ({ wv t1163 = v629_out; wv t1164 = rt_idx(v630_k, v627_cs); rt_add(t1163, t1164); });
     v630_k = rt_add(v630_k, rt_i(1));
   }
   RT_RET(v629_out);
@@ -5907,60 +6418,60 @@ static wv w6_generate(wv p_v631_modules, wv v632_runtime) {
   fr.v640_enums = rt_arr(0, NULL, 1);
   fr.v641_refPositions = rt_arr(0, NULL, 1);
   wv v676_mi = rt_i(0);
-  while (rt_cond(({ wv t1424 = v676_mi; wv t1425 = std_length(fr.v631_modules); rt_lt(t1424, t1425); }))) {
+  while (rt_cond(({ wv t1429 = v676_mi; wv t1430 = std_length(fr.v631_modules); rt_lt(t1429, t1430); }))) {
     wv v793_list = rt_bind(rt_get(&F_stmts, rt_get(&F_program, rt_idx(v676_mi, fr.v631_modules))), 0);
     wv v794_li = rt_i(0);
-    while (rt_cond(({ wv t1426 = v794_li; wv t1427 = std_length(v793_list); rt_lt(t1426, t1427); }))) {
+    while (rt_cond(({ wv t1431 = v794_li; wv t1432 = std_length(v793_list); rt_lt(t1431, t1432); }))) {
       if (rt_cond(rt_eq(rt_get(&F_k, rt_idx(v794_li, v793_list)), rt_s(&S46)))) {
-        (void)({ wv t1428 = rt_idx(v794_li, v793_list); wv t1429 = rt_chk(s642_modId(&fr, v676_mi), "generate"); rt_chk(s655_enumDef(&fr, t1428, t1429), "generate"); });
+        (void)({ wv t1433 = rt_idx(v794_li, v793_list); wv t1434 = rt_chk(s642_modId(&fr, v676_mi), "generate"); rt_chk(s655_enumDef(&fr, t1433, t1434), "generate"); });
       }
       v794_li = rt_add(v794_li, rt_i(1));
     }
     v676_mi = rt_add(v676_mi, rt_i(1));
   }
   v676_mi = rt_i(0);
-  while (rt_cond(({ wv t1430 = v676_mi; wv t1431 = std_length(fr.v631_modules); rt_lt(t1430, t1431); }))) {
+  while (rt_cond(({ wv t1435 = v676_mi; wv t1436 = std_length(fr.v631_modules); rt_lt(t1435, t1436); }))) {
     (void)rt_chk(s643_enter(&fr, v676_mi), "generate");
     (void)rt_chk(s650_stmts(&fr, rt_get(&F_stmts, rt_get(&F_program, rt_idx(v676_mi, fr.v631_modules)))), "generate");
     v676_mi = rt_add(v676_mi, rt_i(1));
   }
-  RT_RET(({ wv t1432 = rt_text(v632_runtime); wv t1433 = rt_text(std_join(fr.v633_out, rt_s(&S2))); rt_cat(5, (wv[]){ rt_s(&S563), t1432, rt_s(&S564), t1433, rt_s(&S565) }); }));
+  RT_RET(({ wv t1437 = rt_text(v632_runtime); wv t1438 = rt_text(std_join(fr.v633_out, rt_s(&S2))); rt_cat(5, (wv[]){ rt_s(&S568), t1437, rt_s(&S569), t1438, rt_s(&S570) }); }));
 }
 
 static wv s642_modId(struct fr139 *up, wv v677_m) {
   rt_enter("modId");
   v677_m = rt_bind(v677_m, 0);
-  RT_RET((rt_cond(({ wv t1160 = v677_m; wv t1161 = rt_sub(std_length(up->v631_modules), rt_i(1)); rt_eq(t1160, t1161); })) ? rt_s(&S13) : rt_cat(1, (wv[]){ rt_text(rt_add(v677_m, rt_i(1))) })));
+  RT_RET((rt_cond(({ wv t1165 = v677_m; wv t1166 = rt_sub(std_length(up->v631_modules), rt_i(1)); rt_eq(t1165, t1166); })) ? rt_s(&S13) : rt_cat(1, (wv[]){ rt_text(rt_add(v677_m, rt_i(1))) })));
 }
 
 static wv s643_enter(struct fr139 *up, wv v678_m) {
   rt_enter("enter");
   v678_m = rt_bind(v678_m, 0);
-  (void)({ wv t1162 = rt_get(&F_file, rt_idx(v678_m, up->v631_modules)); wv t1163 = rt_get(&F_chars, rt_idx(v678_m, up->v631_modules)); rt_chk(w2_setSource(t1162, t1163), "enter"); });
-  wv t1164 = rt_bind(rt_chk(s642_modId(up, v678_m), "enter"), 1);
+  (void)({ wv t1167 = rt_get(&F_file, rt_idx(v678_m, up->v631_modules)); wv t1168 = rt_get(&F_chars, rt_idx(v678_m, up->v631_modules)); rt_chk(w2_setSource(t1167, t1168), "enter"); });
+  wv t1169 = rt_bind(rt_chk(s642_modId(up, v678_m), "enter"), 1);
   (void)rt_def(up->v638_mod, "mod");
-  up->v638_mod = t1164;
-  wv t1165 = rt_arr(0, NULL, 1);
+  up->v638_mod = t1169;
+  wv t1170 = rt_arr(0, NULL, 1);
   (void)rt_def(up->v639_stolen, "stolen");
-  up->v639_stolen = t1165;
-  wv t1166 = rt_arr(0, NULL, 1);
+  up->v639_stolen = t1170;
+  wv t1171 = rt_arr(0, NULL, 1);
   (void)rt_def(up->v640_enums, "enums");
-  up->v640_enums = t1166;
-  wv t1167 = rt_bind(rt_get(&F_refTargets, rt_idx(v678_m, up->v631_modules)), 1);
+  up->v640_enums = t1171;
+  wv t1172 = rt_bind(rt_get(&F_refTargets, rt_idx(v678_m, up->v631_modules)), 1);
   (void)rt_def(up->v641_refPositions, "refPositions");
-  up->v641_refPositions = t1167;
+  up->v641_refPositions = t1172;
   wv v679_list = rt_bind(rt_get(&F_stmts, rt_get(&F_program, rt_idx(v678_m, up->v631_modules))), 0);
   wv v680_k = rt_i(0);
-  while (rt_cond(({ wv t1168 = v680_k; wv t1169 = std_length(v679_list); rt_lt(t1168, t1169); }))) {
+  while (rt_cond(({ wv t1173 = v680_k; wv t1174 = std_length(v679_list); rt_lt(t1173, t1174); }))) {
     if (rt_cond(rt_eq(rt_get(&F_k, rt_idx(v680_k, v679_list)), rt_s(&S46)))) {
-      (void)({ wv t1170 = rt_def(up->v640_enums, "enums"); wv t1171 = rt_get(&F_name, rt_idx(v680_k, v679_list)); std_push(t1170, t1171); });
+      (void)({ wv t1175 = rt_def(up->v640_enums, "enums"); wv t1176 = rt_get(&F_name, rt_idx(v680_k, v679_list)); std_push(t1175, t1176); });
     }
     v680_k = rt_add(v680_k, rt_i(1));
   }
   wv v681_imports = rt_bind(rt_get(&F_imports, rt_idx(v678_m, up->v631_modules)), 0);
   v680_k = rt_i(0);
-  while (rt_cond(({ wv t1172 = v680_k; wv t1173 = std_length(v681_imports); rt_lt(t1172, t1173); }))) {
-    (void)({ wv t1176 = rt_def(up->v639_stolen, "stolen"); wv t1177 = ({ wv t1174 = rt_get(&F_name, rt_get(&F_node, rt_idx(v680_k, v681_imports))); wv t1175 = rt_get(&F_lib, rt_idx(v680_k, v681_imports)); rt_rec(0, 2, K49, (wv[]){ t1174, t1175 }); }); std_push(t1176, t1177); });
+  while (rt_cond(({ wv t1177 = v680_k; wv t1178 = std_length(v681_imports); rt_lt(t1177, t1178); }))) {
+    (void)({ wv t1181 = rt_def(up->v639_stolen, "stolen"); wv t1182 = ({ wv t1179 = rt_get(&F_name, rt_get(&F_node, rt_idx(v680_k, v681_imports))); wv t1180 = rt_get(&F_lib, rt_idx(v680_k, v681_imports)); rt_rec(0, 2, K49, (wv[]){ t1179, t1180 }); }); std_push(t1181, t1182); });
     v680_k = rt_add(v680_k, rt_i(1));
   }
   RT_RET(RT_NULL);
@@ -5969,7 +6480,7 @@ static wv s643_enter(struct fr139 *up, wv v678_m) {
 static wv s644_id(struct fr139 *up, wv v682_name) {
   rt_enter("id");
   v682_name = rt_bind(v682_name, 0);
-  RT_RET(({ wv t1178 = rt_text(rt_def(up->v638_mod, "mod")); wv t1179 = rt_text(v682_name); rt_cat(4, (wv[]){ rt_s(&S478), t1178, rt_s(&S12), t1179 }); }));
+  RT_RET(({ wv t1183 = rt_text(rt_def(up->v638_mod, "mod")); wv t1184 = rt_text(v682_name); rt_cat(4, (wv[]){ rt_s(&S483), t1183, rt_s(&S12), t1184 }); }));
 }
 
 static wv s645_stolenFrom(struct fr139 *up, wv v683_x) {
@@ -5979,9 +6490,9 @@ static wv s645_stolenFrom(struct fr139 *up, wv v683_x) {
     RT_RET(RT_NULL);
   }
   wv v684_k = rt_i(0);
-  while (rt_cond(({ wv t1180 = v684_k; wv t1181 = std_length(rt_def(up->v639_stolen, "stolen")); rt_lt(t1180, t1181); }))) {
-    if (rt_cond(({ wv t1184 = rt_get(&F_name, ({ wv t1182 = v684_k; wv t1183 = rt_def(up->v639_stolen, "stolen"); rt_idx(t1182, t1183); })); wv t1185 = rt_get(&F_name, v683_x); rt_eq(t1184, t1185); }))) {
-      RT_RET(rt_get(&F_lib, ({ wv t1186 = v684_k; wv t1187 = rt_def(up->v639_stolen, "stolen"); rt_idx(t1186, t1187); })));
+  while (rt_cond(({ wv t1185 = v684_k; wv t1186 = std_length(rt_def(up->v639_stolen, "stolen")); rt_lt(t1185, t1186); }))) {
+    if (rt_cond(({ wv t1189 = rt_get(&F_name, ({ wv t1187 = v684_k; wv t1188 = rt_def(up->v639_stolen, "stolen"); rt_idx(t1187, t1188); })); wv t1190 = rt_get(&F_name, v683_x); rt_eq(t1189, t1190); }))) {
+      RT_RET(rt_get(&F_lib, ({ wv t1191 = v684_k; wv t1192 = rt_def(up->v639_stolen, "stolen"); rt_idx(t1191, t1192); })));
     }
     v684_k = rt_add(v684_k, rt_i(1));
   }
@@ -5994,7 +6505,7 @@ static wv s646_exportKind(struct fr139 *up, wv v685_lib, wv v686_name) {
   v686_name = rt_bind(v686_name, 0);
   wv v687_xs = rt_bind(rt_get(&F_exports, rt_idx(v685_lib, up->v631_modules)), 0);
   wv v688_k = rt_i(0);
-  while (rt_cond(({ wv t1188 = rt_get(&F_name, rt_idx(v688_k, v687_xs)); wv t1189 = v686_name; rt_ne(t1188, t1189); }))) {
+  while (rt_cond(({ wv t1193 = rt_get(&F_name, rt_idx(v688_k, v687_xs)); wv t1194 = v686_name; rt_ne(t1193, t1194); }))) {
     v688_k = rt_add(v688_k, rt_i(1));
   }
   RT_RET(rt_get(&F_kind, rt_idx(v688_k, v687_xs)));
@@ -6004,25 +6515,25 @@ static wv s647_enumJs(struct fr139 *up, wv v689_x) {
   rt_enter("enumJs");
   v689_x = rt_bind(v689_x, 0);
   if (rt_cond(rt_eq(rt_get(&F_k, v689_x), rt_s(&S211)))) {
-    RT_RET((rt_cond(({ wv t1190 = rt_def(up->v640_enums, "enums"); wv t1191 = rt_get(&F_name, v689_x); rt_chk(w1_contains(t1190, t1191), "enumJs"); })) ? ({ wv t1192 = rt_text(rt_def(up->v638_mod, "mod")); wv t1193 = rt_text(rt_get(&F_name, v689_x)); rt_cat(4, (wv[]){ rt_s(&S479), t1192, rt_s(&S12), t1193 }); }) : RT_NULL));
+    RT_RET((rt_cond(({ wv t1195 = rt_def(up->v640_enums, "enums"); wv t1196 = rt_get(&F_name, v689_x); rt_chk(w1_contains(t1195, t1196), "enumJs"); })) ? ({ wv t1197 = rt_text(rt_def(up->v638_mod, "mod")); wv t1198 = rt_text(rt_get(&F_name, v689_x)); rt_cat(4, (wv[]){ rt_s(&S484), t1197, rt_s(&S12), t1198 }); }) : RT_NULL));
   }
   if (rt_cond(rt_ne(rt_get(&F_k, v689_x), rt_s(&S189)))) {
     RT_RET(RT_NULL);
   }
   wv v690_lib = rt_bind(rt_chk(s645_stolenFrom(up, rt_get(&F_rec, v689_x)), "enumJs"), 0);
-  RT_RET((rt_cond(rt_b(rt_bool(rt_ne(v690_lib, RT_NULL), "&&") && rt_bool(rt_eq(({ wv t1194 = v690_lib; wv t1195 = rt_get(&F_field, v689_x); rt_chk(s646_exportKind(up, t1194, t1195), "enumJs"); }), rt_s(&S46)), "&&"))) ? ({ wv t1196 = rt_text(rt_chk(s642_modId(up, v690_lib), "enumJs")); wv t1197 = rt_text(rt_get(&F_field, v689_x)); rt_cat(4, (wv[]){ rt_s(&S479), t1196, rt_s(&S12), t1197 }); }) : RT_NULL));
+  RT_RET((rt_cond(rt_b(rt_bool(rt_ne(v690_lib, RT_NULL), "&&") && rt_bool(rt_eq(({ wv t1199 = v690_lib; wv t1200 = rt_get(&F_field, v689_x); rt_chk(s646_exportKind(up, t1199, t1200), "enumJs"); }), rt_s(&S46)), "&&"))) ? ({ wv t1201 = rt_text(rt_chk(s642_modId(up, v690_lib), "enumJs")); wv t1202 = rt_text(rt_get(&F_field, v689_x)); rt_cat(4, (wv[]){ rt_s(&S484), t1201, rt_s(&S12), t1202 }); }) : RT_NULL));
 }
 
 static wv s648_emit(struct fr139 *up, wv v691_line) {
   rt_enter("emit");
   v691_line = rt_bind(v691_line, 0);
-  (void)({ wv t1200 = rt_def(up->v633_out, "out"); wv t1201 = ({ wv t1198 = rt_chk(w6_repeat(rt_s(&S480), rt_def(up->v634_indent, "indent")), "emit"); wv t1199 = v691_line; rt_add(t1198, t1199); }); std_push(t1200, t1201); });
+  (void)({ wv t1205 = rt_def(up->v633_out, "out"); wv t1206 = ({ wv t1203 = rt_chk(w6_repeat(rt_s(&S485), rt_def(up->v634_indent, "indent")), "emit"); wv t1204 = v691_line; rt_add(t1203, t1204); }); std_push(t1205, t1206); });
   RT_RET(RT_NULL);
 }
 
 static wv s649_tmp(struct fr139 *up) {
   rt_enter("tmp");
-  wv v692_name = rt_cat(2, (wv[]){ rt_s(&S481), rt_text(rt_def(up->v635_n, "n")) });
+  wv v692_name = rt_cat(2, (wv[]){ rt_s(&S486), rt_text(rt_def(up->v635_n, "n")) });
   up->v635_n = rt_add(rt_def(up->v635_n, "n"), rt_i(1));
   RT_RET(v692_name);
 }
@@ -6031,7 +6542,7 @@ static wv s650_stmts(struct fr139 *up, wv v693_list) {
   rt_enter("stmts");
   v693_list = rt_bind(v693_list, 0);
   wv v694_k = rt_i(0);
-  while (rt_cond(({ wv t1202 = v694_k; wv t1203 = std_length(v693_list); rt_lt(t1202, t1203); }))) {
+  while (rt_cond(({ wv t1207 = v694_k; wv t1208 = std_length(v693_list); rt_lt(t1207, t1208); }))) {
     (void)rt_chk(s653_stmt(up, rt_idx(v694_k, v693_list)), "stmts");
     v694_k = rt_add(v694_k, rt_i(1));
   }
@@ -6071,24 +6582,24 @@ static wv s653_stmt(struct fr139 *up, wv v697_s) {
   }
   if (rt_cond(rt_eq(v698_kind, rt_s(&S34)))) {
     if (rt_cond(rt_def(up->v637_iife, "iife"))) {
-      (void)rt_chk(w2_abort(rt_get(&F_pos, v697_s), rt_s(&S482)), "stmt");
+      (void)rt_chk(w2_abort(rt_get(&F_pos, v697_s), rt_s(&S487)), "stmt");
     }
-    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S483), rt_text((rt_cond(rt_eq(rt_get(&F_e, v697_s), RT_NULL)) ? rt_s(&S51) : rt_chk(s675_expr(up, rt_get(&F_e, v697_s)), "stmt"))), rt_s(&S14) })), "stmt");
+    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S488), rt_text((rt_cond(rt_eq(rt_get(&F_e, v697_s), RT_NULL)) ? rt_s(&S51) : rt_chk(s675_expr(up, rt_get(&F_e, v697_s)), "stmt"))), rt_s(&S14) })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v698_kind, rt_s(&S57)))) {
-    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S484), rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v697_s)), "stmt")), rt_s(&S485) })), "stmt");
+    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S489), rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v697_s)), "stmt")), rt_s(&S490) })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_b(rt_bool(rt_eq(v698_kind, rt_s(&S42)), "||") || rt_bool(rt_eq(v698_kind, rt_s(&S43)), "||")))) {
     if (rt_cond(rt_eq(rt_def(up->v636_loops, "loops"), rt_i(0)))) {
-      (void)({ wv t1204 = rt_get(&F_pos, v697_s); wv t1205 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text((rt_cond(rt_eq(v698_kind, rt_s(&S42))) ? rt_s(&S42) : rt_s(&S43))), rt_s(&S486) }); rt_chk(w2_abort(t1204, t1205), "stmt"); });
+      (void)({ wv t1209 = rt_get(&F_pos, v697_s); wv t1210 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text((rt_cond(rt_eq(v698_kind, rt_s(&S42))) ? rt_s(&S42) : rt_s(&S43))), rt_s(&S491) }); rt_chk(w2_abort(t1209, t1210), "stmt"); });
     }
-    (void)rt_chk(s648_emit(up, (rt_cond(rt_eq(v698_kind, rt_s(&S42))) ? rt_s(&S487) : rt_s(&S488))), "stmt");
+    (void)rt_chk(s648_emit(up, (rt_cond(rt_eq(v698_kind, rt_s(&S42))) ? rt_s(&S492) : rt_s(&S493))), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v698_kind, rt_s(&S41)))) {
-    (void)rt_chk(s648_emit(up, ({ wv t1206 = rt_text((rt_cond(rt_get(&F_neg, v697_s)) ? rt_s(&S94) : rt_s(&S13))); wv t1207 = rt_text(rt_chk(s675_expr(up, rt_get(&F_cond, v697_s)), "stmt")); rt_cat(5, (wv[]){ rt_s(&S489), t1206, rt_s(&S490), t1207, rt_s(&S491) }); })), "stmt");
+    (void)rt_chk(s648_emit(up, ({ wv t1211 = rt_text((rt_cond(rt_get(&F_neg, v697_s)) ? rt_s(&S94) : rt_s(&S13))); wv t1212 = rt_text(rt_chk(s675_expr(up, rt_get(&F_cond, v697_s)), "stmt")); rt_cat(5, (wv[]){ rt_s(&S494), t1211, rt_s(&S495), t1212, rt_s(&S496) }); })), "stmt");
     up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
     up->v636_loops = rt_add(rt_def(up->v636_loops, "loops"), rt_i(1));
     (void)rt_chk(s651_blockBody(up, rt_get(&F_body, v697_s)), "stmt");
@@ -6098,11 +6609,11 @@ static wv s653_stmt(struct fr139 *up, wv v697_s) {
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v698_kind, rt_s(&S55)))) {
-    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S492), rt_text(rt_get(&F_code, v697_s)), rt_s(&S485) })), "stmt");
+    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S497), rt_text(rt_get(&F_code, v697_s)), rt_s(&S490) })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v698_kind, rt_s(&S54)))) {
-    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S493), rt_text((rt_cond(rt_eq(rt_get(&F_e, v697_s), RT_NULL)) ? rt_s(&S4) : rt_chk(s675_expr(up, rt_get(&F_e, v697_s)), "stmt"))), rt_s(&S485) })), "stmt");
+    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S498), rt_text((rt_cond(rt_eq(rt_get(&F_e, v697_s), RT_NULL)) ? rt_s(&S4) : rt_chk(s675_expr(up, rt_get(&F_e, v697_s)), "stmt"))), rt_s(&S490) })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v698_kind, rt_s(&S176)))) {
@@ -6115,21 +6626,21 @@ static wv s653_stmt(struct fr139 *up, wv v697_s) {
       RT_RET(RT_NULL);
     }
     if (rt_cond(rt_eq(rt_get(&F_k, rt_get(&F_e, v697_s)), rt_s(&S183)))) {
-      (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S492), rt_text(rt_chk(s675_expr(up, rt_get(&F_arg, rt_get(&F_e, v697_s))), "stmt")), rt_s(&S485) })), "stmt");
+      (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S497), rt_text(rt_chk(s675_expr(up, rt_get(&F_arg, rt_get(&F_e, v697_s))), "stmt")), rt_s(&S490) })), "stmt");
       RT_RET(RT_NULL);
     }
     (void)rt_chk(s648_emit(up, rt_cat(2, (wv[]){ rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v697_s)), "stmt")), rt_s(&S14) })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v698_kind, rt_s(&S177)))) {
-    (void)rt_chk(s648_emit(up, ({ wv t1210 = rt_text((rt_cond(rt_b(rt_bool(rt_get(&F_isVar, v697_s), "||") || rt_bool(rt_get(&F_isRef, v697_s), "||"))) ? rt_s(&S494) : rt_s(&S35))); wv t1211 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v697_s)), "stmt")); wv t1212 = rt_text(({ wv t1208 = rt_get(&F_e, v697_s); wv t1209 = rt_chk(w6_modeOf(v697_s), "stmt"); rt_chk(s656_bindRhs(up, t1208, t1209), "stmt"); })); rt_cat(6, (wv[]){ t1210, rt_s(&S0), t1211, rt_s(&S495), t1212, rt_s(&S14) }); })), "stmt");
+    (void)rt_chk(s648_emit(up, ({ wv t1215 = rt_text((rt_cond(rt_b(rt_bool(rt_get(&F_isVar, v697_s), "||") || rt_bool(rt_get(&F_isRef, v697_s), "||"))) ? rt_s(&S499) : rt_s(&S35))); wv t1216 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v697_s)), "stmt")); wv t1217 = rt_text(({ wv t1213 = rt_get(&F_e, v697_s); wv t1214 = rt_chk(w6_modeOf(v697_s), "stmt"); rt_chk(s656_bindRhs(up, t1213, t1214), "stmt"); })); rt_cat(6, (wv[]){ t1215, rt_s(&S0), t1216, rt_s(&S500), t1217, rt_s(&S14) }); })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v698_kind, rt_s(&S38)))) {
     (void)rt_chk(s657_setStmt(up, v697_s), "stmt");
     RT_RET(RT_NULL);
   }
-  rt_panic(rt_cat(2, (wv[]){ rt_s(&S496), rt_text(v698_kind) }));
+  rt_panic(rt_cat(2, (wv[]){ rt_s(&S501), rt_text(v698_kind) }));
   RT_RET(RT_NULL);
 }
 
@@ -6138,41 +6649,41 @@ static wv s654_fnDef(struct fr139 *up, wv v699_s) {
   v699_s = rt_bind(v699_s, 0);
   wv v700_names = rt_arr(0, NULL, 1);
   wv v701_k = rt_i(0);
-  while (rt_cond(({ wv t1213 = v701_k; wv t1214 = std_length(rt_get(&F_params, v699_s)); rt_lt(t1213, t1214); }))) {
-    (void)({ wv t1217 = v700_names; wv t1218 = rt_chk(s644_id(up, rt_get(&F_name, ({ wv t1215 = v701_k; wv t1216 = rt_get(&F_params, v699_s); rt_idx(t1215, t1216); }))), "fnDef"); std_push(t1217, t1218); });
+  while (rt_cond(({ wv t1218 = v701_k; wv t1219 = std_length(rt_get(&F_params, v699_s)); rt_lt(t1218, t1219); }))) {
+    (void)({ wv t1222 = v700_names; wv t1223 = rt_chk(s644_id(up, rt_get(&F_name, ({ wv t1220 = v701_k; wv t1221 = rt_get(&F_params, v699_s); rt_idx(t1220, t1221); }))), "fnDef"); std_push(t1222, t1223); });
     v701_k = rt_add(v701_k, rt_i(1));
   }
-  (void)rt_chk(s648_emit(up, ({ wv t1219 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v699_s)), "fnDef")); wv t1220 = rt_text(std_join(v700_names, rt_s(&S385))); rt_cat(5, (wv[]){ rt_s(&S497), t1219, rt_s(&S97), t1220, rt_s(&S498) }); })), "fnDef");
+  (void)rt_chk(s648_emit(up, ({ wv t1224 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v699_s)), "fnDef")); wv t1225 = rt_text(std_join(v700_names, rt_s(&S390))); rt_cat(5, (wv[]){ rt_s(&S502), t1224, rt_s(&S97), t1225, rt_s(&S503) }); })), "fnDef");
   up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
   v701_k = rt_i(0);
-  while (rt_cond(({ wv t1221 = v701_k; wv t1222 = std_length(rt_get(&F_params, v699_s)); rt_lt(t1221, t1222); }))) {
-    wv v704_param = rt_bind(({ wv t1223 = v701_k; wv t1224 = rt_get(&F_params, v699_s); rt_idx(t1223, t1224); }), 0);
+  while (rt_cond(({ wv t1226 = v701_k; wv t1227 = std_length(rt_get(&F_params, v699_s)); rt_lt(t1226, t1227); }))) {
+    wv v704_param = rt_bind(({ wv t1228 = v701_k; wv t1229 = rt_get(&F_params, v699_s); rt_idx(t1228, t1229); }), 0);
     if (rt_cond(rt_not(rt_get(&F_isRef, v704_param)))) {
-      (void)rt_chk(s648_emit(up, ({ wv t1225 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v704_param)), "fnDef")); wv t1226 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v704_param)), "fnDef")); wv t1227 = rt_text(rt_chk(w6_jsBool(rt_get(&F_isVar, v704_param)), "fnDef")); rt_cat(6, (wv[]){ t1225, rt_s(&S499), t1226, rt_s(&S385), t1227, rt_s(&S485) }); })), "fnDef");
+      (void)rt_chk(s648_emit(up, ({ wv t1230 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v704_param)), "fnDef")); wv t1231 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v704_param)), "fnDef")); wv t1232 = rt_text(rt_chk(w6_jsBool(rt_get(&F_isVar, v704_param)), "fnDef")); rt_cat(6, (wv[]){ t1230, rt_s(&S504), t1231, rt_s(&S390), t1232, rt_s(&S490) }); })), "fnDef");
     }
     v701_k = rt_add(v701_k, rt_i(1));
   }
-  (void)rt_chk(s648_emit(up, rt_s(&S500)), "fnDef");
+  (void)rt_chk(s648_emit(up, rt_s(&S505)), "fnDef");
   up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
   wv v702_savedLoops = rt_bind(rt_def(up->v636_loops, "loops"), 0);
   wv v703_savedIife = rt_bind(rt_def(up->v637_iife, "iife"), 0);
-  wv t1228 = rt_i(0);
+  wv t1233 = rt_i(0);
   (void)rt_def(up->v636_loops, "loops");
-  up->v636_loops = t1228;
-  wv t1229 = rt_b(0);
+  up->v636_loops = t1233;
+  wv t1234 = rt_b(0);
   (void)rt_def(up->v637_iife, "iife");
-  up->v637_iife = t1229;
+  up->v637_iife = t1234;
   (void)rt_chk(s650_stmts(up, rt_get(&F_stmts, rt_get(&F_body, v699_s))), "fnDef");
-  (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S483), rt_text(rt_chk(s652_valueOf(up, rt_get(&F_body, v699_s)), "fnDef")), rt_s(&S14) })), "fnDef");
-  wv t1230 = rt_bind(v702_savedLoops, 1);
+  (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S488), rt_text(rt_chk(s652_valueOf(up, rt_get(&F_body, v699_s)), "fnDef")), rt_s(&S14) })), "fnDef");
+  wv t1235 = rt_bind(v702_savedLoops, 1);
   (void)rt_def(up->v636_loops, "loops");
-  up->v636_loops = t1230;
-  wv t1231 = rt_bind(v703_savedIife, 1);
+  up->v636_loops = t1235;
+  wv t1236 = rt_bind(v703_savedIife, 1);
   (void)rt_def(up->v637_iife, "iife");
-  up->v637_iife = t1231;
+  up->v637_iife = t1236;
   up->v634_indent = rt_sub(rt_def(up->v634_indent, "indent"), rt_i(1));
-  (void)rt_chk(s648_emit(up, rt_s(&S501)), "fnDef");
-  (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S502), rt_text(rt_chk(w1_quote(rt_get(&F_name, v699_s)), "fnDef")), rt_s(&S485) })), "fnDef");
+  (void)rt_chk(s648_emit(up, rt_s(&S506)), "fnDef");
+  (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S507), rt_text(rt_chk(w1_quote(rt_get(&F_name, v699_s)), "fnDef")), rt_s(&S490) })), "fnDef");
   (void)rt_chk(s648_emit(up, rt_s(&S15)), "fnDef");
   up->v634_indent = rt_sub(rt_def(up->v634_indent, "indent"), rt_i(1));
   (void)rt_chk(s648_emit(up, rt_s(&S15)), "fnDef");
@@ -6185,11 +6696,11 @@ static wv s655_enumDef(struct fr139 *up, wv v705_s, wv v706_m) {
   v706_m = rt_bind(v706_m, 0);
   wv v707_names = rt_arr(0, NULL, 1);
   wv v708_k = rt_i(0);
-  while (rt_cond(({ wv t1232 = v708_k; wv t1233 = std_length(rt_get(&F_members, v705_s)); rt_lt(t1232, t1233); }))) {
-    (void)({ wv t1236 = v707_names; wv t1237 = rt_chk(w1_quote(rt_get(&F_name, ({ wv t1234 = v708_k; wv t1235 = rt_get(&F_members, v705_s); rt_idx(t1234, t1235); }))), "enumDef"); std_push(t1236, t1237); });
+  while (rt_cond(({ wv t1237 = v708_k; wv t1238 = std_length(rt_get(&F_members, v705_s)); rt_lt(t1237, t1238); }))) {
+    (void)({ wv t1241 = v707_names; wv t1242 = rt_chk(w1_quote(rt_get(&F_name, ({ wv t1239 = v708_k; wv t1240 = rt_get(&F_members, v705_s); rt_idx(t1239, t1240); }))), "enumDef"); std_push(t1241, t1242); });
     v708_k = rt_add(v708_k, rt_i(1));
   }
-  (void)rt_chk(s648_emit(up, ({ wv t1238 = rt_text(v706_m); wv t1239 = rt_text(rt_get(&F_name, v705_s)); wv t1240 = rt_text(rt_chk(w1_quote(rt_get(&F_name, v705_s)), "enumDef")); wv t1241 = rt_text(std_join(v707_names, rt_s(&S385))); rt_cat(9, (wv[]){ rt_s(&S503), t1238, rt_s(&S12), t1239, rt_s(&S504), t1240, rt_s(&S505), t1241, rt_s(&S506) }); })), "enumDef");
+  (void)rt_chk(s648_emit(up, ({ wv t1243 = rt_text(v706_m); wv t1244 = rt_text(rt_get(&F_name, v705_s)); wv t1245 = rt_text(rt_chk(w1_quote(rt_get(&F_name, v705_s)), "enumDef")); wv t1246 = rt_text(std_join(v707_names, rt_s(&S390))); rt_cat(9, (wv[]){ rt_s(&S508), t1243, rt_s(&S12), t1244, rt_s(&S509), t1245, rt_s(&S510), t1246, rt_s(&S511) }); })), "enumDef");
   RT_RET(RT_NULL);
 }
 
@@ -6200,15 +6711,15 @@ static wv s656_bindRhs(struct fr139 *up, wv v709_e, wv v710_mode) {
   wv v711_mutable = rt_eq(v710_mode, rt_s(&S36));
   if (rt_cond(rt_eq(rt_get(&F_k, v709_e), rt_s(&S186)))) {
     wv v712_items = rt_bind(rt_chk(s674_exprList(up, rt_get(&F_items, v709_e)), "bindRhs"), 0);
-    RT_RET((rt_cond(v711_mutable) ? rt_cat(3, (wv[]){ rt_s(&S98), rt_text(v712_items), rt_s(&S99) }) : rt_cat(3, (wv[]){ rt_s(&S507), rt_text(v712_items), rt_s(&S508) })));
+    RT_RET((rt_cond(v711_mutable) ? rt_cat(3, (wv[]){ rt_s(&S98), rt_text(v712_items), rt_s(&S99) }) : rt_cat(3, (wv[]){ rt_s(&S512), rt_text(v712_items), rt_s(&S513) })));
   }
   if (rt_cond(rt_eq(rt_get(&F_k, v709_e), rt_s(&S187)))) {
     RT_RET(rt_chk(s658_record(up, v709_e, v711_mutable), "bindRhs"));
   }
-  if (rt_cond(rt_b(rt_bool(({ wv t1242 = rt_def(w6_scalarKinds, "scalarKinds"); wv t1243 = rt_get(&F_k, v709_e); rt_chk(w1_contains(t1242, t1243), "bindRhs"); }), "||") || rt_bool(rt_eq(v710_mode, rt_s(&S37)), "||")))) {
+  if (rt_cond(rt_b(rt_bool(({ wv t1247 = rt_def(w6_scalarKinds, "scalarKinds"); wv t1248 = rt_get(&F_k, v709_e); rt_chk(w1_contains(t1247, t1248), "bindRhs"); }), "||") || rt_bool(rt_eq(v710_mode, rt_s(&S37)), "||")))) {
     RT_RET(rt_chk(s675_expr(up, v709_e), "bindRhs"));
   }
-  RT_RET(({ wv t1244 = rt_text(rt_chk(s675_expr(up, v709_e), "bindRhs")); wv t1245 = rt_text(rt_chk(w6_jsBool(v711_mutable), "bindRhs")); rt_cat(5, (wv[]){ rt_s(&S509), t1244, rt_s(&S385), t1245, rt_s(&S16) }); }));
+  RT_RET(({ wv t1249 = rt_text(rt_chk(s675_expr(up, v709_e), "bindRhs")); wv t1250 = rt_text(rt_chk(w6_jsBool(v711_mutable), "bindRhs")); rt_cat(5, (wv[]){ rt_s(&S514), t1249, rt_s(&S390), t1250, rt_s(&S16) }); }));
 }
 
 static wv s657_setStmt(struct fr139 *up, wv v713_s) {
@@ -6216,35 +6727,35 @@ static wv s657_setStmt(struct fr139 *up, wv v713_s) {
   v713_s = rt_bind(v713_s, 0);
   wv v714_t = rt_bind(rt_get(&F_target, v713_s), 0);
   if (rt_cond(rt_eq(rt_get(&F_k, v714_t), rt_s(&S211)))) {
-    wv v716_mode = rt_bind((rt_cond(({ wv t1246 = rt_def(up->v641_refPositions, "refPositions"); wv t1247 = rt_get(&F_pos, v714_t); rt_chk(w1_contains(t1246, t1247), "setStmt"); })) ? rt_s(&S37) : rt_s(&S36)), 0);
+    wv v716_mode = rt_bind((rt_cond(({ wv t1251 = rt_def(up->v641_refPositions, "refPositions"); wv t1252 = rt_get(&F_pos, v714_t); rt_chk(w1_contains(t1251, t1252), "setStmt"); })) ? rt_s(&S37) : rt_s(&S36)), 0);
     if (rt_cond(rt_eq(rt_get(&F_op, v713_s), RT_NULL))) {
-      (void)rt_chk(s648_emit(up, ({ wv t1250 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v714_t)), "setStmt")); wv t1251 = rt_text(({ wv t1248 = rt_get(&F_e, v713_s); wv t1249 = v716_mode; rt_chk(s656_bindRhs(up, t1248, t1249), "setStmt"); })); rt_cat(4, (wv[]){ t1250, rt_s(&S495), t1251, rt_s(&S14) }); })), "setStmt");
+      (void)rt_chk(s648_emit(up, ({ wv t1255 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v714_t)), "setStmt")); wv t1256 = rt_text(({ wv t1253 = rt_get(&F_e, v713_s); wv t1254 = v716_mode; rt_chk(s656_bindRhs(up, t1253, t1254), "setStmt"); })); rt_cat(4, (wv[]){ t1255, rt_s(&S500), t1256, rt_s(&S14) }); })), "setStmt");
       RT_RET(RT_NULL);
     }
     wv v717_v = rt_bind(rt_chk(s675_expr(up, rt_get(&F_e, v713_s)), "setStmt"), 1);
     if (rt_cond(rt_b(rt_bool(rt_ne(rt_get(&F_k, rt_get(&F_e, v713_s)), rt_s(&S138)), "&&") && rt_bool(rt_ne(rt_get(&F_k, rt_get(&F_e, v713_s)), rt_s(&S211)), "&&")))) {
       wv v718_temp = rt_bind(rt_chk(s649_tmp(up), "setStmt"), 0);
-      (void)rt_chk(s648_emit(up, ({ wv t1252 = rt_text(v718_temp); wv t1253 = rt_text(v717_v); rt_cat(5, (wv[]){ rt_s(&S510), t1252, rt_s(&S495), t1253, rt_s(&S14) }); })), "setStmt");
+      (void)rt_chk(s648_emit(up, ({ wv t1257 = rt_text(v718_temp); wv t1258 = rt_text(v717_v); rt_cat(5, (wv[]){ rt_s(&S515), t1257, rt_s(&S500), t1258, rt_s(&S14) }); })), "setStmt");
       v717_v = rt_bind(v718_temp, 1);
     }
-    (void)rt_chk(s648_emit(up, ({ wv t1254 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v714_t)), "setStmt")); wv t1255 = rt_text(rt_chk(w6_binFn(rt_get(&F_op, v713_s)), "setStmt")); wv t1256 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v714_t)), "setStmt")); wv t1257 = rt_text(v717_v); rt_cat(8, (wv[]){ t1254, rt_s(&S511), t1255, rt_s(&S97), t1256, rt_s(&S385), t1257, rt_s(&S485) }); })), "setStmt");
+    (void)rt_chk(s648_emit(up, ({ wv t1259 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v714_t)), "setStmt")); wv t1260 = rt_text(rt_chk(w6_binFn(rt_get(&F_op, v713_s)), "setStmt")); wv t1261 = rt_text(rt_chk(s644_id(up, rt_get(&F_name, v714_t)), "setStmt")); wv t1262 = rt_text(v717_v); rt_cat(8, (wv[]){ t1259, rt_s(&S516), t1260, rt_s(&S97), t1261, rt_s(&S390), t1262, rt_s(&S490) }); })), "setStmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(rt_get(&F_k, v714_t), rt_s(&S189)))) {
-    wv v719_args = ({ wv t1258 = rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v713_s)), "setStmt")); wv t1259 = rt_text(rt_get(&F_field, v714_t)); wv t1260 = rt_text(rt_chk(s675_expr(up, rt_get(&F_rec, v714_t)), "setStmt")); rt_cat(5, (wv[]){ t1258, rt_s(&S512), t1259, rt_s(&S513), t1260 }); });
+    wv v719_args = ({ wv t1263 = rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v713_s)), "setStmt")); wv t1264 = rt_text(rt_get(&F_field, v714_t)); wv t1265 = rt_text(rt_chk(s675_expr(up, rt_get(&F_rec, v714_t)), "setStmt")); rt_cat(5, (wv[]){ t1263, rt_s(&S517), t1264, rt_s(&S518), t1265 }); });
     if (rt_cond(rt_eq(rt_get(&F_op, v713_s), RT_NULL))) {
-      (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S514), rt_text(v719_args), rt_s(&S485) })), "setStmt");
+      (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S519), rt_text(v719_args), rt_s(&S490) })), "setStmt");
       RT_RET(RT_NULL);
     }
-    (void)rt_chk(s648_emit(up, ({ wv t1261 = rt_text(v719_args); wv t1262 = rt_text(rt_chk(w6_binFn(rt_get(&F_op, v713_s)), "setStmt")); rt_cat(5, (wv[]){ rt_s(&S515), t1261, rt_s(&S516), t1262, rt_s(&S485) }); })), "setStmt");
+    (void)rt_chk(s648_emit(up, ({ wv t1266 = rt_text(v719_args); wv t1267 = rt_text(rt_chk(w6_binFn(rt_get(&F_op, v713_s)), "setStmt")); rt_cat(5, (wv[]){ rt_s(&S520), t1266, rt_s(&S521), t1267, rt_s(&S490) }); })), "setStmt");
     RT_RET(RT_NULL);
   }
-  wv v715_args = ({ wv t1263 = rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v713_s)), "setStmt")); wv t1264 = rt_text(rt_chk(s675_expr(up, rt_get(&F_index, v714_t)), "setStmt")); wv t1265 = rt_text(rt_chk(s675_expr(up, rt_get(&F_arr, v714_t)), "setStmt")); rt_cat(5, (wv[]){ t1263, rt_s(&S385), t1264, rt_s(&S385), t1265 }); });
+  wv v715_args = ({ wv t1268 = rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v713_s)), "setStmt")); wv t1269 = rt_text(rt_chk(s675_expr(up, rt_get(&F_index, v714_t)), "setStmt")); wv t1270 = rt_text(rt_chk(s675_expr(up, rt_get(&F_arr, v714_t)), "setStmt")); rt_cat(5, (wv[]){ t1268, rt_s(&S390), t1269, rt_s(&S390), t1270 }); });
   if (rt_cond(rt_eq(rt_get(&F_op, v713_s), RT_NULL))) {
-    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S517), rt_text(v715_args), rt_s(&S485) })), "setStmt");
+    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S522), rt_text(v715_args), rt_s(&S490) })), "setStmt");
     RT_RET(RT_NULL);
   }
-  (void)rt_chk(s648_emit(up, ({ wv t1266 = rt_text(v715_args); wv t1267 = rt_text(rt_chk(w6_binFn(rt_get(&F_op, v713_s)), "setStmt")); rt_cat(5, (wv[]){ rt_s(&S518), t1266, rt_s(&S516), t1267, rt_s(&S485) }); })), "setStmt");
+  (void)rt_chk(s648_emit(up, ({ wv t1271 = rt_text(v715_args); wv t1272 = rt_text(rt_chk(w6_binFn(rt_get(&F_op, v713_s)), "setStmt")); rt_cat(5, (wv[]){ rt_s(&S523), t1271, rt_s(&S521), t1272, rt_s(&S490) }); })), "setStmt");
   RT_RET(RT_NULL);
 }
 
@@ -6254,12 +6765,12 @@ static wv s658_record(struct fr139 *up, wv v720_e, wv v721_mutable) {
   v721_mutable = rt_bind(v721_mutable, 0);
   wv v722_fields = rt_s(&S13);
   wv v723_k = rt_i(0);
-  while (rt_cond(({ wv t1268 = v723_k; wv t1269 = std_length(rt_get(&F_fields, v720_e)); rt_lt(t1268, t1269); }))) {
-    wv v724_field = rt_bind(({ wv t1270 = v723_k; wv t1271 = rt_get(&F_fields, v720_e); rt_idx(t1270, t1271); }), 0);
-    v722_fields = ({ wv t1274 = v722_fields; wv t1275 = ({ wv t1272 = rt_text(rt_get(&F_name, v724_field)); wv t1273 = rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v724_field)), "record")); rt_cat(4, (wv[]){ rt_s(&S519), t1272, rt_s(&S29), t1273 }); }); rt_add(t1274, t1275); });
+  while (rt_cond(({ wv t1273 = v723_k; wv t1274 = std_length(rt_get(&F_fields, v720_e)); rt_lt(t1273, t1274); }))) {
+    wv v724_field = rt_bind(({ wv t1275 = v723_k; wv t1276 = rt_get(&F_fields, v720_e); rt_idx(t1275, t1276); }), 0);
+    v722_fields = ({ wv t1279 = v722_fields; wv t1280 = ({ wv t1277 = rt_text(rt_get(&F_name, v724_field)); wv t1278 = rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v724_field)), "record")); rt_cat(4, (wv[]){ rt_s(&S524), t1277, rt_s(&S29), t1278 }); }); rt_add(t1279, t1280); });
     v723_k = rt_add(v723_k, rt_i(1));
   }
-  RT_RET(({ wv t1276 = rt_text(v722_fields); wv t1277 = rt_text(rt_chk(w6_jsBool(v721_mutable), "record")); rt_cat(5, (wv[]){ rt_s(&S520), t1276, rt_s(&S521), t1277, rt_s(&S16) }); }));
+  RT_RET(({ wv t1281 = rt_text(v722_fields); wv t1282 = rt_text(rt_chk(w6_jsBool(v721_mutable), "record")); rt_cat(5, (wv[]){ rt_s(&S525), t1281, rt_s(&S526), t1282, rt_s(&S16) }); }));
 }
 
 static wv s659_onfailStmt(struct fr139 *up, wv v725_s) {
@@ -6268,40 +6779,40 @@ static wv s659_onfailStmt(struct fr139 *up, wv v725_s) {
   wv v726_call = rt_bind(rt_get(&F_e, v725_s), 0);
   wv v727_args = rt_arr(0, NULL, 1);
   wv v728_k = rt_i(0);
-  while (rt_cond(({ wv t1278 = v728_k; wv t1279 = std_length(rt_get(&F_args, v726_call)); rt_lt(t1278, t1279); }))) {
-    wv v732_a = rt_bind(({ wv t1280 = v728_k; wv t1281 = rt_get(&F_args, v726_call); rt_idx(t1280, t1281); }), 0);
-    if (rt_cond(({ wv t1282 = rt_def(w6_plainKinds, "plainKinds"); wv t1283 = rt_get(&F_k, v732_a); rt_chk(w1_contains(t1282, t1283), "onfailStmt"); }))) {
-      (void)({ wv t1284 = v727_args; wv t1285 = rt_chk(s675_expr(up, v732_a), "onfailStmt"); std_push(t1284, t1285); });
+  while (rt_cond(({ wv t1283 = v728_k; wv t1284 = std_length(rt_get(&F_args, v726_call)); rt_lt(t1283, t1284); }))) {
+    wv v732_a = rt_bind(({ wv t1285 = v728_k; wv t1286 = rt_get(&F_args, v726_call); rt_idx(t1285, t1286); }), 0);
+    if (rt_cond(({ wv t1287 = rt_def(w6_plainKinds, "plainKinds"); wv t1288 = rt_get(&F_k, v732_a); rt_chk(w1_contains(t1287, t1288), "onfailStmt"); }))) {
+      (void)({ wv t1289 = v727_args; wv t1290 = rt_chk(s675_expr(up, v732_a), "onfailStmt"); std_push(t1289, t1290); });
     } else {
       wv v733_temp = rt_bind(rt_chk(s649_tmp(up), "onfailStmt"), 0);
-      (void)rt_chk(s648_emit(up, ({ wv t1286 = rt_text(v733_temp); wv t1287 = rt_text(rt_chk(s675_expr(up, v732_a), "onfailStmt")); rt_cat(5, (wv[]){ rt_s(&S510), t1286, rt_s(&S495), t1287, rt_s(&S14) }); })), "onfailStmt");
+      (void)rt_chk(s648_emit(up, ({ wv t1291 = rt_text(v733_temp); wv t1292 = rt_text(rt_chk(s675_expr(up, v732_a), "onfailStmt")); rt_cat(5, (wv[]){ rt_s(&S515), t1291, rt_s(&S500), t1292, rt_s(&S14) }); })), "onfailStmt");
       (void)std_push(v727_args, v733_temp);
     }
     v728_k = rt_add(v728_k, rt_i(1));
   }
   wv v729_r = rt_bind(rt_chk(s649_tmp(up), "onfailStmt"), 0);
-  wv v730_ev = rt_cat(2, (wv[]){ rt_s(&S522), rt_text(rt_def(up->v635_n, "n")) });
+  wv v730_ev = rt_cat(2, (wv[]){ rt_s(&S527), rt_text(rt_def(up->v635_n, "n")) });
   up->v635_n = rt_add(rt_def(up->v635_n, "n"), rt_i(1));
-  (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S523), rt_text(v729_r), rt_s(&S14) })), "onfailStmt");
-  (void)rt_chk(s648_emit(up, rt_s(&S500)), "onfailStmt");
-  (void)rt_chk(s648_emit(up, ({ wv t1290 = rt_text(v729_r); wv t1291 = rt_text(({ wv t1288 = rt_get(&F_callee, v726_call); wv t1289 = v727_args; rt_chk(s673_callJs(up, t1288, t1289), "onfailStmt"); })); rt_cat(5, (wv[]){ rt_s(&S480), t1290, rt_s(&S495), t1291, rt_s(&S14) }); })), "onfailStmt");
-  (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S524), rt_text(v730_ev), rt_s(&S498) })), "onfailStmt");
+  (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S528), rt_text(v729_r), rt_s(&S14) })), "onfailStmt");
+  (void)rt_chk(s648_emit(up, rt_s(&S505)), "onfailStmt");
+  (void)rt_chk(s648_emit(up, ({ wv t1295 = rt_text(v729_r); wv t1296 = rt_text(({ wv t1293 = rt_get(&F_callee, v726_call); wv t1294 = v727_args; rt_chk(s673_callJs(up, t1293, t1294), "onfailStmt"); })); rt_cat(5, (wv[]){ rt_s(&S485), t1295, rt_s(&S500), t1296, rt_s(&S14) }); })), "onfailStmt");
+  (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S529), rt_text(v730_ev), rt_s(&S503) })), "onfailStmt");
   up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
-  (void)rt_chk(s648_emit(up, ({ wv t1292 = rt_text(v730_ev); wv t1293 = rt_text(v730_ev); rt_cat(5, (wv[]){ rt_s(&S525), t1292, rt_s(&S526), t1293, rt_s(&S14) }); })), "onfailStmt");
+  (void)rt_chk(s648_emit(up, ({ wv t1297 = rt_text(v730_ev); wv t1298 = rt_text(v730_ev); rt_cat(5, (wv[]){ rt_s(&S530), t1297, rt_s(&S531), t1298, rt_s(&S14) }); })), "onfailStmt");
   if (rt_cond(rt_ne(rt_get(&F_param, rt_get(&F_handler, v725_s)), RT_NULL))) {
-    (void)rt_chk(s648_emit(up, ({ wv t1294 = rt_text(rt_chk(s644_id(up, rt_get(&F_param, rt_get(&F_handler, v725_s))), "onfailStmt")); wv t1295 = rt_text(v730_ev); rt_cat(5, (wv[]){ rt_s(&S510), t1294, rt_s(&S495), t1295, rt_s(&S527) }); })), "onfailStmt");
+    (void)rt_chk(s648_emit(up, ({ wv t1299 = rt_text(rt_chk(s644_id(up, rt_get(&F_param, rt_get(&F_handler, v725_s))), "onfailStmt")); wv t1300 = rt_text(v730_ev); rt_cat(5, (wv[]){ rt_s(&S515), t1299, rt_s(&S500), t1300, rt_s(&S532) }); })), "onfailStmt");
   }
   (void)rt_chk(s648_emit(up, rt_s(&S100)), "onfailStmt");
   up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
   (void)rt_chk(s650_stmts(up, rt_get(&F_stmts, rt_get(&F_body, rt_get(&F_handler, v725_s)))), "onfailStmt");
-  (void)rt_chk(s648_emit(up, ({ wv t1296 = rt_text(v729_r); wv t1297 = rt_text(rt_chk(s652_valueOf(up, rt_get(&F_body, rt_get(&F_handler, v725_s))), "onfailStmt")); rt_cat(4, (wv[]){ t1296, rt_s(&S495), t1297, rt_s(&S14) }); })), "onfailStmt");
+  (void)rt_chk(s648_emit(up, ({ wv t1301 = rt_text(v729_r); wv t1302 = rt_text(rt_chk(s652_valueOf(up, rt_get(&F_body, rt_get(&F_handler, v725_s))), "onfailStmt")); rt_cat(4, (wv[]){ t1301, rt_s(&S500), t1302, rt_s(&S14) }); })), "onfailStmt");
   up->v634_indent = rt_sub(rt_def(up->v634_indent, "indent"), rt_i(1));
   (void)rt_chk(s648_emit(up, rt_s(&S15)), "onfailStmt");
   up->v634_indent = rt_sub(rt_def(up->v634_indent, "indent"), rt_i(1));
   (void)rt_chk(s648_emit(up, rt_s(&S15)), "onfailStmt");
   wv v731_rest = rt_bind(v725_s, 1);
   rt_set_mem(RT_NULL, &F_handler, v731_rest);
-  ({ wv t1300 = ({ wv t1298 = v729_r; wv t1299 = rt_get(&F_pos, v725_s); rt_rec(0, 4, K50, (wv[]){ rt_s(&S528), t1298, t1299, rt_b(0) }); }); wv t1301 = v731_rest; rt_set_mem(t1300, &F_e, t1301); });
+  ({ wv t1305 = ({ wv t1303 = v729_r; wv t1304 = rt_get(&F_pos, v725_s); rt_rec(0, 4, K50, (wv[]){ rt_s(&S533), t1303, t1304, rt_b(0) }); }); wv t1306 = v731_rest; rt_set_mem(t1305, &F_e, t1306); });
   (void)rt_chk(s653_stmt(up, v731_rest), "onfailStmt");
   RT_RET(RT_NULL);
 }
@@ -6310,16 +6821,16 @@ static wv s660_chainStmt(struct fr139 *up, wv v734_e) {
   rt_enter("chainStmt");
   v734_e = rt_bind(v734_e, 0);
   wv v735_k = rt_i(0);
-  while (rt_cond(({ wv t1302 = v735_k; wv t1303 = std_length(rt_get(&F_branches, v734_e)); rt_lt(t1302, t1303); }))) {
-    wv v736_b = rt_bind(({ wv t1304 = v735_k; wv t1305 = rt_get(&F_branches, v734_e); rt_idx(t1304, t1305); }), 0);
-    (void)rt_chk(s648_emit(up, ({ wv t1306 = rt_text((rt_cond(rt_gt(v735_k, rt_i(0))) ? rt_s(&S529) : rt_s(&S13))); wv t1307 = rt_text(rt_chk(s661_test(up, v736_b), "chainStmt")); rt_cat(4, (wv[]){ t1306, rt_s(&S530), t1307, rt_s(&S498) }); })), "chainStmt");
+  while (rt_cond(({ wv t1307 = v735_k; wv t1308 = std_length(rt_get(&F_branches, v734_e)); rt_lt(t1307, t1308); }))) {
+    wv v736_b = rt_bind(({ wv t1309 = v735_k; wv t1310 = rt_get(&F_branches, v734_e); rt_idx(t1309, t1310); }), 0);
+    (void)rt_chk(s648_emit(up, ({ wv t1311 = rt_text((rt_cond(rt_gt(v735_k, rt_i(0))) ? rt_s(&S534) : rt_s(&S13))); wv t1312 = rt_text(rt_chk(s661_test(up, v736_b), "chainStmt")); rt_cat(4, (wv[]){ t1311, rt_s(&S535), t1312, rt_s(&S503) }); })), "chainStmt");
     up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
     (void)rt_chk(s651_blockBody(up, rt_get(&F_body, v736_b)), "chainStmt");
     up->v634_indent = rt_sub(rt_def(up->v634_indent, "indent"), rt_i(1));
     v735_k = rt_add(v735_k, rt_i(1));
   }
   if (rt_cond(rt_ne(rt_get(&F_els, v734_e), RT_NULL))) {
-    (void)rt_chk(s648_emit(up, rt_s(&S531)), "chainStmt");
+    (void)rt_chk(s648_emit(up, rt_s(&S536)), "chainStmt");
     up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
     (void)rt_chk(s651_blockBody(up, rt_get(&F_els, v734_e)), "chainStmt");
     up->v634_indent = rt_sub(rt_def(up->v634_indent, "indent"), rt_i(1));
@@ -6331,7 +6842,7 @@ static wv s660_chainStmt(struct fr139 *up, wv v734_e) {
 static wv s661_test(struct fr139 *up, wv v737_b) {
   rt_enter("test");
   v737_b = rt_bind(v737_b, 0);
-  RT_RET(({ wv t1308 = rt_text((rt_cond(rt_get(&F_neg, v737_b)) ? rt_s(&S94) : rt_s(&S13))); wv t1309 = rt_text(rt_chk(s675_expr(up, rt_get(&F_cond, v737_b)), "test")); rt_cat(4, (wv[]){ t1308, rt_s(&S490), t1309, rt_s(&S16) }); }));
+  RT_RET(({ wv t1313 = rt_text((rt_cond(rt_get(&F_neg, v737_b)) ? rt_s(&S94) : rt_s(&S13))); wv t1314 = rt_text(rt_chk(s675_expr(up, rt_get(&F_cond, v737_b)), "test")); rt_cat(4, (wv[]){ t1313, rt_s(&S495), t1314, rt_s(&S16) }); }));
 }
 
 static wv s662_branchCount(struct fr139 *up, wv v738_e) {
@@ -6344,7 +6855,7 @@ static wv s663_branchBody(struct fr139 *up, wv v739_e, wv v740_i) {
   rt_enter("branchBody");
   v739_e = rt_bind(v739_e, 0);
   v740_i = rt_bind(v740_i, 0);
-  RT_RET((rt_cond(rt_eq(rt_get(&F_k, v739_e), rt_s(&S184))) ? rt_get(&F_body, ({ wv t1310 = v740_i; wv t1311 = rt_get(&F_branches, v739_e); rt_idx(t1310, t1311); })) : rt_get(&F_body, ({ wv t1312 = v740_i; wv t1313 = rt_get(&F_cases, v739_e); rt_idx(t1312, t1313); }))));
+  RT_RET((rt_cond(rt_eq(rt_get(&F_k, v739_e), rt_s(&S184))) ? rt_get(&F_body, ({ wv t1315 = v740_i; wv t1316 = rt_get(&F_branches, v739_e); rt_idx(t1315, t1316); })) : rt_get(&F_body, ({ wv t1317 = v740_i; wv t1318 = rt_get(&F_cases, v739_e); rt_idx(t1317, t1318); }))));
 }
 
 static wv s664_branchTest(struct fr139 *up, wv v741_e, wv v742_t, wv v743_i) {
@@ -6352,18 +6863,18 @@ static wv s664_branchTest(struct fr139 *up, wv v741_e, wv v742_t, wv v743_i) {
   v741_e = rt_bind(v741_e, 0);
   v742_t = rt_bind(v742_t, 0);
   v743_i = rt_bind(v743_i, 0);
-  RT_RET((rt_cond(rt_eq(rt_get(&F_k, v741_e), rt_s(&S184))) ? rt_chk(s661_test(up, ({ wv t1314 = v743_i; wv t1315 = rt_get(&F_branches, v741_e); rt_idx(t1314, t1315); })), "branchTest") : ({ wv t1318 = v742_t; wv t1319 = ({ wv t1316 = v743_i; wv t1317 = rt_get(&F_cases, v741_e); rt_idx(t1316, t1317); }); rt_chk(s669_caseTest(up, t1318, t1319), "branchTest"); })));
+  RT_RET((rt_cond(rt_eq(rt_get(&F_k, v741_e), rt_s(&S184))) ? rt_chk(s661_test(up, ({ wv t1319 = v743_i; wv t1320 = rt_get(&F_branches, v741_e); rt_idx(t1319, t1320); })), "branchTest") : ({ wv t1323 = v742_t; wv t1324 = ({ wv t1321 = v743_i; wv t1322 = rt_get(&F_cases, v741_e); rt_idx(t1321, t1322); }); rt_chk(s669_caseTest(up, t1323, t1324), "branchTest"); })));
 }
 
 static wv s665_isPlain(struct fr139 *up, wv v744_e) {
   rt_enter("isPlain");
   v744_e = rt_bind(v744_e, 0);
   wv v745_k = rt_i(0);
-  while (rt_cond(({ wv t1320 = v745_k; wv t1321 = rt_chk(s662_branchCount(up, v744_e), "isPlain"); rt_le(t1320, t1321); }))) {
-    wv v746_b = rt_bind((rt_cond(({ wv t1322 = v745_k; wv t1323 = rt_chk(s662_branchCount(up, v744_e), "isPlain"); rt_lt(t1322, t1323); })) ? rt_chk(s663_branchBody(up, v744_e, v745_k), "isPlain") : rt_get(&F_els, v744_e)), 0);
+  while (rt_cond(({ wv t1325 = v745_k; wv t1326 = rt_chk(s662_branchCount(up, v744_e), "isPlain"); rt_le(t1325, t1326); }))) {
+    wv v746_b = rt_bind((rt_cond(({ wv t1327 = v745_k; wv t1328 = rt_chk(s662_branchCount(up, v744_e), "isPlain"); rt_lt(t1327, t1328); })) ? rt_chk(s663_branchBody(up, v744_e, v745_k), "isPlain") : rt_get(&F_els, v744_e)), 0);
     wv v747_j = rt_i(0);
-    while (rt_cond(({ wv t1324 = v747_j; wv t1325 = std_length(rt_get(&F_stmts, v746_b)); rt_lt(t1324, t1325); }))) {
-      if (rt_cond(rt_ne(rt_get(&F_k, ({ wv t1326 = v747_j; wv t1327 = rt_get(&F_stmts, v746_b); rt_idx(t1326, t1327); })), rt_s(&S200)))) {
+    while (rt_cond(({ wv t1329 = v747_j; wv t1330 = std_length(rt_get(&F_stmts, v746_b)); rt_lt(t1329, t1330); }))) {
+      if (rt_cond(rt_ne(rt_get(&F_k, ({ wv t1331 = v747_j; wv t1332 = rt_get(&F_stmts, v746_b); rt_idx(t1331, t1332); })), rt_s(&S200)))) {
         RT_RET(rt_b(0));
       }
       v747_j = rt_add(v747_j, rt_i(1));
@@ -6380,7 +6891,7 @@ static wv s666_ternaryChain(struct fr139 *up, wv v748_e, wv v749_t) {
   wv v750_js = rt_bind(rt_chk(s652_valueOf(up, rt_get(&F_els, v748_e)), "ternaryChain"), 1);
   wv v751_k = rt_sub(rt_chk(s662_branchCount(up, v748_e), "ternaryChain"), rt_i(1));
   while (rt_cond(rt_ge(v751_k, rt_i(0)))) {
-    v750_js = ({ wv t1328 = rt_text(rt_chk(s664_branchTest(up, v748_e, v749_t, v751_k), "ternaryChain")); wv t1329 = rt_text(rt_chk(s652_valueOf(up, rt_chk(s663_branchBody(up, v748_e, v751_k), "ternaryChain")), "ternaryChain")); wv t1330 = rt_text(v750_js); rt_cat(7, (wv[]){ rt_s(&S97), t1328, rt_s(&S532), t1329, rt_s(&S533), t1330, rt_s(&S16) }); });
+    v750_js = ({ wv t1333 = rt_text(rt_chk(s664_branchTest(up, v748_e, v749_t, v751_k), "ternaryChain")); wv t1334 = rt_text(rt_chk(s652_valueOf(up, rt_chk(s663_branchBody(up, v748_e, v751_k), "ternaryChain")), "ternaryChain")); wv t1335 = rt_text(v750_js); rt_cat(7, (wv[]){ rt_s(&S97), t1333, rt_s(&S537), t1334, rt_s(&S538), t1335, rt_s(&S16) }); });
     v751_k = rt_sub(v751_k, rt_i(1));
   }
   RT_RET(v750_js);
@@ -6394,44 +6905,44 @@ static wv s667_branchFunction(struct fr139 *up, wv v752_e, wv v753_t) {
   wv v755_savedIndent = rt_bind(rt_def(up->v634_indent, "indent"), 0);
   wv v756_savedLoops = rt_bind(rt_def(up->v636_loops, "loops"), 0);
   wv v757_savedIife = rt_bind(rt_def(up->v637_iife, "iife"), 0);
-  wv t1331 = rt_add(v755_savedIndent, rt_i(1));
+  wv t1336 = rt_add(v755_savedIndent, rt_i(1));
   (void)rt_def(up->v634_indent, "indent");
-  up->v634_indent = t1331;
-  wv t1332 = rt_i(0);
+  up->v634_indent = t1336;
+  wv t1337 = rt_i(0);
   (void)rt_def(up->v636_loops, "loops");
-  up->v636_loops = t1332;
-  wv t1333 = rt_b(1);
+  up->v636_loops = t1337;
+  wv t1338 = rt_b(1);
   (void)rt_def(up->v637_iife, "iife");
-  up->v637_iife = t1333;
+  up->v637_iife = t1338;
   wv v758_k = rt_i(0);
-  while (rt_cond(({ wv t1334 = v758_k; wv t1335 = rt_chk(s662_branchCount(up, v752_e), "branchFunction"); rt_lt(t1334, t1335); }))) {
+  while (rt_cond(({ wv t1339 = v758_k; wv t1340 = rt_chk(s662_branchCount(up, v752_e), "branchFunction"); rt_lt(t1339, t1340); }))) {
     wv v760_b = rt_bind(rt_chk(s663_branchBody(up, v752_e, v758_k), "branchFunction"), 0);
-    (void)rt_chk(s648_emit(up, ({ wv t1336 = rt_text((rt_cond(rt_gt(v758_k, rt_i(0))) ? rt_s(&S529) : rt_s(&S13))); wv t1337 = rt_text(rt_chk(s664_branchTest(up, v752_e, v753_t, v758_k), "branchFunction")); rt_cat(4, (wv[]){ t1336, rt_s(&S530), t1337, rt_s(&S498) }); })), "branchFunction");
+    (void)rt_chk(s648_emit(up, ({ wv t1341 = rt_text((rt_cond(rt_gt(v758_k, rt_i(0))) ? rt_s(&S534) : rt_s(&S13))); wv t1342 = rt_text(rt_chk(s664_branchTest(up, v752_e, v753_t, v758_k), "branchFunction")); rt_cat(4, (wv[]){ t1341, rt_s(&S535), t1342, rt_s(&S503) }); })), "branchFunction");
     up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
     (void)rt_chk(s650_stmts(up, rt_get(&F_stmts, v760_b)), "branchFunction");
-    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S483), rt_text(rt_chk(s652_valueOf(up, v760_b), "branchFunction")), rt_s(&S14) })), "branchFunction");
+    (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S488), rt_text(rt_chk(s652_valueOf(up, v760_b), "branchFunction")), rt_s(&S14) })), "branchFunction");
     up->v634_indent = rt_sub(rt_def(up->v634_indent, "indent"), rt_i(1));
     v758_k = rt_add(v758_k, rt_i(1));
   }
-  (void)rt_chk(s648_emit(up, rt_s(&S531)), "branchFunction");
+  (void)rt_chk(s648_emit(up, rt_s(&S536)), "branchFunction");
   up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
   (void)rt_chk(s650_stmts(up, rt_get(&F_stmts, rt_get(&F_els, v752_e))), "branchFunction");
-  (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S483), rt_text(rt_chk(s652_valueOf(up, rt_get(&F_els, v752_e)), "branchFunction")), rt_s(&S14) })), "branchFunction");
+  (void)rt_chk(s648_emit(up, rt_cat(3, (wv[]){ rt_s(&S488), rt_text(rt_chk(s652_valueOf(up, rt_get(&F_els, v752_e)), "branchFunction")), rt_s(&S14) })), "branchFunction");
   up->v634_indent = rt_sub(rt_def(up->v634_indent, "indent"), rt_i(1));
   (void)rt_chk(s648_emit(up, rt_s(&S15)), "branchFunction");
-  wv v759_body = rt_bind(std_join(({ wv t1338 = rt_def(up->v633_out, "out"); wv t1339 = v754_start; wv t1340 = std_length(rt_def(up->v633_out, "out")); std_slice(t1338, t1339, t1340); }), rt_s(&S2)), 0);
-  while (rt_cond(({ wv t1341 = std_length(rt_def(up->v633_out, "out")); wv t1342 = v754_start; rt_gt(t1341, t1342); }))) {
+  wv v759_body = rt_bind(std_join(({ wv t1343 = rt_def(up->v633_out, "out"); wv t1344 = v754_start; wv t1345 = std_length(rt_def(up->v633_out, "out")); std_slice(t1343, t1344, t1345); }), rt_s(&S2)), 0);
+  while (rt_cond(({ wv t1346 = std_length(rt_def(up->v633_out, "out")); wv t1347 = v754_start; rt_gt(t1346, t1347); }))) {
     (void)std_pop(rt_def(up->v633_out, "out"));
   }
-  wv t1343 = rt_bind(v755_savedIndent, 1);
+  wv t1348 = rt_bind(v755_savedIndent, 1);
   (void)rt_def(up->v634_indent, "indent");
-  up->v634_indent = t1343;
-  wv t1344 = rt_bind(v756_savedLoops, 1);
+  up->v634_indent = t1348;
+  wv t1349 = rt_bind(v756_savedLoops, 1);
   (void)rt_def(up->v636_loops, "loops");
-  up->v636_loops = t1344;
-  wv t1345 = rt_bind(v757_savedIife, 1);
+  up->v636_loops = t1349;
+  wv t1350 = rt_bind(v757_savedIife, 1);
   (void)rt_def(up->v637_iife, "iife");
-  up->v637_iife = t1345;
+  up->v637_iife = t1350;
   RT_RET(v759_body);
 }
 
@@ -6442,7 +6953,7 @@ static wv s668_chainExpr(struct fr139 *up, wv v761_e) {
     RT_RET(rt_chk(s666_ternaryChain(up, v761_e, RT_NULL), "chainExpr"));
   }
   wv v762_body = rt_bind(rt_chk(s667_branchFunction(up, v761_e, RT_NULL), "chainExpr"), 0);
-  RT_RET(({ wv t1346 = rt_text(v762_body); wv t1347 = rt_text(rt_chk(w6_repeat(rt_s(&S480), rt_def(up->v634_indent, "indent")), "chainExpr")); rt_cat(5, (wv[]){ rt_s(&S534), t1346, rt_s(&S2), t1347, rt_s(&S535) }); }));
+  RT_RET(({ wv t1351 = rt_text(v762_body); wv t1352 = rt_text(rt_chk(w6_repeat(rt_s(&S485), rt_def(up->v634_indent, "indent")), "chainExpr")); rt_cat(5, (wv[]){ rt_s(&S539), t1351, rt_s(&S2), t1352, rt_s(&S540) }); }));
 }
 
 static wv s669_caseTest(struct fr139 *up, wv v763_t, wv v764_a) {
@@ -6451,11 +6962,11 @@ static wv s669_caseTest(struct fr139 *up, wv v763_t, wv v764_a) {
   v764_a = rt_bind(v764_a, 0);
   wv v765_tests = rt_arr(0, NULL, 1);
   wv v766_k = rt_i(0);
-  while (rt_cond(({ wv t1348 = v766_k; wv t1349 = std_length(rt_get(&F_values, v764_a)); rt_lt(t1348, t1349); }))) {
-    (void)({ wv t1354 = v765_tests; wv t1355 = ({ wv t1352 = rt_text(v763_t); wv t1353 = rt_text(rt_chk(s675_expr(up, ({ wv t1350 = v766_k; wv t1351 = rt_get(&F_values, v764_a); rt_idx(t1350, t1351); })), "caseTest")); rt_cat(5, (wv[]){ rt_s(&S536), t1352, rt_s(&S385), t1353, rt_s(&S16) }); }); std_push(t1354, t1355); });
+  while (rt_cond(({ wv t1353 = v766_k; wv t1354 = std_length(rt_get(&F_values, v764_a)); rt_lt(t1353, t1354); }))) {
+    (void)({ wv t1359 = v765_tests; wv t1360 = ({ wv t1357 = rt_text(v763_t); wv t1358 = rt_text(rt_chk(s675_expr(up, ({ wv t1355 = v766_k; wv t1356 = rt_get(&F_values, v764_a); rt_idx(t1355, t1356); })), "caseTest")); rt_cat(5, (wv[]){ rt_s(&S541), t1357, rt_s(&S390), t1358, rt_s(&S16) }); }); std_push(t1359, t1360); });
     v766_k = rt_add(v766_k, rt_i(1));
   }
-  RT_RET(std_join(v765_tests, rt_s(&S537)));
+  RT_RET(std_join(v765_tests, rt_s(&S542)));
 }
 
 static wv s670_matchElse(struct fr139 *up, wv v767_e, wv v768_t) {
@@ -6465,25 +6976,25 @@ static wv s670_matchElse(struct fr139 *up, wv v767_e, wv v768_t) {
   if (rt_cond(rt_b(rt_bool(rt_ne(rt_get(&F_els, v767_e), RT_NULL), "||") || rt_bool(rt_ne(rt_get(&F_k, rt_idx(rt_i(0), rt_get(&F_values, rt_idx(rt_i(0), rt_get(&F_cases, v767_e))))), rt_s(&S189)), "||")))) {
     RT_RET(rt_get(&F_els, v767_e));
   }
-  RT_RET(({ wv t1356 = rt_arr(0, NULL, 0); wv t1357 = rt_rec(0, 4, K50, (wv[]){ rt_s(&S528), rt_cat(3, (wv[]){ rt_s(&S538), rt_text(v768_t), rt_s(&S16) }), RT_NULL, rt_b(0) }); rt_rec(0, 3, K21, (wv[]){ t1356, t1357, RT_NULL }); }));
+  RT_RET(({ wv t1361 = rt_arr(0, NULL, 0); wv t1362 = rt_rec(0, 4, K50, (wv[]){ rt_s(&S533), rt_cat(3, (wv[]){ rt_s(&S543), rt_text(v768_t), rt_s(&S16) }), RT_NULL, rt_b(0) }); rt_rec(0, 3, K21, (wv[]){ t1361, t1362, RT_NULL }); }));
 }
 
 static wv s671_matchStmt(struct fr139 *up, wv v769_e) {
   rt_enter("matchStmt");
   v769_e = rt_bind(v769_e, 0);
   wv v770_t = rt_bind(rt_chk(s649_tmp(up), "matchStmt"), 0);
-  (void)rt_chk(s648_emit(up, ({ wv t1358 = rt_text(v770_t); wv t1359 = rt_text(rt_chk(s675_expr(up, rt_get(&F_subject, v769_e)), "matchStmt")); rt_cat(5, (wv[]){ rt_s(&S510), t1358, rt_s(&S495), t1359, rt_s(&S14) }); })), "matchStmt");
+  (void)rt_chk(s648_emit(up, ({ wv t1363 = rt_text(v770_t); wv t1364 = rt_text(rt_chk(s675_expr(up, rt_get(&F_subject, v769_e)), "matchStmt")); rt_cat(5, (wv[]){ rt_s(&S515), t1363, rt_s(&S500), t1364, rt_s(&S14) }); })), "matchStmt");
   wv v771_k = rt_i(0);
-  while (rt_cond(({ wv t1360 = v771_k; wv t1361 = std_length(rt_get(&F_cases, v769_e)); rt_lt(t1360, t1361); }))) {
-    (void)rt_chk(s648_emit(up, ({ wv t1366 = rt_text((rt_cond(rt_gt(v771_k, rt_i(0))) ? rt_s(&S529) : rt_s(&S13))); wv t1367 = rt_text(({ wv t1364 = v770_t; wv t1365 = ({ wv t1362 = v771_k; wv t1363 = rt_get(&F_cases, v769_e); rt_idx(t1362, t1363); }); rt_chk(s669_caseTest(up, t1364, t1365), "matchStmt"); })); rt_cat(4, (wv[]){ t1366, rt_s(&S530), t1367, rt_s(&S498) }); })), "matchStmt");
+  while (rt_cond(({ wv t1365 = v771_k; wv t1366 = std_length(rt_get(&F_cases, v769_e)); rt_lt(t1365, t1366); }))) {
+    (void)rt_chk(s648_emit(up, ({ wv t1371 = rt_text((rt_cond(rt_gt(v771_k, rt_i(0))) ? rt_s(&S534) : rt_s(&S13))); wv t1372 = rt_text(({ wv t1369 = v770_t; wv t1370 = ({ wv t1367 = v771_k; wv t1368 = rt_get(&F_cases, v769_e); rt_idx(t1367, t1368); }); rt_chk(s669_caseTest(up, t1369, t1370), "matchStmt"); })); rt_cat(4, (wv[]){ t1371, rt_s(&S535), t1372, rt_s(&S503) }); })), "matchStmt");
     up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
-    (void)rt_chk(s651_blockBody(up, rt_get(&F_body, ({ wv t1368 = v771_k; wv t1369 = rt_get(&F_cases, v769_e); rt_idx(t1368, t1369); }))), "matchStmt");
+    (void)rt_chk(s651_blockBody(up, rt_get(&F_body, ({ wv t1373 = v771_k; wv t1374 = rt_get(&F_cases, v769_e); rt_idx(t1373, t1374); }))), "matchStmt");
     up->v634_indent = rt_sub(rt_def(up->v634_indent, "indent"), rt_i(1));
     v771_k = rt_add(v771_k, rt_i(1));
   }
   wv v772_els = rt_bind(rt_chk(s670_matchElse(up, v769_e, v770_t), "matchStmt"), 0);
   if (rt_cond(rt_ne(v772_els, RT_NULL))) {
-    (void)rt_chk(s648_emit(up, rt_s(&S531)), "matchStmt");
+    (void)rt_chk(s648_emit(up, rt_s(&S536)), "matchStmt");
     up->v634_indent = rt_add(rt_def(up->v634_indent, "indent"), rt_i(1));
     (void)rt_chk(s651_blockBody(up, v772_els), "matchStmt");
     up->v634_indent = rt_sub(rt_def(up->v634_indent, "indent"), rt_i(1));
@@ -6498,20 +7009,20 @@ static wv s672_matchExpr(struct fr139 *up, wv v773_e) {
   wv v774_t = rt_bind(rt_chk(s649_tmp(up), "matchExpr"), 0);
   wv v775_subject = rt_bind(rt_chk(s675_expr(up, rt_get(&F_subject, v773_e)), "matchExpr"), 0);
   wv v776_withElse = rt_bind(v773_e, 1);
-  ({ wv t1370 = rt_chk(s670_matchElse(up, v773_e, v774_t), "matchExpr"); wv t1371 = v776_withElse; rt_set_mem(t1370, &F_els, t1371); });
+  ({ wv t1375 = rt_chk(s670_matchElse(up, v773_e, v774_t), "matchExpr"); wv t1376 = v776_withElse; rt_set_mem(t1375, &F_els, t1376); });
   if (rt_cond(rt_chk(s665_isPlain(up, v776_withElse), "matchExpr"))) {
-    RT_RET(({ wv t1372 = rt_text(v774_t); wv t1373 = rt_text(rt_chk(s666_ternaryChain(up, v776_withElse, v774_t), "matchExpr")); wv t1374 = rt_text(v775_subject); rt_cat(7, (wv[]){ rt_s(&S539), t1372, rt_s(&S540), t1373, rt_s(&S541), t1374, rt_s(&S16) }); }));
+    RT_RET(({ wv t1377 = rt_text(v774_t); wv t1378 = rt_text(rt_chk(s666_ternaryChain(up, v776_withElse, v774_t), "matchExpr")); wv t1379 = rt_text(v775_subject); rt_cat(7, (wv[]){ rt_s(&S544), t1377, rt_s(&S545), t1378, rt_s(&S546), t1379, rt_s(&S16) }); }));
   }
   wv v777_body = rt_bind(rt_chk(s667_branchFunction(up, v776_withElse, v774_t), "matchExpr"), 0);
-  RT_RET(({ wv t1375 = rt_text(v774_t); wv t1376 = rt_text(v777_body); wv t1377 = rt_text(rt_chk(w6_repeat(rt_s(&S480), rt_def(up->v634_indent, "indent")), "matchExpr")); wv t1378 = rt_text(v775_subject); rt_cat(9, (wv[]){ rt_s(&S539), t1375, rt_s(&S542), t1376, rt_s(&S2), t1377, rt_s(&S543), t1378, rt_s(&S16) }); }));
+  RT_RET(({ wv t1380 = rt_text(v774_t); wv t1381 = rt_text(v777_body); wv t1382 = rt_text(rt_chk(w6_repeat(rt_s(&S485), rt_def(up->v634_indent, "indent")), "matchExpr")); wv t1383 = rt_text(v775_subject); rt_cat(9, (wv[]){ rt_s(&S544), t1380, rt_s(&S547), t1381, rt_s(&S2), t1382, rt_s(&S548), t1383, rt_s(&S16) }); }));
 }
 
 static wv s673_callJs(struct fr139 *up, wv v778_callee, wv v779_args) {
   rt_enter("callJs");
   v778_callee = rt_bind(v778_callee, 0);
   v779_args = rt_bind(v779_args, 0);
-  wv v780_func = rt_bind((rt_cond(rt_eq(rt_get(&F_k, v778_callee), rt_s(&S156))) ? rt_cat(2, (wv[]){ rt_s(&S544), rt_text(rt_get(&F_name, v778_callee)) }) : (rt_cond(rt_eq(rt_get(&F_k, v778_callee), rt_s(&S189))) ? ({ wv t1379 = rt_text(rt_chk(s642_modId(up, rt_chk(s645_stolenFrom(up, rt_get(&F_rec, v778_callee)), "callJs")), "callJs")); wv t1380 = rt_text(rt_get(&F_field, v778_callee)); rt_cat(4, (wv[]){ rt_s(&S478), t1379, rt_s(&S12), t1380 }); }) : rt_chk(s644_id(up, rt_get(&F_name, v778_callee)), "callJs"))), 0);
-  RT_RET(({ wv t1381 = rt_text(v780_func); wv t1382 = rt_text(std_join(v779_args, rt_s(&S385))); rt_cat(4, (wv[]){ t1381, rt_s(&S97), t1382, rt_s(&S16) }); }));
+  wv v780_func = rt_bind((rt_cond(rt_eq(rt_get(&F_k, v778_callee), rt_s(&S156))) ? rt_cat(2, (wv[]){ rt_s(&S549), rt_text(rt_get(&F_name, v778_callee)) }) : (rt_cond(rt_eq(rt_get(&F_k, v778_callee), rt_s(&S189))) ? ({ wv t1384 = rt_text(rt_chk(s642_modId(up, rt_chk(s645_stolenFrom(up, rt_get(&F_rec, v778_callee)), "callJs")), "callJs")); wv t1385 = rt_text(rt_get(&F_field, v778_callee)); rt_cat(4, (wv[]){ rt_s(&S483), t1384, rt_s(&S12), t1385 }); }) : rt_chk(s644_id(up, rt_get(&F_name, v778_callee)), "callJs"))), 0);
+  RT_RET(({ wv t1386 = rt_text(v780_func); wv t1387 = rt_text(std_join(v779_args, rt_s(&S390))); rt_cat(4, (wv[]){ t1386, rt_s(&S97), t1387, rt_s(&S16) }); }));
 }
 
 static wv s674_exprList(struct fr139 *up, wv v781_list) {
@@ -6519,11 +7030,11 @@ static wv s674_exprList(struct fr139 *up, wv v781_list) {
   v781_list = rt_bind(v781_list, 0);
   wv v782_js = rt_arr(0, NULL, 1);
   wv v783_k = rt_i(0);
-  while (rt_cond(({ wv t1383 = v783_k; wv t1384 = std_length(v781_list); rt_lt(t1383, t1384); }))) {
-    (void)({ wv t1385 = v782_js; wv t1386 = rt_chk(s675_expr(up, rt_idx(v783_k, v781_list)), "exprList"); std_push(t1385, t1386); });
+  while (rt_cond(({ wv t1388 = v783_k; wv t1389 = std_length(v781_list); rt_lt(t1388, t1389); }))) {
+    (void)({ wv t1390 = v782_js; wv t1391 = rt_chk(s675_expr(up, rt_idx(v783_k, v781_list)), "exprList"); std_push(t1390, t1391); });
     v783_k = rt_add(v783_k, rt_i(1));
   }
-  RT_RET(std_join(v782_js, rt_s(&S385)));
+  RT_RET(std_join(v782_js, rt_s(&S390)));
 }
 
 static wv s675_expr(struct fr139 *up, wv v784_e) {
@@ -6534,29 +7045,29 @@ static wv s675_expr(struct fr139 *up, wv v784_e) {
     RT_RET((rt_cond(rt_lt(rt_get(&F_v, v784_e), rt_i(0))) ? rt_cat(3, (wv[]){ rt_s(&S97), rt_text(rt_get(&F_v, v784_e)), rt_s(&S16) }) : rt_cat(1, (wv[]){ rt_text(rt_get(&F_v, v784_e)) })));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S148)))) {
-    RT_RET(rt_cat(3, (wv[]){ rt_s(&S545), rt_text(rt_chk(w6_jsFloat(rt_get(&F_v, v784_e)), "expr")), rt_s(&S16) }));
+    RT_RET(rt_cat(3, (wv[]){ rt_s(&S550), rt_text(rt_chk(w6_jsFloat(rt_get(&F_v, v784_e)), "expr")), rt_s(&S16) }));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S171)))) {
     wv v786_parts = rt_arr(0, NULL, 1);
     wv v787_k = rt_i(0);
-    while (rt_cond(({ wv t1387 = v787_k; wv t1388 = std_length(rt_get(&F_parts, v784_e)); rt_lt(t1387, t1388); }))) {
-      wv v788_part = rt_bind(({ wv t1389 = v787_k; wv t1390 = rt_get(&F_parts, v784_e); rt_idx(t1389, t1390); }), 0);
+    while (rt_cond(({ wv t1392 = v787_k; wv t1393 = std_length(rt_get(&F_parts, v784_e)); rt_lt(t1392, t1393); }))) {
+      wv v788_part = rt_bind(({ wv t1394 = v787_k; wv t1395 = rt_get(&F_parts, v784_e); rt_idx(t1394, t1395); }), 0);
       if (rt_cond(rt_eq(std_typeOf(v788_part), rt_s(&S185)))) {
         if (rt_cond(rt_ne(v788_part, rt_s(&S13)))) {
-          (void)({ wv t1391 = v786_parts; wv t1392 = rt_chk(w1_quote(v788_part), "expr"); std_push(t1391, t1392); });
+          (void)({ wv t1396 = v786_parts; wv t1397 = rt_chk(w1_quote(v788_part), "expr"); std_push(t1396, t1397); });
         }
       } else {
-        (void)({ wv t1393 = v786_parts; wv t1394 = rt_cat(3, (wv[]){ rt_s(&S546), rt_text(rt_chk(s675_expr(up, v788_part), "expr")), rt_s(&S16) }); std_push(t1393, t1394); });
+        (void)({ wv t1398 = v786_parts; wv t1399 = rt_cat(3, (wv[]){ rt_s(&S551), rt_text(rt_chk(s675_expr(up, v788_part), "expr")), rt_s(&S16) }); std_push(t1398, t1399); });
       }
       v787_k = rt_add(v787_k, rt_i(1));
     }
     if (rt_cond(rt_eq(std_length(v786_parts), rt_i(0)))) {
-      RT_RET(rt_s(&S547));
+      RT_RET(rt_s(&S552));
     }
     if (rt_cond(rt_eq(std_length(v786_parts), rt_i(1)))) {
       RT_RET(rt_idx(rt_i(0), v786_parts));
     }
-    RT_RET(rt_cat(3, (wv[]){ rt_s(&S97), rt_text(std_join(v786_parts, rt_s(&S548))), rt_s(&S16) }));
+    RT_RET(rt_cat(3, (wv[]){ rt_s(&S97), rt_text(std_join(v786_parts, rt_s(&S553))), rt_s(&S16) }));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S281)))) {
     RT_RET(rt_chk(w6_jsBool(rt_get(&F_v, v784_e)), "expr"));
@@ -6565,57 +7076,57 @@ static wv s675_expr(struct fr139 *up, wv v784_e) {
     RT_RET(rt_s(&S51));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S52)))) {
-    RT_RET(rt_s(&S549));
+    RT_RET(rt_s(&S554));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S53)))) {
-    RT_RET(rt_s(&S550));
+    RT_RET(rt_s(&S555));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S211)))) {
     RT_RET(rt_chk(s644_id(up, rt_get(&F_name, v784_e)), "expr"));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S156)))) {
-    RT_RET(rt_cat(2, (wv[]){ rt_s(&S544), rt_text(rt_get(&F_name, v784_e)) }));
+    RT_RET(rt_cat(2, (wv[]){ rt_s(&S549), rt_text(rt_get(&F_name, v784_e)) }));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S186)))) {
-    RT_RET(rt_cat(3, (wv[]){ rt_s(&S507), rt_text(rt_chk(s674_exprList(up, rt_get(&F_items, v784_e)), "expr")), rt_s(&S508) }));
+    RT_RET(rt_cat(3, (wv[]){ rt_s(&S512), rt_text(rt_chk(s674_exprList(up, rt_get(&F_items, v784_e)), "expr")), rt_s(&S513) }));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S187)))) {
     RT_RET(rt_chk(s658_record(up, v784_e, rt_b(0)), "expr"));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S188)))) {
-    RT_RET(({ wv t1395 = rt_text(rt_chk(s675_expr(up, rt_get(&F_index, v784_e)), "expr")); wv t1396 = rt_text(rt_chk(s675_expr(up, rt_get(&F_arr, v784_e)), "expr")); rt_cat(5, (wv[]){ rt_s(&S551), t1395, rt_s(&S385), t1396, rt_s(&S16) }); }));
+    RT_RET(({ wv t1400 = rt_text(rt_chk(s675_expr(up, rt_get(&F_index, v784_e)), "expr")); wv t1401 = rt_text(rt_chk(s675_expr(up, rt_get(&F_arr, v784_e)), "expr")); rt_cat(5, (wv[]){ rt_s(&S556), t1400, rt_s(&S390), t1401, rt_s(&S16) }); }));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S189)))) {
     wv v789_lin = rt_bind(rt_chk(s647_enumJs(up, rt_get(&F_rec, v784_e)), "expr"), 0);
     if (rt_cond(rt_ne(v789_lin, RT_NULL))) {
-      RT_RET(({ wv t1397 = rt_text(v789_lin); wv t1398 = rt_text(rt_get(&F_field, v784_e)); rt_cat(3, (wv[]){ t1397, rt_s(&S552), t1398 }); }));
+      RT_RET(({ wv t1402 = rt_text(v789_lin); wv t1403 = rt_text(rt_get(&F_field, v784_e)); rt_cat(3, (wv[]){ t1402, rt_s(&S557), t1403 }); }));
     }
     wv v790_lib = rt_bind(rt_chk(s645_stolenFrom(up, rt_get(&F_rec, v784_e)), "expr"), 0);
     if (rt_cond(rt_ne(v790_lib, RT_NULL))) {
-      RT_RET(({ wv t1399 = rt_text(rt_chk(s642_modId(up, v790_lib), "expr")); wv t1400 = rt_text(rt_get(&F_field, v784_e)); rt_cat(4, (wv[]){ rt_s(&S478), t1399, rt_s(&S12), t1400 }); }));
+      RT_RET(({ wv t1404 = rt_text(rt_chk(s642_modId(up, v790_lib), "expr")); wv t1405 = rt_text(rt_get(&F_field, v784_e)); rt_cat(4, (wv[]){ rt_s(&S483), t1404, rt_s(&S12), t1405 }); }));
     }
-    RT_RET(({ wv t1401 = rt_text(rt_get(&F_field, v784_e)); wv t1402 = rt_text(rt_chk(s675_expr(up, rt_get(&F_rec, v784_e)), "expr")); rt_cat(5, (wv[]){ rt_s(&S553), t1401, rt_s(&S513), t1402, rt_s(&S16) }); }));
+    RT_RET(({ wv t1406 = rt_text(rt_get(&F_field, v784_e)); wv t1407 = rt_text(rt_chk(s675_expr(up, rt_get(&F_rec, v784_e)), "expr")); rt_cat(5, (wv[]){ rt_s(&S558), t1406, rt_s(&S518), t1407, rt_s(&S16) }); }));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S190)))) {
-    RT_RET(({ wv t1403 = rt_text(rt_chk(w6_unFn(rt_get(&F_op, v784_e)), "expr")); wv t1404 = rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v784_e)), "expr")); rt_cat(5, (wv[]){ rt_s(&S554), t1403, rt_s(&S97), t1404, rt_s(&S16) }); }));
+    RT_RET(({ wv t1408 = rt_text(rt_chk(w6_unFn(rt_get(&F_op, v784_e)), "expr")); wv t1409 = rt_text(rt_chk(s675_expr(up, rt_get(&F_e, v784_e)), "expr")); rt_cat(5, (wv[]){ rt_s(&S559), t1408, rt_s(&S97), t1409, rt_s(&S16) }); }));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S191)))) {
     if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_op, v784_e), rt_s(&S80)), "||") || rt_bool(rt_eq(rt_get(&F_op, v784_e), rt_s(&S81)), "||")))) {
-      RT_RET(({ wv t1405 = rt_text(rt_chk(s675_expr(up, rt_get(&F_l, v784_e)), "expr")); wv t1406 = rt_text(rt_get(&F_op, v784_e)); wv t1407 = rt_text(rt_get(&F_op, v784_e)); wv t1408 = rt_text(rt_chk(s675_expr(up, rt_get(&F_r, v784_e)), "expr")); wv t1409 = rt_text(rt_get(&F_op, v784_e)); rt_cat(11, (wv[]){ rt_s(&S555), t1405, rt_s(&S556), t1406, rt_s(&S557), t1407, rt_s(&S558), t1408, rt_s(&S556), t1409, rt_s(&S559) }); }));
+      RT_RET(({ wv t1410 = rt_text(rt_chk(s675_expr(up, rt_get(&F_l, v784_e)), "expr")); wv t1411 = rt_text(rt_get(&F_op, v784_e)); wv t1412 = rt_text(rt_get(&F_op, v784_e)); wv t1413 = rt_text(rt_chk(s675_expr(up, rt_get(&F_r, v784_e)), "expr")); wv t1414 = rt_text(rt_get(&F_op, v784_e)); rt_cat(11, (wv[]){ rt_s(&S560), t1410, rt_s(&S561), t1411, rt_s(&S562), t1412, rt_s(&S563), t1413, rt_s(&S561), t1414, rt_s(&S564) }); }));
     }
-    RT_RET(({ wv t1410 = rt_text(rt_chk(w6_binFn(rt_get(&F_op, v784_e)), "expr")); wv t1411 = rt_text(rt_chk(s675_expr(up, rt_get(&F_l, v784_e)), "expr")); wv t1412 = rt_text(rt_chk(s675_expr(up, rt_get(&F_r, v784_e)), "expr")); rt_cat(7, (wv[]){ rt_s(&S554), t1410, rt_s(&S97), t1411, rt_s(&S385), t1412, rt_s(&S16) }); }));
+    RT_RET(({ wv t1415 = rt_text(rt_chk(w6_binFn(rt_get(&F_op, v784_e)), "expr")); wv t1416 = rt_text(rt_chk(s675_expr(up, rt_get(&F_l, v784_e)), "expr")); wv t1417 = rt_text(rt_chk(s675_expr(up, rt_get(&F_r, v784_e)), "expr")); rt_cat(7, (wv[]){ rt_s(&S559), t1415, rt_s(&S97), t1416, rt_s(&S390), t1417, rt_s(&S16) }); }));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S192)))) {
-    RT_RET(({ wv t1413 = rt_text(rt_chk(s675_expr(up, rt_get(&F_c, v784_e)), "expr")); wv t1414 = rt_text(rt_chk(s675_expr(up, rt_get(&F_a, v784_e)), "expr")); wv t1415 = rt_text(rt_chk(s675_expr(up, rt_get(&F_b, v784_e)), "expr")); rt_cat(7, (wv[]){ rt_s(&S560), t1413, rt_s(&S561), t1414, rt_s(&S533), t1415, rt_s(&S16) }); }));
+    RT_RET(({ wv t1418 = rt_text(rt_chk(s675_expr(up, rt_get(&F_c, v784_e)), "expr")); wv t1419 = rt_text(rt_chk(s675_expr(up, rt_get(&F_a, v784_e)), "expr")); wv t1420 = rt_text(rt_chk(s675_expr(up, rt_get(&F_b, v784_e)), "expr")); rt_cat(7, (wv[]){ rt_s(&S565), t1418, rt_s(&S566), t1419, rt_s(&S538), t1420, rt_s(&S16) }); }));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S182)))) {
     wv v791_args = rt_arr(0, NULL, 1);
     wv v792_k = rt_i(0);
-    while (rt_cond(({ wv t1416 = v792_k; wv t1417 = std_length(rt_get(&F_args, v784_e)); rt_lt(t1416, t1417); }))) {
-      (void)({ wv t1420 = v791_args; wv t1421 = rt_chk(s675_expr(up, ({ wv t1418 = v792_k; wv t1419 = rt_get(&F_args, v784_e); rt_idx(t1418, t1419); })), "expr"); std_push(t1420, t1421); });
+    while (rt_cond(({ wv t1421 = v792_k; wv t1422 = std_length(rt_get(&F_args, v784_e)); rt_lt(t1421, t1422); }))) {
+      (void)({ wv t1425 = v791_args; wv t1426 = rt_chk(s675_expr(up, ({ wv t1423 = v792_k; wv t1424 = rt_get(&F_args, v784_e); rt_idx(t1423, t1424); })), "expr"); std_push(t1425, t1426); });
       v792_k = rt_add(v792_k, rt_i(1));
     }
-    RT_RET(({ wv t1422 = rt_get(&F_callee, v784_e); wv t1423 = v791_args; rt_chk(s673_callJs(up, t1422, t1423), "expr"); }));
+    RT_RET(({ wv t1427 = rt_get(&F_callee, v784_e); wv t1428 = v791_args; rt_chk(s673_callJs(up, t1427, t1428), "expr"); }));
   }
   if (rt_cond(rt_eq(v785_kind, rt_s(&S184)))) {
     RT_RET(rt_chk(s668_chainExpr(up, v784_e), "expr"));
@@ -6623,10 +7134,10 @@ static wv s675_expr(struct fr139 *up, wv v784_e) {
   if (rt_cond(rt_eq(v785_kind, rt_s(&S44)))) {
     RT_RET(rt_chk(s672_matchExpr(up, v784_e), "expr"));
   }
-  if (rt_cond(rt_eq(v785_kind, rt_s(&S528)))) {
+  if (rt_cond(rt_eq(v785_kind, rt_s(&S533)))) {
     RT_RET(rt_get(&F_js, v784_e));
   }
-  rt_panic(rt_cat(2, (wv[]){ rt_s(&S562), rt_text(v785_kind) }));
+  rt_panic(rt_cat(2, (wv[]){ rt_s(&S567), rt_text(v785_kind) }));
   RT_RET(RT_NULL);
 }
 
@@ -6634,10 +7145,10 @@ static wv w7_binFn(wv v795_op) {
   rt_enter("binFn");
   v795_op = rt_bind(v795_op, 0);
   wv v796_k = rt_i(0);
-  while (rt_cond(({ wv t1436 = ({ wv t1434 = v796_k; wv t1435 = rt_def(w7_binOps, "binOps"); rt_idx(t1434, t1435); }); wv t1437 = v795_op; rt_ne(t1436, t1437); }))) {
+  while (rt_cond(({ wv t1441 = ({ wv t1439 = v796_k; wv t1440 = rt_def(w7_binOps, "binOps"); rt_idx(t1439, t1440); }); wv t1442 = v795_op; rt_ne(t1441, t1442); }))) {
     v796_k = rt_add(v796_k, rt_i(1));
   }
-  RT_RET(({ wv t1438 = v796_k; wv t1439 = rt_def(w7_binFns, "binFns"); rt_idx(t1438, t1439); }));
+  RT_RET(({ wv t1443 = v796_k; wv t1444 = rt_def(w7_binFns, "binFns"); rt_idx(t1443, t1444); }));
 }
 
 static wv w7_modeOf(wv v797_x) {
@@ -6649,7 +7160,7 @@ static wv w7_modeOf(wv v797_x) {
 static wv w7_unFn(wv v798_op) {
   rt_enter("unFn");
   v798_op = rt_bind(v798_op, 0);
-  RT_RET((rt_cond(rt_eq(v798_op, rt_s(&S85))) ? rt_s(&S475) : (rt_cond(rt_eq(v798_op, rt_s(&S94))) ? rt_s(&S476) : rt_s(&S477))));
+  RT_RET((rt_cond(rt_eq(v798_op, rt_s(&S85))) ? rt_s(&S480) : (rt_cond(rt_eq(v798_op, rt_s(&S94))) ? rt_s(&S481) : rt_s(&S482))));
 }
 
 static wv w7_repeat(wv v799_s, wv v800_count) {
@@ -6671,10 +7182,10 @@ static wv w7_utf8Length(wv v803_s) {
   wv v804_cs = rt_bind(std_split(v803_s, rt_s(&S13)), 0);
   wv v805_n = rt_i(0);
   wv v806_k = rt_i(0);
-  while (rt_cond(({ wv t1440 = v806_k; wv t1441 = std_length(v804_cs); rt_lt(t1440, t1441); }))) {
+  while (rt_cond(({ wv t1445 = v806_k; wv t1446 = std_length(v804_cs); rt_lt(t1445, t1446); }))) {
     wv v807_c = rt_bind(std_code(rt_idx(v806_k, v804_cs)), 0);
-    wv t1442 = (rt_cond(rt_lt(v807_c, rt_i(128))) ? rt_i(1) : (rt_cond(rt_lt(v807_c, rt_i(2048))) ? rt_i(2) : (rt_cond(rt_lt(v807_c, rt_i(65536))) ? rt_i(3) : rt_i(4))));
-    v805_n = rt_add(v805_n, t1442);
+    wv t1447 = (rt_cond(rt_lt(v807_c, rt_i(128))) ? rt_i(1) : (rt_cond(rt_lt(v807_c, rt_i(2048))) ? rt_i(2) : (rt_cond(rt_lt(v807_c, rt_i(65536))) ? rt_i(3) : rt_i(4))));
+    v805_n = rt_add(v805_n, t1447);
     v806_k = rt_add(v806_k, rt_i(1));
   }
   RT_RET(v805_n);
@@ -6686,13 +7197,13 @@ static wv w7_cString(wv v808_s) {
   wv v809_cs = rt_bind(std_split(v808_s, rt_s(&S13)), 0);
   wv v810_out = rt_s(&S18);
   wv v811_k = rt_i(0);
-  while (rt_cond(({ wv t1443 = v811_k; wv t1444 = std_length(v809_cs); rt_lt(t1443, t1444); }))) {
+  while (rt_cond(({ wv t1448 = v811_k; wv t1449 = std_length(v809_cs); rt_lt(t1448, t1449); }))) {
     wv v812_ch = rt_bind(rt_idx(v811_k, v809_cs), 0);
     wv v813_c = rt_bind(std_code(v812_ch), 0);
     if (rt_cond(rt_eq(v812_ch, rt_s(&S18)))) {
-      v810_out = rt_add(v810_out, rt_s(&S566));
+      v810_out = rt_add(v810_out, rt_s(&S571));
     } else if (rt_cond(rt_eq(v812_ch, rt_s(&S19)))) {
-      v810_out = rt_add(v810_out, rt_s(&S567));
+      v810_out = rt_add(v810_out, rt_s(&S572));
     } else if (rt_cond(rt_eq(v812_ch, rt_s(&S2)))) {
       v810_out = rt_add(v810_out, rt_s(&S20));
     } else if (rt_cond(rt_eq(v812_ch, rt_s(&S1)))) {
@@ -6700,7 +7211,7 @@ static wv w7_cString(wv v808_s) {
     } else if (rt_cond(rt_eq(v812_ch, rt_s(&S3)))) {
       v810_out = rt_add(v810_out, rt_s(&S21));
     } else if (rt_cond(rt_b(rt_bool(rt_lt(v813_c, rt_i(32)), "||") || rt_bool(rt_eq(v813_c, rt_i(127)), "||")))) {
-      v810_out = ({ wv t1448 = v810_out; wv t1449 = ({ wv t1445 = rt_text(std_floor(rt_div(v813_c, rt_i(64)))); wv t1446 = rt_text(rt_mod(std_floor(rt_div(v813_c, rt_i(8))), rt_i(8))); wv t1447 = rt_text(rt_mod(v813_c, rt_i(8))); rt_cat(4, (wv[]){ rt_s(&S19), t1445, t1446, t1447 }); }); rt_add(t1448, t1449); });
+      v810_out = ({ wv t1453 = v810_out; wv t1454 = ({ wv t1450 = rt_text(std_floor(rt_div(v813_c, rt_i(64)))); wv t1451 = rt_text(rt_mod(std_floor(rt_div(v813_c, rt_i(8))), rt_i(8))); wv t1452 = rt_text(rt_mod(v813_c, rt_i(8))); rt_cat(4, (wv[]){ rt_s(&S19), t1450, t1451, t1452 }); }); rt_add(t1453, t1454); });
     } else {
       v810_out = rt_add(v810_out, v812_ch);
     }
@@ -6714,12 +7225,12 @@ static wv w7_wstrInit(wv v814_s) {
   v814_s = rt_bind(v814_s, 0);
   wv v815_bytes = rt_bind(rt_chk(w7_utf8Length(v814_s), "wstrInit"), 0);
   wv v816_cps = rt_bind(std_length(v814_s), 0);
-  RT_RET(({ wv t1450 = rt_text(v815_bytes); wv t1451 = rt_text(v816_cps); wv t1452 = rt_text((rt_cond(rt_eq(v815_bytes, v816_cps)) ? rt_i(1) : rt_i(0))); wv t1453 = rt_text(rt_chk(w7_cString(v814_s), "wstrInit")); rt_cat(9, (wv[]){ rt_s(&S568), t1450, rt_s(&S385), t1451, rt_s(&S385), t1452, rt_s(&S569), t1453, rt_s(&S570) }); }));
+  RT_RET(({ wv t1455 = rt_text(v815_bytes); wv t1456 = rt_text(v816_cps); wv t1457 = rt_text((rt_cond(rt_eq(v815_bytes, v816_cps)) ? rt_i(1) : rt_i(0))); wv t1458 = rt_text(rt_chk(w7_cString(v814_s), "wstrInit")); rt_cat(9, (wv[]){ rt_s(&S573), t1455, rt_s(&S390), t1456, rt_s(&S390), t1457, rt_s(&S574), t1458, rt_s(&S575) }); }));
 }
 
 static wv w7_values(wv v817_cs) {
   rt_enter("values");
-  RT_RET((rt_cond(rt_eq(std_length(v817_cs), rt_i(0))) ? rt_s(&S571) : rt_cat(3, (wv[]){ rt_s(&S572), rt_text(std_join(v817_cs, rt_s(&S385))), rt_s(&S570) })));
+  RT_RET((rt_cond(rt_eq(std_length(v817_cs), rt_i(0))) ? rt_s(&S576) : rt_cat(3, (wv[]){ rt_s(&S577), rt_text(std_join(v817_cs, rt_s(&S390))), rt_s(&S575) })));
 }
 
 static wv w7_generateC(wv p_v818_modules, wv p_v819_runtime) {
@@ -6751,24 +7262,24 @@ static wv w7_generateC(wv p_v818_modules, wv p_v819_runtime) {
   fr.v841_ownEnums = rt_arr(0, NULL, 1);
   fr.v842_cur = rt_i(0);
   wv v902_mi = rt_i(0);
-  while (rt_cond(({ wv t2385 = v902_mi; wv t2386 = std_length(fr.v818_modules); rt_lt(t2385, t2386); }))) {
+  while (rt_cond(({ wv t2390 = v902_mi; wv t2391 = std_length(fr.v818_modules); rt_lt(t2390, t2391); }))) {
     (void)rt_chk(s857_analyze(&fr, v902_mi), "generateC");
     v902_mi = rt_add(v902_mi, rt_i(1));
   }
   v902_mi = rt_i(0);
-  while (rt_cond(({ wv t2387 = v902_mi; wv t2388 = std_length(fr.v818_modules); rt_lt(t2387, t2388); }))) {
+  while (rt_cond(({ wv t2392 = v902_mi; wv t2393 = std_length(fr.v818_modules); rt_lt(t2392, t2393); }))) {
     wv v1176_list = rt_bind(rt_get(&F_stmts, rt_get(&F_program, rt_idx(v902_mi, fr.v818_modules))), 0);
     wv v1177_li = rt_i(0);
-    while (rt_cond(({ wv t2389 = v1177_li; wv t2390 = std_length(v1176_list); rt_lt(t2389, t2390); }))) {
+    while (rt_cond(({ wv t2394 = v1177_li; wv t2395 = std_length(v1176_list); rt_lt(t2394, t2395); }))) {
       if (rt_cond(rt_eq(rt_get(&F_k, rt_idx(v1177_li, v1176_list)), rt_s(&S46)))) {
-        (void)({ wv t2391 = rt_idx(v1177_li, v1176_list); wv t2392 = rt_chk(s843_modId(&fr, v902_mi), "generateC"); rt_chk(s863_enumDef(&fr, t2391, t2392), "generateC"); });
+        (void)({ wv t2396 = rt_idx(v1177_li, v1176_list); wv t2397 = rt_chk(s843_modId(&fr, v902_mi), "generateC"); rt_chk(s863_enumDef(&fr, t2396, t2397), "generateC"); });
       }
       v1177_li = rt_add(v1177_li, rt_i(1));
     }
     v902_mi = rt_add(v902_mi, rt_i(1));
   }
   v902_mi = rt_i(0);
-  while (rt_cond(({ wv t2393 = v902_mi; wv t2394 = std_length(fr.v818_modules); rt_lt(t2393, t2394); }))) {
+  while (rt_cond(({ wv t2398 = v902_mi; wv t2399 = std_length(fr.v818_modules); rt_lt(t2398, t2399); }))) {
     (void)rt_chk(s858_enter(&fr, v902_mi), "generateC");
     (void)rt_chk(s872_stmts(&fr, rt_get(&F_stmts, rt_get(&F_program, rt_idx(v902_mi, fr.v818_modules)))), "generateC");
     v902_mi = rt_add(v902_mi, rt_i(1));
@@ -6779,13 +7290,13 @@ static wv w7_generateC(wv p_v818_modules, wv p_v819_runtime) {
 static wv s843_modId(struct fr183 *up, wv v903_m) {
   rt_enter("modId");
   v903_m = rt_bind(v903_m, 0);
-  RT_RET((rt_cond(({ wv t1454 = v903_m; wv t1455 = rt_sub(std_length(up->v818_modules), rt_i(1)); rt_eq(t1454, t1455); })) ? rt_s(&S13) : rt_cat(1, (wv[]){ rt_text(rt_add(v903_m, rt_i(1))) })));
+  RT_RET((rt_cond(({ wv t1459 = v903_m; wv t1460 = rt_sub(std_length(up->v818_modules), rt_i(1)); rt_eq(t1459, t1460); })) ? rt_s(&S13) : rt_cat(1, (wv[]){ rt_text(rt_add(v903_m, rt_i(1))) })));
 }
 
 static wv s844_hasFrame(struct fr183 *up, wv v904_f) {
   rt_enter("hasFrame");
   v904_f = rt_bind(v904_f, 0);
-  RT_RET(rt_b(rt_bool(rt_not(rt_get(&F_top, ({ wv t1456 = v904_f; wv t1457 = rt_def(up->v834_fns, "fns"); rt_idx(t1456, t1457); }))), "&&") && rt_bool(rt_gt(rt_get(&F_children, ({ wv t1458 = v904_f; wv t1459 = rt_def(up->v834_fns, "fns"); rt_idx(t1458, t1459); })), rt_i(0)), "&&")));
+  RT_RET(rt_b(rt_bool(rt_not(rt_get(&F_top, ({ wv t1461 = v904_f; wv t1462 = rt_def(up->v834_fns, "fns"); rt_idx(t1461, t1462); }))), "&&") && rt_bool(rt_gt(rt_get(&F_children, ({ wv t1463 = v904_f; wv t1464 = rt_def(up->v834_fns, "fns"); rt_idx(t1463, t1464); })), rt_i(0)), "&&")));
 }
 
 static wv s845_newScope(struct fr183 *up, wv v905_parent) {
@@ -6801,7 +7312,7 @@ static wv s846_put(struct fr183 *up, wv v907_scope, wv v908_name, wv v909_kind, 
   v908_name = rt_bind(v908_name, 0);
   v909_kind = rt_bind(v909_kind, 0);
   v910_d = rt_bind(v910_d, 0);
-  (void)({ wv t1460 = rt_get(&F_names, v907_scope); wv t1461 = rt_rec(0, 3, K51, (wv[]){ v908_name, v909_kind, v910_d }); std_push(t1460, t1461); });
+  (void)({ wv t1465 = rt_get(&F_names, v907_scope); wv t1466 = rt_rec(0, 3, K51, (wv[]){ v908_name, v909_kind, v910_d }); std_push(t1465, t1466); });
   RT_RET(RT_NULL);
 }
 
@@ -6812,8 +7323,8 @@ static wv s847_find(struct fr183 *up, wv v911_scope, wv v912_name) {
   while (rt_cond(rt_ne(v913_s, RT_NULL))) {
     wv v914_ns = rt_get(&F_names, v913_s);
     wv v915_k = rt_i(0);
-    while (rt_cond(({ wv t1462 = v915_k; wv t1463 = std_length(v914_ns); rt_lt(t1462, t1463); }))) {
-      if (rt_cond(({ wv t1464 = rt_get(&F_name, rt_idx(v915_k, v914_ns)); wv t1465 = v912_name; rt_eq(t1464, t1465); }))) {
+    while (rt_cond(({ wv t1467 = v915_k; wv t1468 = std_length(v914_ns); rt_lt(t1467, t1468); }))) {
+      if (rt_cond(({ wv t1469 = rt_get(&F_name, rt_idx(v915_k, v914_ns)); wv t1470 = v912_name; rt_eq(t1469, t1470); }))) {
         RT_RET(rt_idx(v915_k, v914_ns));
       }
       v915_k = rt_add(v915_k, rt_i(1));
@@ -6835,8 +7346,8 @@ static wv s849_newFn(struct fr183 *up, wv v919_name, wv v920_parent) {
   rt_enter("newFn");
   v919_name = rt_bind(v919_name, 0);
   v920_parent = rt_bind(v920_parent, 0);
-  wv v921_f = ({ wv t1468 = v919_name; wv t1469 = v920_parent; wv t1470 = (rt_cond(rt_eq(v920_parent, RT_NULL)) ? rt_i(0) : rt_add(rt_get(&F_depth, ({ wv t1466 = v920_parent; wv t1467 = rt_def(up->v834_fns, "fns"); rt_idx(t1466, t1467); })), rt_i(1))); wv t1471 = rt_eq(v920_parent, RT_NULL); rt_rec(1, 6, K52, (wv[]){ t1468, t1469, t1470, t1471, rt_i(0), rt_s(&S13) }); });
-  (void)({ wv t1472 = rt_def(up->v834_fns, "fns"); wv t1473 = v921_f; std_push(t1472, t1473); });
+  wv v921_f = ({ wv t1473 = v919_name; wv t1474 = v920_parent; wv t1475 = (rt_cond(rt_eq(v920_parent, RT_NULL)) ? rt_i(0) : rt_add(rt_get(&F_depth, ({ wv t1471 = v920_parent; wv t1472 = rt_def(up->v834_fns, "fns"); rt_idx(t1471, t1472); })), rt_i(1))); wv t1476 = rt_eq(v920_parent, RT_NULL); rt_rec(1, 6, K52, (wv[]){ t1473, t1474, t1475, t1476, rt_i(0), rt_s(&S13) }); });
+  (void)({ wv t1477 = rt_def(up->v834_fns, "fns"); wv t1478 = v921_f; std_push(t1477, t1478); });
   RT_RET(rt_sub(std_length(rt_def(up->v834_fns, "fns")), rt_i(1)));
 }
 
@@ -6847,15 +7358,15 @@ static wv s850_bind(struct fr183 *up, wv v922_kind, wv v923_name, wv v924_f, wv 
   v924_f = rt_bind(v924_f, 0);
   v925_atTop = rt_bind(v925_atTop, 0);
   v926_mode = rt_bind(v926_mode, 0);
-  wv v927_cname = ({ wv t1474 = rt_text(rt_def(up->v838_mod, "mod")); wv t1475 = rt_text(v923_name); rt_cat(4, (wv[]){ rt_s(&S478), t1474, rt_s(&S12), t1475 }); });
+  wv v927_cname = ({ wv t1479 = rt_text(rt_def(up->v838_mod, "mod")); wv t1480 = rt_text(v923_name); rt_cat(4, (wv[]){ rt_s(&S483), t1479, rt_s(&S12), t1480 }); });
   if (rt_cond(rt_not(v925_atTop))) {
-    v927_cname = ({ wv t1478 = (rt_cond(rt_eq(v922_kind, rt_s(&S33))) ? rt_s(&S362) : rt_s(&S573)); wv t1479 = ({ wv t1476 = rt_text(rt_def(up->v820_n, "n")); wv t1477 = rt_text(v923_name); rt_cat(3, (wv[]){ t1476, rt_s(&S12), t1477 }); }); rt_add(t1478, t1479); });
+    v927_cname = ({ wv t1483 = (rt_cond(rt_eq(v922_kind, rt_s(&S33))) ? rt_s(&S367) : rt_s(&S578)); wv t1484 = ({ wv t1481 = rt_text(rt_def(up->v820_n, "n")); wv t1482 = rt_text(v923_name); rt_cat(3, (wv[]){ t1481, rt_s(&S12), t1482 }); }); rt_add(t1483, t1484); });
     up->v820_n = rt_add(rt_def(up->v820_n, "n"), rt_i(1));
   }
-  wv v928_d = ({ wv t1480 = v922_kind; wv t1481 = v923_name; wv t1482 = v924_f; wv t1483 = v927_cname; wv t1484 = rt_eq(v926_mode, rt_s(&S37)); rt_rec(1, 7, K53, (wv[]){ t1480, t1481, t1482, t1483, t1484, rt_b(0), RT_NULL }); });
-  (void)({ wv t1485 = rt_def(up->v833_decls, "decls"); wv t1486 = v928_d; std_push(t1485, t1486); });
-  if (rt_cond(rt_b(rt_bool(rt_get(&F_top, ({ wv t1487 = v924_f; wv t1488 = rt_def(up->v834_fns, "fns"); rt_idx(t1487, t1488); })), "&&") && rt_bool(rt_ne(v922_kind, rt_s(&S33)), "&&")))) {
-    (void)({ wv t1489 = rt_def(up->v826_globals, "globals"); wv t1490 = v927_cname; std_push(t1489, t1490); });
+  wv v928_d = ({ wv t1485 = v922_kind; wv t1486 = v923_name; wv t1487 = v924_f; wv t1488 = v927_cname; wv t1489 = rt_eq(v926_mode, rt_s(&S37)); rt_rec(1, 7, K53, (wv[]){ t1485, t1486, t1487, t1488, t1489, rt_b(0), RT_NULL }); });
+  (void)({ wv t1490 = rt_def(up->v833_decls, "decls"); wv t1491 = v928_d; std_push(t1490, t1491); });
+  if (rt_cond(rt_b(rt_bool(rt_get(&F_top, ({ wv t1492 = v924_f; wv t1493 = rt_def(up->v834_fns, "fns"); rt_idx(t1492, t1493); })), "&&") && rt_bool(rt_ne(v922_kind, rt_s(&S33)), "&&")))) {
+    (void)({ wv t1494 = rt_def(up->v826_globals, "globals"); wv t1495 = v927_cname; std_push(t1494, t1495); });
   }
   RT_RET(rt_sub(std_length(rt_def(up->v833_decls, "decls")), rt_i(1)));
 }
@@ -6868,32 +7379,32 @@ static wv s851_ablock(struct fr183 *up, wv v929_b, wv v930_scope, wv v931_f, wv 
   wv v933_atTop = rt_eq(v930_scope, v932_topScope);
   wv v934_list = rt_bind(rt_get(&F_stmts, v929_b), 0);
   wv v935_k = rt_i(0);
-  while (rt_cond(({ wv t1491 = v935_k; wv t1492 = std_length(v934_list); rt_lt(t1491, t1492); }))) {
+  while (rt_cond(({ wv t1496 = v935_k; wv t1497 = std_length(v934_list); rt_lt(t1496, t1497); }))) {
     wv v936_s = rt_bind(rt_idx(v935_k, v934_list), 0);
     if (rt_cond(rt_eq(rt_get(&F_k, v936_s), rt_s(&S33)))) {
-      wv v937_d = rt_bind(({ wv t1493 = rt_get(&F_name, v936_s); wv t1494 = v931_f; wv t1495 = v933_atTop; rt_chk(s850_bind(up, rt_s(&S33), t1493, t1494, t1495, rt_s(&S13)), "ablock"); }), 0);
-      wv v938_child = rt_bind(({ wv t1496 = rt_get(&F_name, v936_s); wv t1497 = v931_f; rt_chk(s849_newFn(up, t1496, t1497), "ablock"); }), 0);
-      ({ wv t1502 = rt_get(&F_cname, ({ wv t1498 = v937_d; wv t1499 = rt_def(up->v833_decls, "decls"); rt_idx(t1498, t1499); })); wv t1503 = ({ wv t1500 = v938_child; wv t1501 = rt_def(up->v834_fns, "fns"); rt_idx(t1500, t1501); }); rt_set_mem(t1502, &F_cname, t1503); });
-      ({ wv t1506 = v938_child; wv t1507 = ({ wv t1504 = v937_d; wv t1505 = rt_def(up->v833_decls, "decls"); rt_idx(t1504, t1505); }); rt_set_mem(t1506, &F_fnIndex, t1507); });
-      rt_upd_mem(rt_i(1), &F_children, ({ wv t1508 = v931_f; wv t1509 = rt_def(up->v834_fns, "fns"); rt_idx(t1508, t1509); }), rt_add);
-      ({ wv t1510 = v937_d; wv t1511 = rt_get(&F_namePos, v936_s); wv t1512 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1510, t1511, t1512); });
-      (void)({ wv t1513 = v930_scope; wv t1514 = rt_get(&F_name, v936_s); wv t1515 = v937_d; rt_chk(s846_put(up, t1513, t1514, rt_s(&S33), t1515), "ablock"); });
+      wv v937_d = rt_bind(({ wv t1498 = rt_get(&F_name, v936_s); wv t1499 = v931_f; wv t1500 = v933_atTop; rt_chk(s850_bind(up, rt_s(&S33), t1498, t1499, t1500, rt_s(&S13)), "ablock"); }), 0);
+      wv v938_child = rt_bind(({ wv t1501 = rt_get(&F_name, v936_s); wv t1502 = v931_f; rt_chk(s849_newFn(up, t1501, t1502), "ablock"); }), 0);
+      ({ wv t1507 = rt_get(&F_cname, ({ wv t1503 = v937_d; wv t1504 = rt_def(up->v833_decls, "decls"); rt_idx(t1503, t1504); })); wv t1508 = ({ wv t1505 = v938_child; wv t1506 = rt_def(up->v834_fns, "fns"); rt_idx(t1505, t1506); }); rt_set_mem(t1507, &F_cname, t1508); });
+      ({ wv t1511 = v938_child; wv t1512 = ({ wv t1509 = v937_d; wv t1510 = rt_def(up->v833_decls, "decls"); rt_idx(t1509, t1510); }); rt_set_mem(t1511, &F_fnIndex, t1512); });
+      rt_upd_mem(rt_i(1), &F_children, ({ wv t1513 = v931_f; wv t1514 = rt_def(up->v834_fns, "fns"); rt_idx(t1513, t1514); }), rt_add);
+      ({ wv t1515 = v937_d; wv t1516 = rt_get(&F_namePos, v936_s); wv t1517 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1515, t1516, t1517); });
+      (void)({ wv t1518 = v930_scope; wv t1519 = rt_get(&F_name, v936_s); wv t1520 = v937_d; rt_chk(s846_put(up, t1518, t1519, rt_s(&S33), t1520), "ablock"); });
     } else if (rt_cond(rt_eq(rt_get(&F_k, v936_s), rt_s(&S46)))) {
-      (void)({ wv t1516 = v930_scope; wv t1517 = rt_get(&F_name, v936_s); rt_chk(s846_put(up, t1516, t1517, rt_s(&S46), RT_NULL), "ablock"); });
+      (void)({ wv t1521 = v930_scope; wv t1522 = rt_get(&F_name, v936_s); rt_chk(s846_put(up, t1521, t1522, rt_s(&S46), RT_NULL), "ablock"); });
     } else if (rt_cond(rt_eq(rt_get(&F_k, v936_s), rt_s(&S177)))) {
-      wv v939_d = rt_bind(({ wv t1518 = rt_get(&F_name, v936_s); wv t1519 = v931_f; wv t1520 = v933_atTop; wv t1521 = rt_chk(w7_modeOf(v936_s), "ablock"); rt_chk(s850_bind(up, rt_s(&S177), t1518, t1519, t1520, t1521), "ablock"); }), 0);
-      ({ wv t1522 = v939_d; wv t1523 = rt_get(&F_namePos, v936_s); wv t1524 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1522, t1523, t1524); });
-      (void)({ wv t1525 = v930_scope; wv t1526 = rt_get(&F_name, v936_s); wv t1527 = v939_d; rt_chk(s846_put(up, t1525, t1526, rt_s(&S177), t1527), "ablock"); });
+      wv v939_d = rt_bind(({ wv t1523 = rt_get(&F_name, v936_s); wv t1524 = v931_f; wv t1525 = v933_atTop; wv t1526 = rt_chk(w7_modeOf(v936_s), "ablock"); rt_chk(s850_bind(up, rt_s(&S177), t1523, t1524, t1525, t1526), "ablock"); }), 0);
+      ({ wv t1527 = v939_d; wv t1528 = rt_get(&F_namePos, v936_s); wv t1529 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1527, t1528, t1529); });
+      (void)({ wv t1530 = v930_scope; wv t1531 = rt_get(&F_name, v936_s); wv t1532 = v939_d; rt_chk(s846_put(up, t1530, t1531, rt_s(&S177), t1532), "ablock"); });
     }
     v935_k = rt_add(v935_k, rt_i(1));
   }
   v935_k = rt_i(0);
-  while (rt_cond(({ wv t1528 = v935_k; wv t1529 = std_length(v934_list); rt_lt(t1528, t1529); }))) {
-    (void)({ wv t1530 = rt_idx(v935_k, v934_list); wv t1531 = v930_scope; wv t1532 = v931_f; wv t1533 = v932_topScope; rt_chk(s852_astmt(up, t1530, t1531, t1532, t1533), "ablock"); });
+  while (rt_cond(({ wv t1533 = v935_k; wv t1534 = std_length(v934_list); rt_lt(t1533, t1534); }))) {
+    (void)({ wv t1535 = rt_idx(v935_k, v934_list); wv t1536 = v930_scope; wv t1537 = v931_f; wv t1538 = v932_topScope; rt_chk(s852_astmt(up, t1535, t1536, t1537, t1538), "ablock"); });
     v935_k = rt_add(v935_k, rt_i(1));
   }
   if (rt_cond(rt_ne(rt_get(&F_value, v929_b), RT_NULL))) {
-    (void)({ wv t1534 = rt_get(&F_value, v929_b); wv t1535 = v930_scope; wv t1536 = v931_f; rt_chk(s856_aexpr(up, t1534, t1535, t1536), "ablock"); });
+    (void)({ wv t1539 = rt_get(&F_value, v929_b); wv t1540 = v930_scope; wv t1541 = v931_f; rt_chk(s856_aexpr(up, t1539, t1540, t1541), "ablock"); });
   }
   RT_RET(RT_NULL);
 }
@@ -6905,44 +7416,44 @@ static wv s852_astmt(struct fr183 *up, wv v940_s, wv v941_scope, wv v942_f, wv v
   v943_topScope = rt_bind(v943_topScope, 0);
   wv v944_kind = rt_bind(rt_get(&F_k, v940_s), 0);
   if (rt_cond(rt_eq(v944_kind, rt_s(&S33)))) {
-    wv v945_d = rt_bind(({ wv t1537 = rt_get(&F_namePos, v940_s); wv t1538 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1537, t1538); }), 0);
-    wv v946_child = rt_bind(rt_get(&F_fnIndex, ({ wv t1539 = v945_d; wv t1540 = rt_def(up->v833_decls, "decls"); rt_idx(t1539, t1540); })), 0);
+    wv v945_d = rt_bind(({ wv t1542 = rt_get(&F_namePos, v940_s); wv t1543 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1542, t1543); }), 0);
+    wv v946_child = rt_bind(rt_get(&F_fnIndex, ({ wv t1544 = v945_d; wv t1545 = rt_def(up->v833_decls, "decls"); rt_idx(t1544, t1545); })), 0);
     wv v947_ps = rt_bind(rt_chk(s845_newScope(up, v941_scope), "astmt"), 0);
     wv v948_k = rt_i(0);
-    while (rt_cond(({ wv t1541 = v948_k; wv t1542 = std_length(rt_get(&F_params, v940_s)); rt_lt(t1541, t1542); }))) {
-      wv v949_p = rt_bind(({ wv t1543 = v948_k; wv t1544 = rt_get(&F_params, v940_s); rt_idx(t1543, t1544); }), 0);
-      wv v950_pd = rt_bind(({ wv t1545 = rt_get(&F_name, v949_p); wv t1546 = v946_child; wv t1547 = rt_chk(w7_modeOf(v949_p), "astmt"); rt_chk(s850_bind(up, rt_s(&S373), t1545, t1546, rt_b(0), t1547), "astmt"); }), 0);
-      ({ wv t1548 = v950_pd; wv t1549 = rt_get(&F_pos, v949_p); wv t1550 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1548, t1549, t1550); });
-      (void)({ wv t1551 = v947_ps; wv t1552 = rt_get(&F_name, v949_p); wv t1553 = v950_pd; rt_chk(s846_put(up, t1551, t1552, rt_s(&S373), t1553), "astmt"); });
+    while (rt_cond(({ wv t1546 = v948_k; wv t1547 = std_length(rt_get(&F_params, v940_s)); rt_lt(t1546, t1547); }))) {
+      wv v949_p = rt_bind(({ wv t1548 = v948_k; wv t1549 = rt_get(&F_params, v940_s); rt_idx(t1548, t1549); }), 0);
+      wv v950_pd = rt_bind(({ wv t1550 = rt_get(&F_name, v949_p); wv t1551 = v946_child; wv t1552 = rt_chk(w7_modeOf(v949_p), "astmt"); rt_chk(s850_bind(up, rt_s(&S378), t1550, t1551, rt_b(0), t1552), "astmt"); }), 0);
+      ({ wv t1553 = v950_pd; wv t1554 = rt_get(&F_pos, v949_p); wv t1555 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1553, t1554, t1555); });
+      (void)({ wv t1556 = v947_ps; wv t1557 = rt_get(&F_name, v949_p); wv t1558 = v950_pd; rt_chk(s846_put(up, t1556, t1557, rt_s(&S378), t1558), "astmt"); });
       v948_k = rt_add(v948_k, rt_i(1));
     }
-    (void)({ wv t1554 = rt_get(&F_body, v940_s); wv t1555 = rt_chk(s845_newScope(up, v947_ps), "astmt"); wv t1556 = v946_child; wv t1557 = v943_topScope; rt_chk(s851_ablock(up, t1554, t1555, t1556, t1557), "astmt"); });
+    (void)({ wv t1559 = rt_get(&F_body, v940_s); wv t1560 = rt_chk(s845_newScope(up, v947_ps), "astmt"); wv t1561 = v946_child; wv t1562 = v943_topScope; rt_chk(s851_ablock(up, t1559, t1560, t1561, t1562), "astmt"); });
   } else if (rt_cond(rt_eq(v944_kind, rt_s(&S41)))) {
-    (void)({ wv t1558 = rt_get(&F_cond, v940_s); wv t1559 = v941_scope; wv t1560 = v942_f; rt_chk(s856_aexpr(up, t1558, t1559, t1560), "astmt"); });
-    (void)({ wv t1561 = rt_get(&F_body, v940_s); wv t1562 = rt_chk(s845_newScope(up, v941_scope), "astmt"); wv t1563 = v942_f; wv t1564 = v943_topScope; rt_chk(s851_ablock(up, t1561, t1562, t1563, t1564), "astmt"); });
+    (void)({ wv t1563 = rt_get(&F_cond, v940_s); wv t1564 = v941_scope; wv t1565 = v942_f; rt_chk(s856_aexpr(up, t1563, t1564, t1565), "astmt"); });
+    (void)({ wv t1566 = rt_get(&F_body, v940_s); wv t1567 = rt_chk(s845_newScope(up, v941_scope), "astmt"); wv t1568 = v942_f; wv t1569 = v943_topScope; rt_chk(s851_ablock(up, t1566, t1567, t1568, t1569), "astmt"); });
   } else if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(v944_kind, rt_s(&S34)), "||") || rt_bool(rt_eq(v944_kind, rt_s(&S57)), "||")), "||") || rt_bool(rt_eq(v944_kind, rt_s(&S54)), "||")), "||") || rt_bool(rt_eq(v944_kind, rt_s(&S177)), "||")))) {
     if (rt_cond(rt_ne(rt_get(&F_e, v940_s), RT_NULL))) {
-      (void)({ wv t1565 = rt_get(&F_e, v940_s); wv t1566 = v941_scope; wv t1567 = v942_f; rt_chk(s856_aexpr(up, t1565, t1566, t1567), "astmt"); });
+      (void)({ wv t1570 = rt_get(&F_e, v940_s); wv t1571 = v941_scope; wv t1572 = v942_f; rt_chk(s856_aexpr(up, t1570, t1571, t1572), "astmt"); });
     }
   } else if (rt_cond(rt_eq(v944_kind, rt_s(&S176)))) {
     if (rt_cond(rt_eq(rt_get(&F_k, rt_get(&F_e, v940_s)), rt_s(&S183)))) {
-      (void)({ wv t1568 = rt_get(&F_arg, rt_get(&F_e, v940_s)); wv t1569 = v941_scope; wv t1570 = v942_f; rt_chk(s856_aexpr(up, t1568, t1569, t1570), "astmt"); });
+      (void)({ wv t1573 = rt_get(&F_arg, rt_get(&F_e, v940_s)); wv t1574 = v941_scope; wv t1575 = v942_f; rt_chk(s856_aexpr(up, t1573, t1574, t1575), "astmt"); });
     } else {
-      (void)({ wv t1571 = rt_get(&F_e, v940_s); wv t1572 = v941_scope; wv t1573 = v942_f; rt_chk(s856_aexpr(up, t1571, t1572, t1573), "astmt"); });
+      (void)({ wv t1576 = rt_get(&F_e, v940_s); wv t1577 = v941_scope; wv t1578 = v942_f; rt_chk(s856_aexpr(up, t1576, t1577, t1578), "astmt"); });
     }
   } else if (rt_cond(rt_eq(v944_kind, rt_s(&S38)))) {
-    (void)({ wv t1574 = rt_get(&F_e, v940_s); wv t1575 = v941_scope; wv t1576 = v942_f; rt_chk(s856_aexpr(up, t1574, t1575, t1576), "astmt"); });
-    (void)({ wv t1577 = rt_get(&F_target, v940_s); wv t1578 = v941_scope; wv t1579 = v942_f; rt_chk(s854_atarget(up, t1577, t1578, t1579), "astmt"); });
+    (void)({ wv t1579 = rt_get(&F_e, v940_s); wv t1580 = v941_scope; wv t1581 = v942_f; rt_chk(s856_aexpr(up, t1579, t1580, t1581), "astmt"); });
+    (void)({ wv t1582 = rt_get(&F_target, v940_s); wv t1583 = v941_scope; wv t1584 = v942_f; rt_chk(s854_atarget(up, t1582, t1583, t1584), "astmt"); });
   }
   if (rt_cond(rt_ne(rt_get(&F_handler, v940_s), RT_NULL))) {
     wv v951_h = rt_bind(rt_get(&F_handler, v940_s), 0);
     wv v952_hs = rt_bind(rt_chk(s845_newScope(up, v941_scope), "astmt"), 0);
     if (rt_cond(rt_ne(rt_get(&F_param, v951_h), RT_NULL))) {
-      wv v953_wd = rt_bind(({ wv t1580 = rt_get(&F_param, v951_h); wv t1581 = v942_f; rt_chk(s850_bind(up, rt_s(&S56), t1580, t1581, rt_b(0), rt_s(&S13)), "astmt"); }), 0);
-      ({ wv t1582 = v953_wd; wv t1583 = rt_get(&F_paramPos, v951_h); wv t1584 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1582, t1583, t1584); });
-      (void)({ wv t1585 = v952_hs; wv t1586 = rt_get(&F_param, v951_h); wv t1587 = v953_wd; rt_chk(s846_put(up, t1585, t1586, rt_s(&S56), t1587), "astmt"); });
+      wv v953_wd = rt_bind(({ wv t1585 = rt_get(&F_param, v951_h); wv t1586 = v942_f; rt_chk(s850_bind(up, rt_s(&S56), t1585, t1586, rt_b(0), rt_s(&S13)), "astmt"); }), 0);
+      ({ wv t1587 = v953_wd; wv t1588 = rt_get(&F_paramPos, v951_h); wv t1589 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1587, t1588, t1589); });
+      (void)({ wv t1590 = v952_hs; wv t1591 = rt_get(&F_param, v951_h); wv t1592 = v953_wd; rt_chk(s846_put(up, t1590, t1591, rt_s(&S56), t1592), "astmt"); });
     }
-    (void)({ wv t1588 = rt_get(&F_body, v951_h); wv t1589 = rt_chk(s845_newScope(up, v952_hs), "astmt"); wv t1590 = v942_f; wv t1591 = v943_topScope; rt_chk(s851_ablock(up, t1588, t1589, t1590, t1591), "astmt"); });
+    (void)({ wv t1593 = rt_get(&F_body, v951_h); wv t1594 = rt_chk(s845_newScope(up, v952_hs), "astmt"); wv t1595 = v942_f; wv t1596 = v943_topScope; rt_chk(s851_ablock(up, t1593, t1594, t1595, t1596), "astmt"); });
   }
   RT_RET(RT_NULL);
 }
@@ -6952,10 +7463,10 @@ static wv s853_use(struct fr183 *up, wv v954_x, wv v955_scope, wv v956_f) {
   v954_x = rt_bind(v954_x, 0);
   v955_scope = rt_bind(v955_scope, 0);
   v956_f = rt_bind(v956_f, 0);
-  wv v957_d = rt_bind(rt_get(&F_d, ({ wv t1592 = v955_scope; wv t1593 = rt_get(&F_name, v954_x); rt_chk(s847_find(up, t1592, t1593), "use"); })), 0);
-  ({ wv t1594 = v957_d; wv t1595 = rt_get(&F_pos, v954_x); wv t1596 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1594, t1595, t1596); });
-  if (rt_cond(({ wv t1599 = rt_get(&F_func, ({ wv t1597 = v957_d; wv t1598 = rt_def(up->v833_decls, "decls"); rt_idx(t1597, t1598); })); wv t1600 = v956_f; rt_ne(t1599, t1600); }))) {
-    rt_set_mem(rt_b(1), &F_captured, ({ wv t1601 = v957_d; wv t1602 = rt_def(up->v833_decls, "decls"); rt_idx(t1601, t1602); }));
+  wv v957_d = rt_bind(rt_get(&F_d, ({ wv t1597 = v955_scope; wv t1598 = rt_get(&F_name, v954_x); rt_chk(s847_find(up, t1597, t1598), "use"); })), 0);
+  ({ wv t1599 = v957_d; wv t1600 = rt_get(&F_pos, v954_x); wv t1601 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1599, t1600, t1601); });
+  if (rt_cond(({ wv t1604 = rt_get(&F_func, ({ wv t1602 = v957_d; wv t1603 = rt_def(up->v833_decls, "decls"); rt_idx(t1602, t1603); })); wv t1605 = v956_f; rt_ne(t1604, t1605); }))) {
+    rt_set_mem(rt_b(1), &F_captured, ({ wv t1606 = v957_d; wv t1607 = rt_def(up->v833_decls, "decls"); rt_idx(t1606, t1607); }));
   }
   RT_RET(RT_NULL);
 }
@@ -6970,9 +7481,9 @@ static wv s854_atarget(struct fr183 *up, wv v958_t, wv v959_scope, wv v960_f) {
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(rt_get(&F_k, v958_t), rt_s(&S188)))) {
-    (void)({ wv t1603 = rt_get(&F_index, v958_t); wv t1604 = v959_scope; wv t1605 = v960_f; rt_chk(s856_aexpr(up, t1603, t1604, t1605), "atarget"); });
+    (void)({ wv t1608 = rt_get(&F_index, v958_t); wv t1609 = v959_scope; wv t1610 = v960_f; rt_chk(s856_aexpr(up, t1608, t1609, t1610), "atarget"); });
   }
-  (void)({ wv t1606 = (rt_cond(rt_eq(rt_get(&F_k, v958_t), rt_s(&S189))) ? rt_get(&F_rec, v958_t) : rt_get(&F_arr, v958_t)); wv t1607 = v959_scope; wv t1608 = v960_f; rt_chk(s856_aexpr(up, t1606, t1607, t1608), "atarget"); });
+  (void)({ wv t1611 = (rt_cond(rt_eq(rt_get(&F_k, v958_t), rt_s(&S189))) ? rt_get(&F_rec, v958_t) : rt_get(&F_arr, v958_t)); wv t1612 = v959_scope; wv t1613 = v960_f; rt_chk(s856_aexpr(up, t1611, t1612, t1613), "atarget"); });
   RT_RET(RT_NULL);
 }
 
@@ -6980,13 +7491,13 @@ static wv s855_notValue(struct fr183 *up, wv v961_x, wv v962_scope) {
   rt_enter("notValue");
   v962_scope = rt_bind(v962_scope, 0);
   if (rt_cond(rt_eq(rt_get(&F_k, v961_x), rt_s(&S189)))) {
-    RT_RET(rt_b(rt_bool(rt_eq(rt_get(&F_k, rt_get(&F_rec, v961_x)), rt_s(&S211)), "&&") && rt_bool(rt_eq(({ wv t1609 = v962_scope; wv t1610 = rt_get(&F_name, rt_get(&F_rec, v961_x)); rt_chk(s848_kindOf(up, t1609, t1610), "notValue"); }), rt_s(&S388)), "&&")));
+    RT_RET(rt_b(rt_bool(rt_eq(rt_get(&F_k, rt_get(&F_rec, v961_x)), rt_s(&S211)), "&&") && rt_bool(rt_eq(({ wv t1614 = v962_scope; wv t1615 = rt_get(&F_name, rt_get(&F_rec, v961_x)); rt_chk(s848_kindOf(up, t1614, t1615), "notValue"); }), rt_s(&S393)), "&&")));
   }
   if (rt_cond(rt_ne(rt_get(&F_k, v961_x), rt_s(&S211)))) {
     RT_RET(rt_b(0));
   }
-  wv v963_kind = rt_bind(({ wv t1611 = v962_scope; wv t1612 = rt_get(&F_name, v961_x); rt_chk(s848_kindOf(up, t1611, t1612), "notValue"); }), 0);
-  RT_RET(rt_b(rt_bool(rt_eq(v963_kind, rt_s(&S46)), "||") || rt_bool(rt_eq(v963_kind, rt_s(&S388)), "||")));
+  wv v963_kind = rt_bind(({ wv t1616 = v962_scope; wv t1617 = rt_get(&F_name, v961_x); rt_chk(s848_kindOf(up, t1616, t1617), "notValue"); }), 0);
+  RT_RET(rt_b(rt_bool(rt_eq(v963_kind, rt_s(&S46)), "||") || rt_bool(rt_eq(v963_kind, rt_s(&S393)), "||")));
 }
 
 static wv s856_aexpr(struct fr183 *up, wv v964_e, wv v965_scope, wv v966_f) {
@@ -6996,9 +7507,9 @@ static wv s856_aexpr(struct fr183 *up, wv v964_e, wv v965_scope, wv v966_f) {
   wv v967_kind = rt_bind(rt_get(&F_k, v964_e), 0);
   if (rt_cond(rt_eq(v967_kind, rt_s(&S171)))) {
     wv v968_k = rt_i(0);
-    while (rt_cond(({ wv t1613 = v968_k; wv t1614 = std_length(rt_get(&F_parts, v964_e)); rt_lt(t1613, t1614); }))) {
-      if (rt_cond(rt_ne(std_typeOf(({ wv t1615 = v968_k; wv t1616 = rt_get(&F_parts, v964_e); rt_idx(t1615, t1616); })), rt_s(&S185)))) {
-        (void)({ wv t1619 = ({ wv t1617 = v968_k; wv t1618 = rt_get(&F_parts, v964_e); rt_idx(t1617, t1618); }); wv t1620 = v965_scope; wv t1621 = v966_f; rt_chk(s856_aexpr(up, t1619, t1620, t1621), "aexpr"); });
+    while (rt_cond(({ wv t1618 = v968_k; wv t1619 = std_length(rt_get(&F_parts, v964_e)); rt_lt(t1618, t1619); }))) {
+      if (rt_cond(rt_ne(std_typeOf(({ wv t1620 = v968_k; wv t1621 = rt_get(&F_parts, v964_e); rt_idx(t1620, t1621); })), rt_s(&S185)))) {
+        (void)({ wv t1624 = ({ wv t1622 = v968_k; wv t1623 = rt_get(&F_parts, v964_e); rt_idx(t1622, t1623); }); wv t1625 = v965_scope; wv t1626 = v966_f; rt_chk(s856_aexpr(up, t1624, t1625, t1626), "aexpr"); });
       }
       v968_k = rt_add(v968_k, rt_i(1));
     }
@@ -7006,60 +7517,60 @@ static wv s856_aexpr(struct fr183 *up, wv v964_e, wv v965_scope, wv v966_f) {
     (void)rt_chk(s853_use(up, v964_e, v965_scope, v966_f), "aexpr");
   } else if (rt_cond(rt_eq(v967_kind, rt_s(&S186)))) {
     wv v969_k = rt_i(0);
-    while (rt_cond(({ wv t1622 = v969_k; wv t1623 = std_length(rt_get(&F_items, v964_e)); rt_lt(t1622, t1623); }))) {
-      (void)({ wv t1626 = ({ wv t1624 = v969_k; wv t1625 = rt_get(&F_items, v964_e); rt_idx(t1624, t1625); }); wv t1627 = v965_scope; wv t1628 = v966_f; rt_chk(s856_aexpr(up, t1626, t1627, t1628), "aexpr"); });
+    while (rt_cond(({ wv t1627 = v969_k; wv t1628 = std_length(rt_get(&F_items, v964_e)); rt_lt(t1627, t1628); }))) {
+      (void)({ wv t1631 = ({ wv t1629 = v969_k; wv t1630 = rt_get(&F_items, v964_e); rt_idx(t1629, t1630); }); wv t1632 = v965_scope; wv t1633 = v966_f; rt_chk(s856_aexpr(up, t1631, t1632, t1633), "aexpr"); });
       v969_k = rt_add(v969_k, rt_i(1));
     }
   } else if (rt_cond(rt_eq(v967_kind, rt_s(&S187)))) {
     wv v970_k = rt_i(0);
-    while (rt_cond(({ wv t1629 = v970_k; wv t1630 = std_length(rt_get(&F_fields, v964_e)); rt_lt(t1629, t1630); }))) {
-      (void)({ wv t1633 = rt_get(&F_e, ({ wv t1631 = v970_k; wv t1632 = rt_get(&F_fields, v964_e); rt_idx(t1631, t1632); })); wv t1634 = v965_scope; wv t1635 = v966_f; rt_chk(s856_aexpr(up, t1633, t1634, t1635), "aexpr"); });
+    while (rt_cond(({ wv t1634 = v970_k; wv t1635 = std_length(rt_get(&F_fields, v964_e)); rt_lt(t1634, t1635); }))) {
+      (void)({ wv t1638 = rt_get(&F_e, ({ wv t1636 = v970_k; wv t1637 = rt_get(&F_fields, v964_e); rt_idx(t1636, t1637); })); wv t1639 = v965_scope; wv t1640 = v966_f; rt_chk(s856_aexpr(up, t1638, t1639, t1640), "aexpr"); });
       v970_k = rt_add(v970_k, rt_i(1));
     }
   } else if (rt_cond(rt_eq(v967_kind, rt_s(&S188)))) {
-    (void)({ wv t1636 = rt_get(&F_index, v964_e); wv t1637 = v965_scope; wv t1638 = v966_f; rt_chk(s856_aexpr(up, t1636, t1637, t1638), "aexpr"); });
-    (void)({ wv t1639 = rt_get(&F_arr, v964_e); wv t1640 = v965_scope; wv t1641 = v966_f; rt_chk(s856_aexpr(up, t1639, t1640, t1641), "aexpr"); });
+    (void)({ wv t1641 = rt_get(&F_index, v964_e); wv t1642 = v965_scope; wv t1643 = v966_f; rt_chk(s856_aexpr(up, t1641, t1642, t1643), "aexpr"); });
+    (void)({ wv t1644 = rt_get(&F_arr, v964_e); wv t1645 = v965_scope; wv t1646 = v966_f; rt_chk(s856_aexpr(up, t1644, t1645, t1646), "aexpr"); });
   } else if (rt_cond(rt_eq(v967_kind, rt_s(&S189)))) {
-    if (rt_cond(rt_not(({ wv t1642 = rt_get(&F_rec, v964_e); wv t1643 = v965_scope; rt_chk(s855_notValue(up, t1642, t1643), "aexpr"); })))) {
-      (void)({ wv t1644 = rt_get(&F_rec, v964_e); wv t1645 = v965_scope; wv t1646 = v966_f; rt_chk(s856_aexpr(up, t1644, t1645, t1646), "aexpr"); });
+    if (rt_cond(rt_not(({ wv t1647 = rt_get(&F_rec, v964_e); wv t1648 = v965_scope; rt_chk(s855_notValue(up, t1647, t1648), "aexpr"); })))) {
+      (void)({ wv t1649 = rt_get(&F_rec, v964_e); wv t1650 = v965_scope; wv t1651 = v966_f; rt_chk(s856_aexpr(up, t1649, t1650, t1651), "aexpr"); });
     }
   } else if (rt_cond(rt_eq(v967_kind, rt_s(&S190)))) {
-    (void)({ wv t1647 = rt_get(&F_e, v964_e); wv t1648 = v965_scope; wv t1649 = v966_f; rt_chk(s856_aexpr(up, t1647, t1648, t1649), "aexpr"); });
+    (void)({ wv t1652 = rt_get(&F_e, v964_e); wv t1653 = v965_scope; wv t1654 = v966_f; rt_chk(s856_aexpr(up, t1652, t1653, t1654), "aexpr"); });
   } else if (rt_cond(rt_eq(v967_kind, rt_s(&S191)))) {
-    (void)({ wv t1650 = rt_get(&F_l, v964_e); wv t1651 = v965_scope; wv t1652 = v966_f; rt_chk(s856_aexpr(up, t1650, t1651, t1652), "aexpr"); });
-    (void)({ wv t1653 = rt_get(&F_r, v964_e); wv t1654 = v965_scope; wv t1655 = v966_f; rt_chk(s856_aexpr(up, t1653, t1654, t1655), "aexpr"); });
+    (void)({ wv t1655 = rt_get(&F_l, v964_e); wv t1656 = v965_scope; wv t1657 = v966_f; rt_chk(s856_aexpr(up, t1655, t1656, t1657), "aexpr"); });
+    (void)({ wv t1658 = rt_get(&F_r, v964_e); wv t1659 = v965_scope; wv t1660 = v966_f; rt_chk(s856_aexpr(up, t1658, t1659, t1660), "aexpr"); });
   } else if (rt_cond(rt_eq(v967_kind, rt_s(&S192)))) {
-    (void)({ wv t1656 = rt_get(&F_c, v964_e); wv t1657 = v965_scope; wv t1658 = v966_f; rt_chk(s856_aexpr(up, t1656, t1657, t1658), "aexpr"); });
-    (void)({ wv t1659 = rt_get(&F_a, v964_e); wv t1660 = v965_scope; wv t1661 = v966_f; rt_chk(s856_aexpr(up, t1659, t1660, t1661), "aexpr"); });
-    (void)({ wv t1662 = rt_get(&F_b, v964_e); wv t1663 = v965_scope; wv t1664 = v966_f; rt_chk(s856_aexpr(up, t1662, t1663, t1664), "aexpr"); });
+    (void)({ wv t1661 = rt_get(&F_c, v964_e); wv t1662 = v965_scope; wv t1663 = v966_f; rt_chk(s856_aexpr(up, t1661, t1662, t1663), "aexpr"); });
+    (void)({ wv t1664 = rt_get(&F_a, v964_e); wv t1665 = v965_scope; wv t1666 = v966_f; rt_chk(s856_aexpr(up, t1664, t1665, t1666), "aexpr"); });
+    (void)({ wv t1667 = rt_get(&F_b, v964_e); wv t1668 = v965_scope; wv t1669 = v966_f; rt_chk(s856_aexpr(up, t1667, t1668, t1669), "aexpr"); });
   } else if (rt_cond(rt_eq(v967_kind, rt_s(&S182)))) {
     wv v971_k = rt_i(0);
-    while (rt_cond(({ wv t1665 = v971_k; wv t1666 = std_length(rt_get(&F_args, v964_e)); rt_lt(t1665, t1666); }))) {
-      (void)({ wv t1669 = ({ wv t1667 = v971_k; wv t1668 = rt_get(&F_args, v964_e); rt_idx(t1667, t1668); }); wv t1670 = v965_scope; wv t1671 = v966_f; rt_chk(s856_aexpr(up, t1669, t1670, t1671), "aexpr"); });
+    while (rt_cond(({ wv t1670 = v971_k; wv t1671 = std_length(rt_get(&F_args, v964_e)); rt_lt(t1670, t1671); }))) {
+      (void)({ wv t1674 = ({ wv t1672 = v971_k; wv t1673 = rt_get(&F_args, v964_e); rt_idx(t1672, t1673); }); wv t1675 = v965_scope; wv t1676 = v966_f; rt_chk(s856_aexpr(up, t1674, t1675, t1676), "aexpr"); });
       v971_k = rt_add(v971_k, rt_i(1));
     }
     if (rt_cond(rt_eq(rt_get(&F_k, rt_get(&F_callee, v964_e)), rt_s(&S211)))) {
-      ({ wv t1674 = rt_get(&F_d, ({ wv t1672 = v965_scope; wv t1673 = rt_get(&F_name, rt_get(&F_callee, v964_e)); rt_chk(s847_find(up, t1672, t1673), "aexpr"); })); wv t1675 = rt_get(&F_pos, rt_get(&F_callee, v964_e)); wv t1676 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1674, t1675, t1676); });
+      ({ wv t1679 = rt_get(&F_d, ({ wv t1677 = v965_scope; wv t1678 = rt_get(&F_name, rt_get(&F_callee, v964_e)); rt_chk(s847_find(up, t1677, t1678), "aexpr"); })); wv t1680 = rt_get(&F_pos, rt_get(&F_callee, v964_e)); wv t1681 = rt_def(up->v839_curSlot, "curSlot"); rt_set_idx(t1679, t1680, t1681); });
     }
   } else if (rt_cond(rt_eq(v967_kind, rt_s(&S184)))) {
     wv v972_k = rt_i(0);
-    while (rt_cond(({ wv t1677 = v972_k; wv t1678 = std_length(rt_get(&F_branches, v964_e)); rt_lt(t1677, t1678); }))) {
-      (void)({ wv t1681 = rt_get(&F_cond, ({ wv t1679 = v972_k; wv t1680 = rt_get(&F_branches, v964_e); rt_idx(t1679, t1680); })); wv t1682 = v965_scope; wv t1683 = v966_f; rt_chk(s856_aexpr(up, t1681, t1682, t1683), "aexpr"); });
-      (void)({ wv t1686 = rt_get(&F_body, ({ wv t1684 = v972_k; wv t1685 = rt_get(&F_branches, v964_e); rt_idx(t1684, t1685); })); wv t1687 = rt_chk(s845_newScope(up, v965_scope), "aexpr"); wv t1688 = v966_f; rt_chk(s851_ablock(up, t1686, t1687, t1688, RT_NULL), "aexpr"); });
+    while (rt_cond(({ wv t1682 = v972_k; wv t1683 = std_length(rt_get(&F_branches, v964_e)); rt_lt(t1682, t1683); }))) {
+      (void)({ wv t1686 = rt_get(&F_cond, ({ wv t1684 = v972_k; wv t1685 = rt_get(&F_branches, v964_e); rt_idx(t1684, t1685); })); wv t1687 = v965_scope; wv t1688 = v966_f; rt_chk(s856_aexpr(up, t1686, t1687, t1688), "aexpr"); });
+      (void)({ wv t1691 = rt_get(&F_body, ({ wv t1689 = v972_k; wv t1690 = rt_get(&F_branches, v964_e); rt_idx(t1689, t1690); })); wv t1692 = rt_chk(s845_newScope(up, v965_scope), "aexpr"); wv t1693 = v966_f; rt_chk(s851_ablock(up, t1691, t1692, t1693, RT_NULL), "aexpr"); });
       v972_k = rt_add(v972_k, rt_i(1));
     }
     if (rt_cond(rt_ne(rt_get(&F_els, v964_e), RT_NULL))) {
-      (void)({ wv t1689 = rt_get(&F_els, v964_e); wv t1690 = rt_chk(s845_newScope(up, v965_scope), "aexpr"); wv t1691 = v966_f; rt_chk(s851_ablock(up, t1689, t1690, t1691, RT_NULL), "aexpr"); });
+      (void)({ wv t1694 = rt_get(&F_els, v964_e); wv t1695 = rt_chk(s845_newScope(up, v965_scope), "aexpr"); wv t1696 = v966_f; rt_chk(s851_ablock(up, t1694, t1695, t1696, RT_NULL), "aexpr"); });
     }
   } else if (rt_cond(rt_eq(v967_kind, rt_s(&S44)))) {
-    (void)({ wv t1692 = rt_get(&F_subject, v964_e); wv t1693 = v965_scope; wv t1694 = v966_f; rt_chk(s856_aexpr(up, t1692, t1693, t1694), "aexpr"); });
+    (void)({ wv t1697 = rt_get(&F_subject, v964_e); wv t1698 = v965_scope; wv t1699 = v966_f; rt_chk(s856_aexpr(up, t1697, t1698, t1699), "aexpr"); });
     wv v973_k = rt_i(0);
-    while (rt_cond(({ wv t1695 = v973_k; wv t1696 = std_length(rt_get(&F_cases, v964_e)); rt_lt(t1695, t1696); }))) {
-      (void)({ wv t1699 = rt_get(&F_body, ({ wv t1697 = v973_k; wv t1698 = rt_get(&F_cases, v964_e); rt_idx(t1697, t1698); })); wv t1700 = rt_chk(s845_newScope(up, v965_scope), "aexpr"); wv t1701 = v966_f; rt_chk(s851_ablock(up, t1699, t1700, t1701, RT_NULL), "aexpr"); });
+    while (rt_cond(({ wv t1700 = v973_k; wv t1701 = std_length(rt_get(&F_cases, v964_e)); rt_lt(t1700, t1701); }))) {
+      (void)({ wv t1704 = rt_get(&F_body, ({ wv t1702 = v973_k; wv t1703 = rt_get(&F_cases, v964_e); rt_idx(t1702, t1703); })); wv t1705 = rt_chk(s845_newScope(up, v965_scope), "aexpr"); wv t1706 = v966_f; rt_chk(s851_ablock(up, t1704, t1705, t1706, RT_NULL), "aexpr"); });
       v973_k = rt_add(v973_k, rt_i(1));
     }
     if (rt_cond(rt_ne(rt_get(&F_els, v964_e), RT_NULL))) {
-      (void)({ wv t1702 = rt_get(&F_els, v964_e); wv t1703 = rt_chk(s845_newScope(up, v965_scope), "aexpr"); wv t1704 = v966_f; rt_chk(s851_ablock(up, t1702, t1703, t1704, RT_NULL), "aexpr"); });
+      (void)({ wv t1707 = rt_get(&F_els, v964_e); wv t1708 = rt_chk(s845_newScope(up, v965_scope), "aexpr"); wv t1709 = v966_f; rt_chk(s851_ablock(up, t1707, t1708, t1709, RT_NULL), "aexpr"); });
     }
   }
   RT_RET(RT_NULL);
@@ -7068,69 +7579,69 @@ static wv s856_aexpr(struct fr183 *up, wv v964_e, wv v965_scope, wv v966_f) {
 static wv s857_analyze(struct fr183 *up, wv v974_m) {
   rt_enter("analyze");
   v974_m = rt_bind(v974_m, 0);
-  wv t1705 = rt_bind(v974_m, 1);
+  wv t1710 = rt_bind(v974_m, 1);
   (void)rt_def(up->v837_curMod, "curMod");
-  up->v837_curMod = t1705;
-  wv t1706 = rt_bind(rt_chk(s843_modId(up, v974_m), "analyze"), 1);
+  up->v837_curMod = t1710;
+  wv t1711 = rt_bind(rt_chk(s843_modId(up, v974_m), "analyze"), 1);
   (void)rt_def(up->v838_mod, "mod");
-  up->v838_mod = t1706;
+  up->v838_mod = t1711;
   wv v975_top = rt_bind(rt_chk(s849_newFn(up, RT_NULL, RT_NULL), "analyze"), 0);
-  (void)({ wv t1707 = rt_def(up->v835_tops, "tops"); wv t1708 = v975_top; std_push(t1707, t1708); });
+  (void)({ wv t1712 = rt_def(up->v835_tops, "tops"); wv t1713 = v975_top; std_push(t1712, t1713); });
   wv v976_slot = rt_arr(0, NULL, 1);
   wv v977_i = rt_i(0);
-  while (rt_cond(({ wv t1709 = v977_i; wv t1710 = std_length(rt_get(&F_chars, rt_idx(v974_m, up->v818_modules))); rt_le(t1709, t1710); }))) {
+  while (rt_cond(({ wv t1714 = v977_i; wv t1715 = std_length(rt_get(&F_chars, rt_idx(v974_m, up->v818_modules))); rt_le(t1714, t1715); }))) {
     (void)std_push(v976_slot, RT_NULL);
     v977_i = rt_add(v977_i, rt_i(1));
   }
-  (void)({ wv t1711 = rt_def(up->v836_slots, "slots"); wv t1712 = v976_slot; std_push(t1711, t1712); });
-  wv t1713 = rt_bind(v976_slot, 1);
+  (void)({ wv t1716 = rt_def(up->v836_slots, "slots"); wv t1717 = v976_slot; std_push(t1716, t1717); });
+  wv t1718 = rt_bind(v976_slot, 1);
   (void)rt_def(up->v839_curSlot, "curSlot");
-  up->v839_curSlot = t1713;
+  up->v839_curSlot = t1718;
   wv v978_scope = rt_bind(rt_chk(s845_newScope(up, RT_NULL), "analyze"), 0);
   wv v979_imports = rt_bind(rt_get(&F_imports, rt_idx(v974_m, up->v818_modules)), 0);
   wv v980_k = rt_i(0);
-  while (rt_cond(({ wv t1714 = v980_k; wv t1715 = std_length(v979_imports); rt_lt(t1714, t1715); }))) {
-    (void)({ wv t1716 = v978_scope; wv t1717 = rt_get(&F_name, rt_get(&F_node, rt_idx(v980_k, v979_imports))); rt_chk(s846_put(up, t1716, t1717, rt_s(&S388), RT_NULL), "analyze"); });
+  while (rt_cond(({ wv t1719 = v980_k; wv t1720 = std_length(v979_imports); rt_lt(t1719, t1720); }))) {
+    (void)({ wv t1721 = v978_scope; wv t1722 = rt_get(&F_name, rt_get(&F_node, rt_idx(v980_k, v979_imports))); rt_chk(s846_put(up, t1721, t1722, rt_s(&S393), RT_NULL), "analyze"); });
     v980_k = rt_add(v980_k, rt_i(1));
   }
-  (void)({ wv t1718 = rt_rec(0, 2, K48, (wv[]){ rt_get(&F_stmts, rt_get(&F_program, rt_idx(v974_m, up->v818_modules))), RT_NULL }); wv t1719 = v978_scope; wv t1720 = v975_top; wv t1721 = v978_scope; rt_chk(s851_ablock(up, t1718, t1719, t1720, t1721), "analyze"); });
+  (void)({ wv t1723 = rt_rec(0, 2, K48, (wv[]){ rt_get(&F_stmts, rt_get(&F_program, rt_idx(v974_m, up->v818_modules))), RT_NULL }); wv t1724 = v978_scope; wv t1725 = v975_top; wv t1726 = v978_scope; rt_chk(s851_ablock(up, t1723, t1724, t1725, t1726), "analyze"); });
   RT_RET(RT_NULL);
 }
 
 static wv s858_enter(struct fr183 *up, wv v981_m) {
   rt_enter("enter");
   v981_m = rt_bind(v981_m, 0);
-  (void)({ wv t1722 = rt_get(&F_file, rt_idx(v981_m, up->v818_modules)); wv t1723 = rt_get(&F_chars, rt_idx(v981_m, up->v818_modules)); rt_chk(w2_setSource(t1722, t1723), "enter"); });
-  wv t1724 = rt_bind(v981_m, 1);
+  (void)({ wv t1727 = rt_get(&F_file, rt_idx(v981_m, up->v818_modules)); wv t1728 = rt_get(&F_chars, rt_idx(v981_m, up->v818_modules)); rt_chk(w2_setSource(t1727, t1728), "enter"); });
+  wv t1729 = rt_bind(v981_m, 1);
   (void)rt_def(up->v837_curMod, "curMod");
-  up->v837_curMod = t1724;
-  wv t1725 = rt_bind(rt_chk(s843_modId(up, v981_m), "enter"), 1);
+  up->v837_curMod = t1729;
+  wv t1730 = rt_bind(rt_chk(s843_modId(up, v981_m), "enter"), 1);
   (void)rt_def(up->v838_mod, "mod");
-  up->v838_mod = t1725;
-  wv t1728 = rt_bind(({ wv t1726 = v981_m; wv t1727 = rt_def(up->v836_slots, "slots"); rt_idx(t1726, t1727); }), 1);
+  up->v838_mod = t1730;
+  wv t1733 = rt_bind(({ wv t1731 = v981_m; wv t1732 = rt_def(up->v836_slots, "slots"); rt_idx(t1731, t1732); }), 1);
   (void)rt_def(up->v839_curSlot, "curSlot");
-  up->v839_curSlot = t1728;
-  wv t1731 = rt_bind(({ wv t1729 = v981_m; wv t1730 = rt_def(up->v835_tops, "tops"); rt_idx(t1729, t1730); }), 1);
+  up->v839_curSlot = t1733;
+  wv t1736 = rt_bind(({ wv t1734 = v981_m; wv t1735 = rt_def(up->v835_tops, "tops"); rt_idx(t1734, t1735); }), 1);
   (void)rt_def(up->v842_cur, "cur");
-  up->v842_cur = t1731;
-  wv t1732 = rt_arr(0, NULL, 1);
+  up->v842_cur = t1736;
+  wv t1737 = rt_arr(0, NULL, 1);
   (void)rt_def(up->v840_stolen, "stolen");
-  up->v840_stolen = t1732;
-  wv t1733 = rt_arr(0, NULL, 1);
+  up->v840_stolen = t1737;
+  wv t1738 = rt_arr(0, NULL, 1);
   (void)rt_def(up->v841_ownEnums, "ownEnums");
-  up->v841_ownEnums = t1733;
+  up->v841_ownEnums = t1738;
   wv v982_list = rt_bind(rt_get(&F_stmts, rt_get(&F_program, rt_idx(v981_m, up->v818_modules))), 0);
   wv v983_k = rt_i(0);
-  while (rt_cond(({ wv t1734 = v983_k; wv t1735 = std_length(v982_list); rt_lt(t1734, t1735); }))) {
+  while (rt_cond(({ wv t1739 = v983_k; wv t1740 = std_length(v982_list); rt_lt(t1739, t1740); }))) {
     if (rt_cond(rt_eq(rt_get(&F_k, rt_idx(v983_k, v982_list)), rt_s(&S46)))) {
-      (void)({ wv t1736 = rt_def(up->v841_ownEnums, "ownEnums"); wv t1737 = rt_idx(v983_k, v982_list); std_push(t1736, t1737); });
+      (void)({ wv t1741 = rt_def(up->v841_ownEnums, "ownEnums"); wv t1742 = rt_idx(v983_k, v982_list); std_push(t1741, t1742); });
     }
     v983_k = rt_add(v983_k, rt_i(1));
   }
   wv v984_imports = rt_bind(rt_get(&F_imports, rt_idx(v981_m, up->v818_modules)), 0);
   v983_k = rt_i(0);
-  while (rt_cond(({ wv t1738 = v983_k; wv t1739 = std_length(v984_imports); rt_lt(t1738, t1739); }))) {
-    (void)({ wv t1742 = rt_def(up->v840_stolen, "stolen"); wv t1743 = ({ wv t1740 = rt_get(&F_name, rt_get(&F_node, rt_idx(v983_k, v984_imports))); wv t1741 = rt_get(&F_lib, rt_idx(v983_k, v984_imports)); rt_rec(0, 2, K49, (wv[]){ t1740, t1741 }); }); std_push(t1742, t1743); });
+  while (rt_cond(({ wv t1743 = v983_k; wv t1744 = std_length(v984_imports); rt_lt(t1743, t1744); }))) {
+    (void)({ wv t1747 = rt_def(up->v840_stolen, "stolen"); wv t1748 = ({ wv t1745 = rt_get(&F_name, rt_get(&F_node, rt_idx(v983_k, v984_imports))); wv t1746 = rt_get(&F_lib, rt_idx(v983_k, v984_imports)); rt_rec(0, 2, K49, (wv[]){ t1745, t1746 }); }); std_push(t1747, t1748); });
     v983_k = rt_add(v983_k, rt_i(1));
   }
   RT_RET(RT_NULL);
@@ -7139,7 +7650,7 @@ static wv s858_enter(struct fr183 *up, wv v981_m) {
 static wv s859_emit(struct fr183 *up, wv v985_line) {
   rt_enter("emit");
   v985_line = rt_bind(v985_line, 0);
-  (void)({ wv t1746 = rt_def(up->v829_out, "out"); wv t1747 = ({ wv t1744 = rt_chk(w7_repeat(rt_s(&S480), rt_def(up->v830_indent, "indent")), "emit"); wv t1745 = v985_line; rt_add(t1744, t1745); }); std_push(t1746, t1747); });
+  (void)({ wv t1751 = rt_def(up->v829_out, "out"); wv t1752 = ({ wv t1749 = rt_chk(w7_repeat(rt_s(&S485), rt_def(up->v830_indent, "indent")), "emit"); wv t1750 = v985_line; rt_add(t1749, t1750); }); std_push(t1751, t1752); });
   RT_RET(RT_NULL);
 }
 
@@ -7154,22 +7665,22 @@ static wv s861_str(struct fr183 *up, wv v987_s) {
   rt_enter("str");
   v987_s = rt_bind(v987_s, 0);
   wv v988_k = rt_i(0);
-  while (rt_cond(rt_b(rt_bool(({ wv t1748 = v988_k; wv t1749 = std_length(rt_def(up->v822_strings, "strings")); rt_lt(t1748, t1749); }), "&&") && rt_bool(({ wv t1752 = ({ wv t1750 = v988_k; wv t1751 = rt_def(up->v822_strings, "strings"); rt_idx(t1750, t1751); }); wv t1753 = v987_s; rt_ne(t1752, t1753); }), "&&")))) {
+  while (rt_cond(rt_b(rt_bool(({ wv t1753 = v988_k; wv t1754 = std_length(rt_def(up->v822_strings, "strings")); rt_lt(t1753, t1754); }), "&&") && rt_bool(({ wv t1757 = ({ wv t1755 = v988_k; wv t1756 = rt_def(up->v822_strings, "strings"); rt_idx(t1755, t1756); }); wv t1758 = v987_s; rt_ne(t1757, t1758); }), "&&")))) {
     v988_k = rt_add(v988_k, rt_i(1));
   }
-  if (rt_cond(({ wv t1754 = v988_k; wv t1755 = std_length(rt_def(up->v822_strings, "strings")); rt_eq(t1754, t1755); }))) {
-    (void)({ wv t1756 = rt_def(up->v822_strings, "strings"); wv t1757 = v987_s; std_push(t1756, t1757); });
+  if (rt_cond(({ wv t1759 = v988_k; wv t1760 = std_length(rt_def(up->v822_strings, "strings")); rt_eq(t1759, t1760); }))) {
+    (void)({ wv t1761 = rt_def(up->v822_strings, "strings"); wv t1762 = v987_s; std_push(t1761, t1762); });
   }
-  RT_RET(rt_cat(2, (wv[]){ rt_s(&S574), rt_text(v988_k) }));
+  RT_RET(rt_cat(2, (wv[]){ rt_s(&S579), rt_text(v988_k) }));
 }
 
 static wv s862_fieldRef(struct fr183 *up, wv v989_name) {
   rt_enter("fieldRef");
   v989_name = rt_bind(v989_name, 0);
-  if (rt_cond(rt_not(({ wv t1758 = rt_def(up->v823_fields, "fields"); wv t1759 = v989_name; rt_chk(w1_contains(t1758, t1759), "fieldRef"); })))) {
-    (void)({ wv t1760 = rt_def(up->v823_fields, "fields"); wv t1761 = v989_name; std_push(t1760, t1761); });
+  if (rt_cond(rt_not(({ wv t1763 = rt_def(up->v823_fields, "fields"); wv t1764 = v989_name; rt_chk(w1_contains(t1763, t1764), "fieldRef"); })))) {
+    (void)({ wv t1765 = rt_def(up->v823_fields, "fields"); wv t1766 = v989_name; std_push(t1765, t1766); });
   }
-  RT_RET(rt_cat(2, (wv[]){ rt_s(&S575), rt_text(v989_name) }));
+  RT_RET(rt_cat(2, (wv[]){ rt_s(&S580), rt_text(v989_name) }));
 }
 
 static wv s863_enumDef(struct fr183 *up, wv v990_s, wv v991_m) {
@@ -7179,11 +7690,11 @@ static wv s863_enumDef(struct fr183 *up, wv v990_s, wv v991_m) {
   wv v992_nm = rt_bind(rt_chk(s861_str(up, rt_get(&F_name, v990_s)), "enumDef"), 0);
   wv v993_members = rt_arr(0, NULL, 1);
   wv v994_k = rt_i(0);
-  while (rt_cond(({ wv t1762 = v994_k; wv t1763 = std_length(rt_get(&F_members, v990_s)); rt_lt(t1762, t1763); }))) {
-    (void)({ wv t1768 = v993_members; wv t1769 = ({ wv t1766 = rt_text(v992_nm); wv t1767 = rt_text(rt_chk(s861_str(up, rt_get(&F_name, ({ wv t1764 = v994_k; wv t1765 = rt_get(&F_members, v990_s); rt_idx(t1764, t1765); }))), "enumDef")); rt_cat(5, (wv[]){ rt_s(&S568), t1766, rt_s(&S385), t1767, rt_s(&S570) }); }); std_push(t1768, t1769); });
+  while (rt_cond(({ wv t1767 = v994_k; wv t1768 = std_length(rt_get(&F_members, v990_s)); rt_lt(t1767, t1768); }))) {
+    (void)({ wv t1773 = v993_members; wv t1774 = ({ wv t1771 = rt_text(v992_nm); wv t1772 = rt_text(rt_chk(s861_str(up, rt_get(&F_name, ({ wv t1769 = v994_k; wv t1770 = rt_get(&F_members, v990_s); rt_idx(t1769, t1770); }))), "enumDef")); rt_cat(5, (wv[]){ rt_s(&S573), t1771, rt_s(&S390), t1772, rt_s(&S575) }); }); std_push(t1773, t1774); });
     v994_k = rt_add(v994_k, rt_i(1));
   }
-  (void)({ wv t1773 = rt_def(up->v825_enumDefs, "enumDefs"); wv t1774 = ({ wv t1770 = rt_text(v991_m); wv t1771 = rt_text(rt_get(&F_name, v990_s)); wv t1772 = rt_text(std_join(v993_members, rt_s(&S385))); rt_cat(7, (wv[]){ rt_s(&S576), t1770, rt_s(&S12), t1771, rt_s(&S577), t1772, rt_s(&S578) }); }); std_push(t1773, t1774); });
+  (void)({ wv t1778 = rt_def(up->v825_enumDefs, "enumDefs"); wv t1779 = ({ wv t1775 = rt_text(v991_m); wv t1776 = rt_text(rt_get(&F_name, v990_s)); wv t1777 = rt_text(std_join(v993_members, rt_s(&S390))); rt_cat(7, (wv[]){ rt_s(&S581), t1775, rt_s(&S12), t1776, rt_s(&S582), t1777, rt_s(&S583) }); }); std_push(t1778, t1779); });
   RT_RET(RT_NULL);
 }
 
@@ -7193,9 +7704,9 @@ static wv s864_stolenFrom(struct fr183 *up, wv v995_x) {
     RT_RET(RT_NULL);
   }
   wv v996_k = rt_i(0);
-  while (rt_cond(({ wv t1775 = v996_k; wv t1776 = std_length(rt_def(up->v840_stolen, "stolen")); rt_lt(t1775, t1776); }))) {
-    if (rt_cond(({ wv t1779 = rt_get(&F_name, ({ wv t1777 = v996_k; wv t1778 = rt_def(up->v840_stolen, "stolen"); rt_idx(t1777, t1778); })); wv t1780 = rt_get(&F_name, v995_x); rt_eq(t1779, t1780); }))) {
-      RT_RET(rt_get(&F_lib, ({ wv t1781 = v996_k; wv t1782 = rt_def(up->v840_stolen, "stolen"); rt_idx(t1781, t1782); })));
+  while (rt_cond(({ wv t1780 = v996_k; wv t1781 = std_length(rt_def(up->v840_stolen, "stolen")); rt_lt(t1780, t1781); }))) {
+    if (rt_cond(({ wv t1784 = rt_get(&F_name, ({ wv t1782 = v996_k; wv t1783 = rt_def(up->v840_stolen, "stolen"); rt_idx(t1782, t1783); })); wv t1785 = rt_get(&F_name, v995_x); rt_eq(t1784, t1785); }))) {
+      RT_RET(rt_get(&F_lib, ({ wv t1786 = v996_k; wv t1787 = rt_def(up->v840_stolen, "stolen"); rt_idx(t1786, t1787); })));
     }
     v996_k = rt_add(v996_k, rt_i(1));
   }
@@ -7206,8 +7717,8 @@ static wv s865_enumIn(struct fr183 *up, wv v997_list, wv v998_name) {
   rt_enter("enumIn");
   v998_name = rt_bind(v998_name, 0);
   wv v999_k = rt_i(0);
-  while (rt_cond(({ wv t1783 = v999_k; wv t1784 = std_length(v997_list); rt_lt(t1783, t1784); }))) {
-    if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_k, rt_idx(v999_k, v997_list)), rt_s(&S46)), "&&") && rt_bool(({ wv t1785 = rt_get(&F_name, rt_idx(v999_k, v997_list)); wv t1786 = v998_name; rt_eq(t1785, t1786); }), "&&")))) {
+  while (rt_cond(({ wv t1788 = v999_k; wv t1789 = std_length(v997_list); rt_lt(t1788, t1789); }))) {
+    if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_k, rt_idx(v999_k, v997_list)), rt_s(&S46)), "&&") && rt_bool(({ wv t1790 = rt_get(&F_name, rt_idx(v999_k, v997_list)); wv t1791 = v998_name; rt_eq(t1790, t1791); }), "&&")))) {
       RT_RET(rt_idx(v999_k, v997_list));
     }
     v999_k = rt_add(v999_k, rt_i(1));
@@ -7218,8 +7729,8 @@ static wv s865_enumIn(struct fr183 *up, wv v997_list, wv v998_name) {
 static wv s866_enumOf(struct fr183 *up, wv v1000_x) {
   rt_enter("enumOf");
   if (rt_cond(rt_eq(rt_get(&F_k, v1000_x), rt_s(&S211)))) {
-    wv v1004_s = rt_bind(({ wv t1787 = rt_def(up->v841_ownEnums, "ownEnums"); wv t1788 = rt_get(&F_name, v1000_x); rt_chk(s865_enumIn(up, t1787, t1788), "enumOf"); }), 0);
-    RT_RET((rt_cond(rt_eq(v1004_s, RT_NULL)) ? RT_NULL : ({ wv t1791 = ({ wv t1789 = rt_text(rt_def(up->v838_mod, "mod")); wv t1790 = rt_text(rt_get(&F_name, v1000_x)); rt_cat(4, (wv[]){ rt_s(&S479), t1789, rt_s(&S12), t1790 }); }); wv t1792 = v1004_s; rt_rec(0, 2, K54, (wv[]){ t1791, t1792 }); })));
+    wv v1004_s = rt_bind(({ wv t1792 = rt_def(up->v841_ownEnums, "ownEnums"); wv t1793 = rt_get(&F_name, v1000_x); rt_chk(s865_enumIn(up, t1792, t1793), "enumOf"); }), 0);
+    RT_RET((rt_cond(rt_eq(v1004_s, RT_NULL)) ? RT_NULL : ({ wv t1796 = ({ wv t1794 = rt_text(rt_def(up->v838_mod, "mod")); wv t1795 = rt_text(rt_get(&F_name, v1000_x)); rt_cat(4, (wv[]){ rt_s(&S484), t1794, rt_s(&S12), t1795 }); }); wv t1797 = v1004_s; rt_rec(0, 2, K54, (wv[]){ t1796, t1797 }); })));
   }
   if (rt_cond(rt_ne(rt_get(&F_k, v1000_x), rt_s(&S189)))) {
     RT_RET(RT_NULL);
@@ -7230,38 +7741,38 @@ static wv s866_enumOf(struct fr183 *up, wv v1000_x) {
   }
   wv v1002_xs = rt_bind(rt_get(&F_exports, rt_idx(v1001_lib, up->v818_modules)), 0);
   wv v1003_k = rt_i(0);
-  while (rt_cond(rt_b(rt_bool(({ wv t1793 = v1003_k; wv t1794 = std_length(v1002_xs); rt_lt(t1793, t1794); }), "&&") && rt_bool(({ wv t1795 = rt_get(&F_name, rt_idx(v1003_k, v1002_xs)); wv t1796 = rt_get(&F_field, v1000_x); rt_ne(t1795, t1796); }), "&&")))) {
+  while (rt_cond(rt_b(rt_bool(({ wv t1798 = v1003_k; wv t1799 = std_length(v1002_xs); rt_lt(t1798, t1799); }), "&&") && rt_bool(({ wv t1800 = rt_get(&F_name, rt_idx(v1003_k, v1002_xs)); wv t1801 = rt_get(&F_field, v1000_x); rt_ne(t1800, t1801); }), "&&")))) {
     v1003_k = rt_add(v1003_k, rt_i(1));
   }
-  if (rt_cond(rt_b(rt_bool(({ wv t1797 = v1003_k; wv t1798 = std_length(v1002_xs); rt_eq(t1797, t1798); }), "||") || rt_bool(rt_ne(rt_get(&F_kind, rt_idx(v1003_k, v1002_xs)), rt_s(&S46)), "||")))) {
+  if (rt_cond(rt_b(rt_bool(({ wv t1802 = v1003_k; wv t1803 = std_length(v1002_xs); rt_eq(t1802, t1803); }), "||") || rt_bool(rt_ne(rt_get(&F_kind, rt_idx(v1003_k, v1002_xs)), rt_s(&S46)), "||")))) {
     RT_RET(RT_NULL);
   }
-  RT_RET(({ wv t1803 = ({ wv t1799 = rt_text(rt_chk(s843_modId(up, v1001_lib), "enumOf")); wv t1800 = rt_text(rt_get(&F_field, v1000_x)); rt_cat(4, (wv[]){ rt_s(&S479), t1799, rt_s(&S12), t1800 }); }); wv t1804 = ({ wv t1801 = rt_get(&F_stmts, rt_get(&F_program, rt_idx(v1001_lib, up->v818_modules))); wv t1802 = rt_get(&F_field, v1000_x); rt_chk(s865_enumIn(up, t1801, t1802), "enumOf"); }); rt_rec(0, 2, K54, (wv[]){ t1803, t1804 }); }));
+  RT_RET(({ wv t1808 = ({ wv t1804 = rt_text(rt_chk(s843_modId(up, v1001_lib), "enumOf")); wv t1805 = rt_text(rt_get(&F_field, v1000_x)); rt_cat(4, (wv[]){ rt_s(&S484), t1804, rt_s(&S12), t1805 }); }); wv t1809 = ({ wv t1806 = rt_get(&F_stmts, rt_get(&F_program, rt_idx(v1001_lib, up->v818_modules))); wv t1807 = rt_get(&F_field, v1000_x); rt_chk(s865_enumIn(up, t1806, t1807), "enumOf"); }); rt_rec(0, 2, K54, (wv[]){ t1808, t1809 }); }));
 }
 
 static wv s867_place(struct fr183 *up, wv v1005_d) {
   rt_enter("place");
   v1005_d = rt_bind(v1005_d, 0);
-  wv v1006_owner = rt_bind(rt_get(&F_func, ({ wv t1805 = v1005_d; wv t1806 = rt_def(up->v833_decls, "decls"); rt_idx(t1805, t1806); })), 0);
-  if (rt_cond(rt_get(&F_top, ({ wv t1807 = v1006_owner; wv t1808 = rt_def(up->v834_fns, "fns"); rt_idx(t1807, t1808); })))) {
-    RT_RET(rt_get(&F_cname, ({ wv t1809 = v1005_d; wv t1810 = rt_def(up->v833_decls, "decls"); rt_idx(t1809, t1810); })));
+  wv v1006_owner = rt_bind(rt_get(&F_func, ({ wv t1810 = v1005_d; wv t1811 = rt_def(up->v833_decls, "decls"); rt_idx(t1810, t1811); })), 0);
+  if (rt_cond(rt_get(&F_top, ({ wv t1812 = v1006_owner; wv t1813 = rt_def(up->v834_fns, "fns"); rt_idx(t1812, t1813); })))) {
+    RT_RET(rt_get(&F_cname, ({ wv t1814 = v1005_d; wv t1815 = rt_def(up->v833_decls, "decls"); rt_idx(t1814, t1815); })));
   }
-  if (rt_cond(({ wv t1811 = v1006_owner; wv t1812 = rt_def(up->v842_cur, "cur"); rt_eq(t1811, t1812); }))) {
-    RT_RET((rt_cond(rt_get(&F_captured, ({ wv t1813 = v1005_d; wv t1814 = rt_def(up->v833_decls, "decls"); rt_idx(t1813, t1814); }))) ? rt_cat(2, (wv[]){ rt_s(&S579), rt_text(rt_get(&F_cname, ({ wv t1815 = v1005_d; wv t1816 = rt_def(up->v833_decls, "decls"); rt_idx(t1815, t1816); }))) }) : rt_get(&F_cname, ({ wv t1817 = v1005_d; wv t1818 = rt_def(up->v833_decls, "decls"); rt_idx(t1817, t1818); }))));
+  if (rt_cond(({ wv t1816 = v1006_owner; wv t1817 = rt_def(up->v842_cur, "cur"); rt_eq(t1816, t1817); }))) {
+    RT_RET((rt_cond(rt_get(&F_captured, ({ wv t1818 = v1005_d; wv t1819 = rt_def(up->v833_decls, "decls"); rt_idx(t1818, t1819); }))) ? rt_cat(2, (wv[]){ rt_s(&S584), rt_text(rt_get(&F_cname, ({ wv t1820 = v1005_d; wv t1821 = rt_def(up->v833_decls, "decls"); rt_idx(t1820, t1821); }))) }) : rt_get(&F_cname, ({ wv t1822 = v1005_d; wv t1823 = rt_def(up->v833_decls, "decls"); rt_idx(t1822, t1823); }))));
   }
-  RT_RET(({ wv t1827 = rt_text(rt_chk(w7_repeat(rt_s(&S581), rt_sub(({ wv t1823 = rt_get(&F_depth, ({ wv t1819 = rt_def(up->v842_cur, "cur"); wv t1820 = rt_def(up->v834_fns, "fns"); rt_idx(t1819, t1820); })); wv t1824 = rt_get(&F_depth, ({ wv t1821 = v1006_owner; wv t1822 = rt_def(up->v834_fns, "fns"); rt_idx(t1821, t1822); })); rt_sub(t1823, t1824); }), rt_i(1))), "place")); wv t1828 = rt_text(rt_get(&F_cname, ({ wv t1825 = v1005_d; wv t1826 = rt_def(up->v833_decls, "decls"); rt_idx(t1825, t1826); }))); rt_cat(4, (wv[]){ rt_s(&S580), t1827, rt_s(&S582), t1828 }); }));
+  RT_RET(({ wv t1832 = rt_text(rt_chk(w7_repeat(rt_s(&S586), rt_sub(({ wv t1828 = rt_get(&F_depth, ({ wv t1824 = rt_def(up->v842_cur, "cur"); wv t1825 = rt_def(up->v834_fns, "fns"); rt_idx(t1824, t1825); })); wv t1829 = rt_get(&F_depth, ({ wv t1826 = v1006_owner; wv t1827 = rt_def(up->v834_fns, "fns"); rt_idx(t1826, t1827); })); rt_sub(t1828, t1829); }), rt_i(1))), "place")); wv t1833 = rt_text(rt_get(&F_cname, ({ wv t1830 = v1005_d; wv t1831 = rt_def(up->v833_decls, "decls"); rt_idx(t1830, t1831); }))); rt_cat(4, (wv[]){ rt_s(&S585), t1832, rt_s(&S587), t1833 }); }));
 }
 
 static wv s868_tdz(struct fr183 *up, wv v1007_d) {
   rt_enter("tdz");
   v1007_d = rt_bind(v1007_d, 0);
-  RT_RET(rt_b(rt_bool(rt_eq(rt_get(&F_kind, ({ wv t1829 = v1007_d; wv t1830 = rt_def(up->v833_decls, "decls"); rt_idx(t1829, t1830); })), rt_s(&S177)), "&&") && rt_bool(({ wv t1833 = rt_get(&F_func, ({ wv t1831 = v1007_d; wv t1832 = rt_def(up->v833_decls, "decls"); rt_idx(t1831, t1832); })); wv t1834 = rt_def(up->v842_cur, "cur"); rt_ne(t1833, t1834); }), "&&")));
+  RT_RET(rt_b(rt_bool(rt_eq(rt_get(&F_kind, ({ wv t1834 = v1007_d; wv t1835 = rt_def(up->v833_decls, "decls"); rt_idx(t1834, t1835); })), rt_s(&S177)), "&&") && rt_bool(({ wv t1838 = rt_get(&F_func, ({ wv t1836 = v1007_d; wv t1837 = rt_def(up->v833_decls, "decls"); rt_idx(t1836, t1837); })); wv t1839 = rt_def(up->v842_cur, "cur"); rt_ne(t1838, t1839); }), "&&")));
 }
 
 static wv s869_read(struct fr183 *up, wv v1008_d) {
   rt_enter("read");
   v1008_d = rt_bind(v1008_d, 0);
-  RT_RET((rt_cond(rt_chk(s868_tdz(up, v1008_d), "read")) ? ({ wv t1839 = ({ wv t1837 = rt_text(rt_chk(s867_place(up, v1008_d), "read")); wv t1838 = rt_text(rt_chk(w1_quote(rt_get(&F_name, ({ wv t1835 = v1008_d; wv t1836 = rt_def(up->v833_decls, "decls"); rt_idx(t1835, t1836); }))), "read")); rt_cat(5, (wv[]){ rt_s(&S583), t1837, rt_s(&S385), t1838, rt_s(&S16) }); }); wv t1840 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t1839, t1840 }); }) : ({ wv t1841 = rt_chk(s867_place(up, v1008_d), "read"); wv t1842 = rt_def(w7_pureK, "pureK"); rt_rec(0, 2, K55, (wv[]){ t1841, t1842 }); })));
+  RT_RET((rt_cond(rt_chk(s868_tdz(up, v1008_d), "read")) ? ({ wv t1844 = ({ wv t1842 = rt_text(rt_chk(s867_place(up, v1008_d), "read")); wv t1843 = rt_text(rt_chk(w1_quote(rt_get(&F_name, ({ wv t1840 = v1008_d; wv t1841 = rt_def(up->v833_decls, "decls"); rt_idx(t1840, t1841); }))), "read")); rt_cat(5, (wv[]){ rt_s(&S588), t1842, rt_s(&S390), t1843, rt_s(&S16) }); }); wv t1845 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t1844, t1845 }); }) : ({ wv t1846 = rt_chk(s867_place(up, v1008_d), "read"); wv t1847 = rt_def(w7_pureK, "pureK"); rt_rec(0, 2, K55, (wv[]){ t1846, t1847 }); })));
 }
 
 static wv s870_seq(struct fr183 *up, wv v1009_args) {
@@ -7270,11 +7781,11 @@ static wv s870_seq(struct fr183 *up, wv v1009_args) {
   wv v1010_effects = rt_i(0);
   wv v1011_anyPure = rt_b(0);
   wv v1012_k = rt_i(0);
-  while (rt_cond(({ wv t1843 = v1012_k; wv t1844 = std_length(v1009_args); rt_lt(t1843, t1844); }))) {
-    if (rt_cond(({ wv t1845 = rt_get(&F_k, rt_idx(v1012_k, v1009_args)); wv t1846 = rt_def(w7_effectK, "effectK"); rt_eq(t1845, t1846); }))) {
+  while (rt_cond(({ wv t1848 = v1012_k; wv t1849 = std_length(v1009_args); rt_lt(t1848, t1849); }))) {
+    if (rt_cond(({ wv t1850 = rt_get(&F_k, rt_idx(v1012_k, v1009_args)); wv t1851 = rt_def(w7_effectK, "effectK"); rt_eq(t1850, t1851); }))) {
       v1010_effects = rt_add(v1010_effects, rt_i(1));
     }
-    if (rt_cond(({ wv t1847 = rt_get(&F_k, rt_idx(v1012_k, v1009_args)); wv t1848 = rt_def(w7_pureK, "pureK"); rt_eq(t1847, t1848); }))) {
+    if (rt_cond(({ wv t1852 = rt_get(&F_k, rt_idx(v1012_k, v1009_args)); wv t1853 = rt_def(w7_pureK, "pureK"); rt_eq(t1852, t1853); }))) {
       v1011_anyPure = rt_b(1);
     }
     v1012_k = rt_add(v1012_k, rt_i(1));
@@ -7282,39 +7793,39 @@ static wv s870_seq(struct fr183 *up, wv v1009_args) {
   wv v1013_cs = rt_arr(0, NULL, 1);
   if (rt_cond(rt_b(rt_bool(rt_eq(v1010_effects, rt_i(0)), "||") || rt_bool(rt_b(rt_bool(rt_eq(v1010_effects, rt_i(1)), "&&") && rt_bool(rt_not(v1011_anyPure), "&&")), "||")))) {
     v1012_k = rt_i(0);
-    while (rt_cond(({ wv t1849 = v1012_k; wv t1850 = std_length(v1009_args); rt_lt(t1849, t1850); }))) {
-      (void)({ wv t1851 = v1013_cs; wv t1852 = rt_get(&F_c, rt_idx(v1012_k, v1009_args)); std_push(t1851, t1852); });
+    while (rt_cond(({ wv t1854 = v1012_k; wv t1855 = std_length(v1009_args); rt_lt(t1854, t1855); }))) {
+      (void)({ wv t1856 = v1013_cs; wv t1857 = rt_get(&F_c, rt_idx(v1012_k, v1009_args)); std_push(t1856, t1857); });
       v1012_k = rt_add(v1012_k, rt_i(1));
     }
     RT_RET(rt_rec(0, 2, K56, (wv[]){ rt_s(&S13), v1013_cs }));
   }
   wv v1014_pre = rt_arr(0, NULL, 1);
   v1012_k = rt_i(0);
-  while (rt_cond(({ wv t1853 = v1012_k; wv t1854 = std_length(v1009_args); rt_lt(t1853, t1854); }))) {
-    if (rt_cond(({ wv t1855 = rt_get(&F_k, rt_idx(v1012_k, v1009_args)); wv t1856 = rt_def(w7_constK, "constK"); rt_eq(t1855, t1856); }))) {
-      (void)({ wv t1857 = v1013_cs; wv t1858 = rt_get(&F_c, rt_idx(v1012_k, v1009_args)); std_push(t1857, t1858); });
+  while (rt_cond(({ wv t1858 = v1012_k; wv t1859 = std_length(v1009_args); rt_lt(t1858, t1859); }))) {
+    if (rt_cond(({ wv t1860 = rt_get(&F_k, rt_idx(v1012_k, v1009_args)); wv t1861 = rt_def(w7_constK, "constK"); rt_eq(t1860, t1861); }))) {
+      (void)({ wv t1862 = v1013_cs; wv t1863 = rt_get(&F_c, rt_idx(v1012_k, v1009_args)); std_push(t1862, t1863); });
     } else {
       wv v1015_temp = rt_bind(rt_chk(s860_tmp(up), "seq"), 0);
-      (void)({ wv t1861 = v1014_pre; wv t1862 = ({ wv t1859 = rt_text(v1015_temp); wv t1860 = rt_text(rt_get(&F_c, rt_idx(v1012_k, v1009_args))); rt_cat(5, (wv[]){ rt_s(&S584), t1859, rt_s(&S495), t1860, rt_s(&S14) }); }); std_push(t1861, t1862); });
+      (void)({ wv t1866 = v1014_pre; wv t1867 = ({ wv t1864 = rt_text(v1015_temp); wv t1865 = rt_text(rt_get(&F_c, rt_idx(v1012_k, v1009_args))); rt_cat(5, (wv[]){ rt_s(&S589), t1864, rt_s(&S500), t1865, rt_s(&S14) }); }); std_push(t1866, t1867); });
       (void)std_push(v1013_cs, v1015_temp);
     }
     v1012_k = rt_add(v1012_k, rt_i(1));
   }
-  RT_RET(({ wv t1863 = std_join(v1014_pre, rt_s(&S0)); wv t1864 = v1013_cs; rt_rec(0, 2, K56, (wv[]){ t1863, t1864 }); }));
+  RT_RET(({ wv t1868 = std_join(v1014_pre, rt_s(&S0)); wv t1869 = v1013_cs; rt_rec(0, 2, K56, (wv[]){ t1868, t1869 }); }));
 }
 
 static wv s871_wrap(struct fr183 *up, wv v1016_sq, wv v1017_inner) {
   rt_enter("wrap");
   v1016_sq = rt_bind(v1016_sq, 0);
   v1017_inner = rt_bind(v1017_inner, 0);
-  RT_RET(({ wv t1867 = (rt_cond(rt_eq(rt_get(&F_pre, v1016_sq), rt_s(&S13))) ? v1017_inner : ({ wv t1865 = rt_text(rt_get(&F_pre, v1016_sq)); wv t1866 = rt_text(v1017_inner); rt_cat(5, (wv[]){ rt_s(&S585), t1865, rt_s(&S0), t1866, rt_s(&S586) }); })); wv t1868 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t1867, t1868 }); }));
+  RT_RET(({ wv t1872 = (rt_cond(rt_eq(rt_get(&F_pre, v1016_sq), rt_s(&S13))) ? v1017_inner : ({ wv t1870 = rt_text(rt_get(&F_pre, v1016_sq)); wv t1871 = rt_text(v1017_inner); rt_cat(5, (wv[]){ rt_s(&S590), t1870, rt_s(&S0), t1871, rt_s(&S591) }); })); wv t1873 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t1872, t1873 }); }));
 }
 
 static wv s872_stmts(struct fr183 *up, wv v1018_list) {
   rt_enter("stmts");
   v1018_list = rt_bind(v1018_list, 0);
   wv v1019_k = rt_i(0);
-  while (rt_cond(({ wv t1869 = v1019_k; wv t1870 = std_length(v1018_list); rt_lt(t1869, t1870); }))) {
+  while (rt_cond(({ wv t1874 = v1019_k; wv t1875 = std_length(v1018_list); rt_lt(t1874, t1875); }))) {
     (void)rt_chk(s876_stmt(up, rt_idx(v1019_k, v1018_list)), "stmts");
     v1019_k = rt_add(v1019_k, rt_i(1));
   }
@@ -7324,12 +7835,12 @@ static wv s872_stmts(struct fr183 *up, wv v1018_list) {
 static wv s873_resets(struct fr183 *up, wv v1020_b) {
   rt_enter("resets");
   wv v1021_k = rt_i(0);
-  while (rt_cond(({ wv t1871 = v1021_k; wv t1872 = std_length(rt_get(&F_stmts, v1020_b)); rt_lt(t1871, t1872); }))) {
-    wv v1022_s = ({ wv t1873 = v1021_k; wv t1874 = rt_get(&F_stmts, v1020_b); rt_idx(t1873, t1874); });
+  while (rt_cond(({ wv t1876 = v1021_k; wv t1877 = std_length(rt_get(&F_stmts, v1020_b)); rt_lt(t1876, t1877); }))) {
+    wv v1022_s = ({ wv t1878 = v1021_k; wv t1879 = rt_get(&F_stmts, v1020_b); rt_idx(t1878, t1879); });
     if (rt_cond(rt_eq(rt_get(&F_k, v1022_s), rt_s(&S177)))) {
-      wv v1023_d = rt_bind(({ wv t1875 = rt_get(&F_namePos, v1022_s); wv t1876 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1875, t1876); }), 0);
-      if (rt_cond(rt_get(&F_captured, ({ wv t1877 = v1023_d; wv t1878 = rt_def(up->v833_decls, "decls"); rt_idx(t1877, t1878); })))) {
-        (void)rt_chk(s859_emit(up, rt_cat(2, (wv[]){ rt_text(rt_chk(s867_place(up, v1023_d), "resets")), rt_s(&S587) })), "resets");
+      wv v1023_d = rt_bind(({ wv t1880 = rt_get(&F_namePos, v1022_s); wv t1881 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1880, t1881); }), 0);
+      if (rt_cond(rt_get(&F_captured, ({ wv t1882 = v1023_d; wv t1883 = rt_def(up->v833_decls, "decls"); rt_idx(t1882, t1883); })))) {
+        (void)rt_chk(s859_emit(up, rt_cat(2, (wv[]){ rt_text(rt_chk(s867_place(up, v1023_d), "resets")), rt_s(&S592) })), "resets");
       }
     }
     v1021_k = rt_add(v1021_k, rt_i(1));
@@ -7343,7 +7854,7 @@ static wv s874_blockBody(struct fr183 *up, wv v1024_b) {
   (void)rt_chk(s873_resets(up, v1024_b), "blockBody");
   (void)rt_chk(s872_stmts(up, rt_get(&F_stmts, v1024_b)), "blockBody");
   if (rt_cond(rt_ne(rt_get(&F_value, v1024_b), RT_NULL))) {
-    (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S588), rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_value, v1024_b)), "blockBody"))), rt_s(&S14) })), "blockBody");
+    (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S593), rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_value, v1024_b)), "blockBody"))), rt_s(&S14) })), "blockBody");
   }
   RT_RET(RT_NULL);
 }
@@ -7351,7 +7862,7 @@ static wv s874_blockBody(struct fr183 *up, wv v1024_b) {
 static wv s875_valueOf(struct fr183 *up, wv v1025_b) {
   rt_enter("valueOf");
   v1025_b = rt_bind(v1025_b, 0);
-  RT_RET((rt_cond(rt_eq(rt_get(&F_value, v1025_b), RT_NULL)) ? rt_s(&S589) : rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_value, v1025_b)), "valueOf"))));
+  RT_RET((rt_cond(rt_eq(rt_get(&F_value, v1025_b), RT_NULL)) ? rt_s(&S594) : rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_value, v1025_b)), "valueOf"))));
 }
 
 static wv s876_stmt(struct fr183 *up, wv v1026_s) {
@@ -7370,24 +7881,24 @@ static wv s876_stmt(struct fr183 *up, wv v1026_s) {
   }
   if (rt_cond(rt_eq(v1027_kind, rt_s(&S34)))) {
     if (rt_cond(rt_def(up->v832_iife, "iife"))) {
-      (void)rt_chk(w2_abort(rt_get(&F_pos, v1026_s), rt_s(&S482)), "stmt");
+      (void)rt_chk(w2_abort(rt_get(&F_pos, v1026_s), rt_s(&S487)), "stmt");
     }
-    (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S590), rt_text((rt_cond(rt_eq(rt_get(&F_e, v1026_s), RT_NULL)) ? rt_s(&S589) : rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_e, v1026_s)), "stmt")))), rt_s(&S485) })), "stmt");
+    (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S595), rt_text((rt_cond(rt_eq(rt_get(&F_e, v1026_s), RT_NULL)) ? rt_s(&S594) : rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_e, v1026_s)), "stmt")))), rt_s(&S490) })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v1027_kind, rt_s(&S57)))) {
-    (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S591), rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_e, v1026_s)), "stmt"))), rt_s(&S485) })), "stmt");
+    (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S596), rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_e, v1026_s)), "stmt"))), rt_s(&S490) })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_b(rt_bool(rt_eq(v1027_kind, rt_s(&S42)), "||") || rt_bool(rt_eq(v1027_kind, rt_s(&S43)), "||")))) {
     if (rt_cond(rt_eq(rt_def(up->v831_loops, "loops"), rt_i(0)))) {
-      (void)({ wv t1879 = rt_get(&F_pos, v1026_s); wv t1880 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text((rt_cond(rt_eq(v1027_kind, rt_s(&S42))) ? rt_s(&S42) : rt_s(&S43))), rt_s(&S486) }); rt_chk(w2_abort(t1879, t1880), "stmt"); });
+      (void)({ wv t1884 = rt_get(&F_pos, v1026_s); wv t1885 = rt_cat(3, (wv[]){ rt_s(&S113), rt_text((rt_cond(rt_eq(v1027_kind, rt_s(&S42))) ? rt_s(&S42) : rt_s(&S43))), rt_s(&S491) }); rt_chk(w2_abort(t1884, t1885), "stmt"); });
     }
-    (void)rt_chk(s859_emit(up, (rt_cond(rt_eq(v1027_kind, rt_s(&S42))) ? rt_s(&S487) : rt_s(&S488))), "stmt");
+    (void)rt_chk(s859_emit(up, (rt_cond(rt_eq(v1027_kind, rt_s(&S42))) ? rt_s(&S492) : rt_s(&S493))), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v1027_kind, rt_s(&S41)))) {
-    (void)rt_chk(s859_emit(up, ({ wv t1881 = rt_text((rt_cond(rt_get(&F_neg, v1026_s)) ? rt_s(&S94) : rt_s(&S13))); wv t1882 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_cond, v1026_s)), "stmt"))); rt_cat(5, (wv[]){ rt_s(&S489), t1881, rt_s(&S592), t1882, rt_s(&S491) }); })), "stmt");
+    (void)rt_chk(s859_emit(up, ({ wv t1886 = rt_text((rt_cond(rt_get(&F_neg, v1026_s)) ? rt_s(&S94) : rt_s(&S13))); wv t1887 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_cond, v1026_s)), "stmt"))); rt_cat(5, (wv[]){ rt_s(&S494), t1886, rt_s(&S597), t1887, rt_s(&S496) }); })), "stmt");
     up->v830_indent = rt_add(rt_def(up->v830_indent, "indent"), rt_i(1));
     up->v831_loops = rt_add(rt_def(up->v831_loops, "loops"), rt_i(1));
     (void)rt_chk(s874_blockBody(up, rt_get(&F_body, v1026_s)), "stmt");
@@ -7397,11 +7908,11 @@ static wv s876_stmt(struct fr183 *up, wv v1026_s) {
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v1027_kind, rt_s(&S55)))) {
-    (void)rt_chk(s877_signal(up, rt_cat(3, (wv[]){ rt_s(&S593), rt_text(rt_get(&F_code, v1026_s)), rt_s(&S16) })), "stmt");
+    (void)rt_chk(s877_signal(up, rt_cat(3, (wv[]){ rt_s(&S598), rt_text(rt_get(&F_code, v1026_s)), rt_s(&S16) })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v1027_kind, rt_s(&S54)))) {
-    (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S594), rt_text((rt_cond(rt_eq(rt_get(&F_e, v1026_s), RT_NULL)) ? rt_s(&S595) : rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_e, v1026_s)), "stmt")))), rt_s(&S485) })), "stmt");
+    (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S599), rt_text((rt_cond(rt_eq(rt_get(&F_e, v1026_s), RT_NULL)) ? rt_s(&S600) : rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_e, v1026_s)), "stmt")))), rt_s(&S490) })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v1027_kind, rt_s(&S176)))) {
@@ -7417,26 +7928,26 @@ static wv s876_stmt(struct fr183 *up, wv v1026_s) {
       (void)rt_chk(s877_signal(up, rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_arg, rt_get(&F_e, v1026_s))), "stmt"))), "stmt");
       RT_RET(RT_NULL);
     }
-    (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S588), rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_e, v1026_s)), "stmt"))), rt_s(&S14) })), "stmt");
+    (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S593), rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_e, v1026_s)), "stmt"))), rt_s(&S14) })), "stmt");
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v1027_kind, rt_s(&S177)))) {
-    (void)({ wv t1887 = ({ wv t1883 = rt_get(&F_namePos, v1026_s); wv t1884 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1883, t1884); }); wv t1888 = ({ wv t1885 = rt_get(&F_e, v1026_s); wv t1886 = rt_chk(w7_modeOf(v1026_s), "stmt"); rt_chk(s880_bindRhs(up, t1885, t1886), "stmt"); }); rt_chk(s878_bindDecl(up, t1887, t1888), "stmt"); });
+    (void)({ wv t1892 = ({ wv t1888 = rt_get(&F_namePos, v1026_s); wv t1889 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1888, t1889); }); wv t1893 = ({ wv t1890 = rt_get(&F_e, v1026_s); wv t1891 = rt_chk(w7_modeOf(v1026_s), "stmt"); rt_chk(s880_bindRhs(up, t1890, t1891), "stmt"); }); rt_chk(s878_bindDecl(up, t1892, t1893), "stmt"); });
     RT_RET(RT_NULL);
   }
   if (rt_cond(rt_eq(v1027_kind, rt_s(&S38)))) {
     (void)rt_chk(s881_setStmt(up, v1026_s), "stmt");
     RT_RET(RT_NULL);
   }
-  rt_panic(rt_cat(2, (wv[]){ rt_s(&S496), rt_text(v1027_kind) }));
+  rt_panic(rt_cat(2, (wv[]){ rt_s(&S501), rt_text(v1027_kind) }));
   RT_RET(RT_NULL);
 }
 
 static wv s877_signal(struct fr183 *up, wv v1028_code) {
   rt_enter("signal");
   v1028_code = rt_bind(v1028_code, 0);
-  (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S596), rt_text(v1028_code), rt_s(&S485) })), "signal");
-  (void)rt_chk(s859_emit(up, rt_s(&S597)), "signal");
+  (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S601), rt_text(v1028_code), rt_s(&S490) })), "signal");
+  (void)rt_chk(s859_emit(up, rt_s(&S602)), "signal");
   RT_RET(RT_NULL);
 }
 
@@ -7444,11 +7955,11 @@ static wv s878_bindDecl(struct fr183 *up, wv v1029_d, wv v1030_value) {
   rt_enter("bindDecl");
   v1029_d = rt_bind(v1029_d, 0);
   v1030_value = rt_bind(v1030_value, 0);
-  wv v1031_owner = rt_bind(rt_get(&F_func, ({ wv t1889 = v1029_d; wv t1890 = rt_def(up->v833_decls, "decls"); rt_idx(t1889, t1890); })), 0);
-  if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_not(rt_get(&F_top, ({ wv t1891 = v1031_owner; wv t1892 = rt_def(up->v834_fns, "fns"); rt_idx(t1891, t1892); }))), "&&") && rt_bool(({ wv t1893 = v1031_owner; wv t1894 = rt_def(up->v842_cur, "cur"); rt_eq(t1893, t1894); }), "&&")), "&&") && rt_bool(rt_not(rt_get(&F_captured, ({ wv t1895 = v1029_d; wv t1896 = rt_def(up->v833_decls, "decls"); rt_idx(t1895, t1896); }))), "&&")))) {
-    (void)rt_chk(s859_emit(up, ({ wv t1899 = rt_text(rt_get(&F_cname, ({ wv t1897 = v1029_d; wv t1898 = rt_def(up->v833_decls, "decls"); rt_idx(t1897, t1898); }))); wv t1900 = rt_text(v1030_value); rt_cat(5, (wv[]){ rt_s(&S584), t1899, rt_s(&S495), t1900, rt_s(&S14) }); })), "bindDecl");
+  wv v1031_owner = rt_bind(rt_get(&F_func, ({ wv t1894 = v1029_d; wv t1895 = rt_def(up->v833_decls, "decls"); rt_idx(t1894, t1895); })), 0);
+  if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_not(rt_get(&F_top, ({ wv t1896 = v1031_owner; wv t1897 = rt_def(up->v834_fns, "fns"); rt_idx(t1896, t1897); }))), "&&") && rt_bool(({ wv t1898 = v1031_owner; wv t1899 = rt_def(up->v842_cur, "cur"); rt_eq(t1898, t1899); }), "&&")), "&&") && rt_bool(rt_not(rt_get(&F_captured, ({ wv t1900 = v1029_d; wv t1901 = rt_def(up->v833_decls, "decls"); rt_idx(t1900, t1901); }))), "&&")))) {
+    (void)rt_chk(s859_emit(up, ({ wv t1904 = rt_text(rt_get(&F_cname, ({ wv t1902 = v1029_d; wv t1903 = rt_def(up->v833_decls, "decls"); rt_idx(t1902, t1903); }))); wv t1905 = rt_text(v1030_value); rt_cat(5, (wv[]){ rt_s(&S589), t1904, rt_s(&S500), t1905, rt_s(&S14) }); })), "bindDecl");
   } else {
-    (void)rt_chk(s859_emit(up, ({ wv t1901 = rt_text(rt_chk(s867_place(up, v1029_d), "bindDecl")); wv t1902 = rt_text(v1030_value); rt_cat(4, (wv[]){ t1901, rt_s(&S495), t1902, rt_s(&S14) }); })), "bindDecl");
+    (void)rt_chk(s859_emit(up, ({ wv t1906 = rt_text(rt_chk(s867_place(up, v1029_d), "bindDecl")); wv t1907 = rt_text(v1030_value); rt_cat(4, (wv[]){ t1906, rt_s(&S500), t1907, rt_s(&S14) }); })), "bindDecl");
   }
   RT_RET(RT_NULL);
 }
@@ -7456,79 +7967,79 @@ static wv s878_bindDecl(struct fr183 *up, wv v1029_d, wv v1030_value) {
 static wv s879_fnDef(struct fr183 *up, wv v1032_s) {
   rt_enter("fnDef");
   v1032_s = rt_bind(v1032_s, 0);
-  wv v1033_d = rt_bind(({ wv t1903 = rt_get(&F_namePos, v1032_s); wv t1904 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1903, t1904); }), 0);
-  wv v1034_f = rt_bind(rt_get(&F_fnIndex, ({ wv t1905 = v1033_d; wv t1906 = rt_def(up->v833_decls, "decls"); rt_idx(t1905, t1906); })), 0);
-  wv v1035_pf = rt_bind(rt_get(&F_parent, ({ wv t1907 = v1034_f; wv t1908 = rt_def(up->v834_fns, "fns"); rt_idx(t1907, t1908); })), 0);
-  wv v1036_hasUp = rt_not(rt_get(&F_top, ({ wv t1909 = v1035_pf; wv t1910 = rt_def(up->v834_fns, "fns"); rt_idx(t1909, t1910); })));
+  wv v1033_d = rt_bind(({ wv t1908 = rt_get(&F_namePos, v1032_s); wv t1909 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1908, t1909); }), 0);
+  wv v1034_f = rt_bind(rt_get(&F_fnIndex, ({ wv t1910 = v1033_d; wv t1911 = rt_def(up->v833_decls, "decls"); rt_idx(t1910, t1911); })), 0);
+  wv v1035_pf = rt_bind(rt_get(&F_parent, ({ wv t1912 = v1034_f; wv t1913 = rt_def(up->v834_fns, "fns"); rt_idx(t1912, t1913); })), 0);
+  wv v1036_hasUp = rt_not(rt_get(&F_top, ({ wv t1914 = v1035_pf; wv t1915 = rt_def(up->v834_fns, "fns"); rt_idx(t1914, t1915); })));
   wv v1037_params = rt_arr(0, NULL, 1);
   if (rt_cond(v1036_hasUp)) {
-    (void)({ wv t1911 = v1037_params; wv t1912 = rt_cat(3, (wv[]){ rt_s(&S598), rt_text(v1035_pf), rt_s(&S599) }); std_push(t1911, t1912); });
+    (void)({ wv t1916 = v1037_params; wv t1917 = rt_cat(3, (wv[]){ rt_s(&S603), rt_text(v1035_pf), rt_s(&S604) }); std_push(t1916, t1917); });
   }
   wv v1038_k = rt_i(0);
-  while (rt_cond(({ wv t1913 = v1038_k; wv t1914 = std_length(rt_get(&F_params, v1032_s)); rt_lt(t1913, t1914); }))) {
-    wv v1046_pd = rt_bind(({ wv t1917 = rt_get(&F_pos, ({ wv t1915 = v1038_k; wv t1916 = rt_get(&F_params, v1032_s); rt_idx(t1915, t1916); })); wv t1918 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1917, t1918); }), 0);
-    (void)({ wv t1925 = v1037_params; wv t1926 = ({ wv t1923 = rt_text((rt_cond(rt_get(&F_captured, ({ wv t1919 = v1046_pd; wv t1920 = rt_def(up->v833_decls, "decls"); rt_idx(t1919, t1920); }))) ? rt_s(&S600) : rt_s(&S13))); wv t1924 = rt_text(rt_get(&F_cname, ({ wv t1921 = v1046_pd; wv t1922 = rt_def(up->v833_decls, "decls"); rt_idx(t1921, t1922); }))); rt_cat(3, (wv[]){ rt_s(&S584), t1923, t1924 }); }); std_push(t1925, t1926); });
+  while (rt_cond(({ wv t1918 = v1038_k; wv t1919 = std_length(rt_get(&F_params, v1032_s)); rt_lt(t1918, t1919); }))) {
+    wv v1046_pd = rt_bind(({ wv t1922 = rt_get(&F_pos, ({ wv t1920 = v1038_k; wv t1921 = rt_get(&F_params, v1032_s); rt_idx(t1920, t1921); })); wv t1923 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1922, t1923); }), 0);
+    (void)({ wv t1930 = v1037_params; wv t1931 = ({ wv t1928 = rt_text((rt_cond(rt_get(&F_captured, ({ wv t1924 = v1046_pd; wv t1925 = rt_def(up->v833_decls, "decls"); rt_idx(t1924, t1925); }))) ? rt_s(&S605) : rt_s(&S13))); wv t1929 = rt_text(rt_get(&F_cname, ({ wv t1926 = v1046_pd; wv t1927 = rt_def(up->v833_decls, "decls"); rt_idx(t1926, t1927); }))); rt_cat(3, (wv[]){ rt_s(&S589), t1928, t1929 }); }); std_push(t1930, t1931); });
     v1038_k = rt_add(v1038_k, rt_i(1));
   }
-  wv v1039_proto = ({ wv t1929 = rt_text(rt_get(&F_cname, ({ wv t1927 = v1034_f; wv t1928 = rt_def(up->v834_fns, "fns"); rt_idx(t1927, t1928); }))); wv t1930 = rt_text((rt_cond(rt_eq(std_length(v1037_params), rt_i(0))) ? rt_s(&S602) : std_join(v1037_params, rt_s(&S385)))); rt_cat(5, (wv[]){ rt_s(&S601), t1929, rt_s(&S97), t1930, rt_s(&S16) }); });
-  wv v1040_entry = ({ wv t1931 = v1039_proto; wv t1932 = rt_arr(0, NULL, 0); rt_rec(1, 2, K57, (wv[]){ t1931, t1932 }); });
-  (void)({ wv t1933 = rt_def(up->v828_functions, "functions"); wv t1934 = v1040_entry; std_push(t1933, t1934); });
+  wv v1039_proto = ({ wv t1934 = rt_text(rt_get(&F_cname, ({ wv t1932 = v1034_f; wv t1933 = rt_def(up->v834_fns, "fns"); rt_idx(t1932, t1933); }))); wv t1935 = rt_text((rt_cond(rt_eq(std_length(v1037_params), rt_i(0))) ? rt_s(&S607) : std_join(v1037_params, rt_s(&S390)))); rt_cat(5, (wv[]){ rt_s(&S606), t1934, rt_s(&S97), t1935, rt_s(&S16) }); });
+  wv v1040_entry = ({ wv t1936 = v1039_proto; wv t1937 = rt_arr(0, NULL, 0); rt_rec(1, 2, K57, (wv[]){ t1936, t1937 }); });
+  (void)({ wv t1938 = rt_def(up->v828_functions, "functions"); wv t1939 = v1040_entry; std_push(t1938, t1939); });
   if (rt_cond(rt_chk(s844_hasFrame(up, v1034_f), "fnDef"))) {
-    (void)({ wv t1935 = rt_def(up->v827_frames, "frames"); wv t1936 = v1034_f; std_push(t1935, t1936); });
+    (void)({ wv t1940 = rt_def(up->v827_frames, "frames"); wv t1941 = v1034_f; std_push(t1940, t1941); });
   }
   wv v1041_start = rt_bind(std_length(rt_def(up->v829_out, "out")), 0);
   wv v1042_savedIndent = rt_bind(rt_def(up->v830_indent, "indent"), 0);
   wv v1043_savedLoops = rt_bind(rt_def(up->v831_loops, "loops"), 0);
   wv v1044_savedIife = rt_bind(rt_def(up->v832_iife, "iife"), 0);
   wv v1045_savedCur = rt_bind(rt_def(up->v842_cur, "cur"), 0);
-  wv t1937 = rt_i(1);
+  wv t1942 = rt_i(1);
   (void)rt_def(up->v830_indent, "indent");
-  up->v830_indent = t1937;
-  wv t1938 = rt_i(0);
+  up->v830_indent = t1942;
+  wv t1943 = rt_i(0);
   (void)rt_def(up->v831_loops, "loops");
-  up->v831_loops = t1938;
-  wv t1939 = rt_b(0);
+  up->v831_loops = t1943;
+  wv t1944 = rt_b(0);
   (void)rt_def(up->v832_iife, "iife");
-  up->v832_iife = t1939;
-  wv t1940 = rt_bind(v1034_f, 1);
+  up->v832_iife = t1944;
+  wv t1945 = rt_bind(v1034_f, 1);
   (void)rt_def(up->v842_cur, "cur");
-  up->v842_cur = t1940;
-  (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S603), rt_text(rt_chk(w1_quote(rt_get(&F_name, v1032_s)), "fnDef")), rt_s(&S485) })), "fnDef");
+  up->v842_cur = t1945;
+  (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S608), rt_text(rt_chk(w1_quote(rt_get(&F_name, v1032_s)), "fnDef")), rt_s(&S490) })), "fnDef");
   if (rt_cond(rt_chk(s844_hasFrame(up, v1034_f), "fnDef"))) {
-    (void)rt_chk(s859_emit(up, ({ wv t1941 = rt_text(v1034_f); wv t1942 = rt_text((rt_cond(v1036_hasUp) ? rt_s(&S605) : rt_s(&S4))); rt_cat(5, (wv[]){ rt_s(&S598), t1941, rt_s(&S604), t1942, rt_s(&S578) }); })), "fnDef");
+    (void)rt_chk(s859_emit(up, ({ wv t1946 = rt_text(v1034_f); wv t1947 = rt_text((rt_cond(v1036_hasUp) ? rt_s(&S610) : rt_s(&S4))); rt_cat(5, (wv[]){ rt_s(&S603), t1946, rt_s(&S609), t1947, rt_s(&S583) }); })), "fnDef");
   }
   v1038_k = rt_i(0);
-  while (rt_cond(({ wv t1943 = v1038_k; wv t1944 = std_length(rt_get(&F_params, v1032_s)); rt_lt(t1943, t1944); }))) {
-    wv v1047_p = rt_bind(({ wv t1945 = v1038_k; wv t1946 = rt_get(&F_params, v1032_s); rt_idx(t1945, t1946); }), 0);
-    wv v1048_pd = rt_bind(({ wv t1947 = rt_get(&F_pos, v1047_p); wv t1948 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1947, t1948); }), 0);
-    wv v1049_cn = rt_bind(rt_get(&F_cname, ({ wv t1949 = v1048_pd; wv t1950 = rt_def(up->v833_decls, "decls"); rt_idx(t1949, t1950); })), 0);
-    wv v1050_arg = rt_bind((rt_cond(rt_get(&F_captured, ({ wv t1951 = v1048_pd; wv t1952 = rt_def(up->v833_decls, "decls"); rt_idx(t1951, t1952); }))) ? rt_cat(2, (wv[]){ rt_s(&S600), rt_text(v1049_cn) }) : v1049_cn), 0);
-    wv v1051_v = rt_bind((rt_cond(rt_get(&F_isRef, v1047_p)) ? v1050_arg : ({ wv t1953 = rt_text(v1050_arg); wv t1954 = rt_text((rt_cond(rt_get(&F_isVar, v1047_p)) ? rt_i(1) : rt_i(0))); rt_cat(5, (wv[]){ rt_s(&S606), t1953, rt_s(&S385), t1954, rt_s(&S16) }); })), 0);
-    if (rt_cond(rt_get(&F_captured, ({ wv t1955 = v1048_pd; wv t1956 = rt_def(up->v833_decls, "decls"); rt_idx(t1955, t1956); })))) {
-      (void)rt_chk(s859_emit(up, ({ wv t1957 = rt_text(v1049_cn); wv t1958 = rt_text(v1051_v); rt_cat(5, (wv[]){ rt_s(&S579), t1957, rt_s(&S495), t1958, rt_s(&S14) }); })), "fnDef");
+  while (rt_cond(({ wv t1948 = v1038_k; wv t1949 = std_length(rt_get(&F_params, v1032_s)); rt_lt(t1948, t1949); }))) {
+    wv v1047_p = rt_bind(({ wv t1950 = v1038_k; wv t1951 = rt_get(&F_params, v1032_s); rt_idx(t1950, t1951); }), 0);
+    wv v1048_pd = rt_bind(({ wv t1952 = rt_get(&F_pos, v1047_p); wv t1953 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1952, t1953); }), 0);
+    wv v1049_cn = rt_bind(rt_get(&F_cname, ({ wv t1954 = v1048_pd; wv t1955 = rt_def(up->v833_decls, "decls"); rt_idx(t1954, t1955); })), 0);
+    wv v1050_arg = rt_bind((rt_cond(rt_get(&F_captured, ({ wv t1956 = v1048_pd; wv t1957 = rt_def(up->v833_decls, "decls"); rt_idx(t1956, t1957); }))) ? rt_cat(2, (wv[]){ rt_s(&S605), rt_text(v1049_cn) }) : v1049_cn), 0);
+    wv v1051_v = rt_bind((rt_cond(rt_get(&F_isRef, v1047_p)) ? v1050_arg : ({ wv t1958 = rt_text(v1050_arg); wv t1959 = rt_text((rt_cond(rt_get(&F_isVar, v1047_p)) ? rt_i(1) : rt_i(0))); rt_cat(5, (wv[]){ rt_s(&S611), t1958, rt_s(&S390), t1959, rt_s(&S16) }); })), 0);
+    if (rt_cond(rt_get(&F_captured, ({ wv t1960 = v1048_pd; wv t1961 = rt_def(up->v833_decls, "decls"); rt_idx(t1960, t1961); })))) {
+      (void)rt_chk(s859_emit(up, ({ wv t1962 = rt_text(v1049_cn); wv t1963 = rt_text(v1051_v); rt_cat(5, (wv[]){ rt_s(&S584), t1962, rt_s(&S500), t1963, rt_s(&S14) }); })), "fnDef");
     } else if (rt_cond(rt_not(rt_get(&F_isRef, v1047_p)))) {
-      (void)rt_chk(s859_emit(up, ({ wv t1959 = rt_text(v1049_cn); wv t1960 = rt_text(v1051_v); rt_cat(4, (wv[]){ t1959, rt_s(&S495), t1960, rt_s(&S14) }); })), "fnDef");
+      (void)rt_chk(s859_emit(up, ({ wv t1964 = rt_text(v1049_cn); wv t1965 = rt_text(v1051_v); rt_cat(4, (wv[]){ t1964, rt_s(&S500), t1965, rt_s(&S14) }); })), "fnDef");
     }
     v1038_k = rt_add(v1038_k, rt_i(1));
   }
   (void)rt_chk(s872_stmts(up, rt_get(&F_stmts, rt_get(&F_body, v1032_s))), "fnDef");
-  (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S590), rt_text(rt_chk(s875_valueOf(up, rt_get(&F_body, v1032_s)), "fnDef")), rt_s(&S485) })), "fnDef");
-  ({ wv t1964 = ({ wv t1961 = rt_def(up->v829_out, "out"); wv t1962 = v1041_start; wv t1963 = std_length(rt_def(up->v829_out, "out")); std_slice(t1961, t1962, t1963); }); wv t1965 = v1040_entry; rt_set_mem(t1964, &F_lines, t1965); });
-  while (rt_cond(({ wv t1966 = std_length(rt_def(up->v829_out, "out")); wv t1967 = v1041_start; rt_gt(t1966, t1967); }))) {
+  (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S595), rt_text(rt_chk(s875_valueOf(up, rt_get(&F_body, v1032_s)), "fnDef")), rt_s(&S490) })), "fnDef");
+  ({ wv t1969 = ({ wv t1966 = rt_def(up->v829_out, "out"); wv t1967 = v1041_start; wv t1968 = std_length(rt_def(up->v829_out, "out")); std_slice(t1966, t1967, t1968); }); wv t1970 = v1040_entry; rt_set_mem(t1969, &F_lines, t1970); });
+  while (rt_cond(({ wv t1971 = std_length(rt_def(up->v829_out, "out")); wv t1972 = v1041_start; rt_gt(t1971, t1972); }))) {
     (void)std_pop(rt_def(up->v829_out, "out"));
   }
-  wv t1968 = rt_bind(v1042_savedIndent, 1);
+  wv t1973 = rt_bind(v1042_savedIndent, 1);
   (void)rt_def(up->v830_indent, "indent");
-  up->v830_indent = t1968;
-  wv t1969 = rt_bind(v1043_savedLoops, 1);
+  up->v830_indent = t1973;
+  wv t1974 = rt_bind(v1043_savedLoops, 1);
   (void)rt_def(up->v831_loops, "loops");
-  up->v831_loops = t1969;
-  wv t1970 = rt_bind(v1044_savedIife, 1);
+  up->v831_loops = t1974;
+  wv t1975 = rt_bind(v1044_savedIife, 1);
   (void)rt_def(up->v832_iife, "iife");
-  up->v832_iife = t1970;
-  wv t1971 = rt_bind(v1045_savedCur, 1);
+  up->v832_iife = t1975;
+  wv t1976 = rt_bind(v1045_savedCur, 1);
   (void)rt_def(up->v842_cur, "cur");
-  up->v842_cur = t1971;
+  up->v842_cur = t1976;
   RT_RET(RT_NULL);
 }
 
@@ -7543,10 +8054,10 @@ static wv s880_bindRhs(struct fr183 *up, wv v1052_e, wv v1053_mode) {
   if (rt_cond(rt_eq(rt_get(&F_k, v1052_e), rt_s(&S187)))) {
     RT_RET(rt_get(&F_c, rt_chk(s884_record(up, v1052_e, v1054_mutable), "bindRhs")));
   }
-  if (rt_cond(rt_b(rt_bool(({ wv t1972 = rt_def(w7_scalarKinds, "scalarKinds"); wv t1973 = rt_get(&F_k, v1052_e); rt_chk(w1_contains(t1972, t1973), "bindRhs"); }), "||") || rt_bool(rt_eq(v1053_mode, rt_s(&S37)), "||")))) {
+  if (rt_cond(rt_b(rt_bool(({ wv t1977 = rt_def(w7_scalarKinds, "scalarKinds"); wv t1978 = rt_get(&F_k, v1052_e); rt_chk(w1_contains(t1977, t1978), "bindRhs"); }), "||") || rt_bool(rt_eq(v1053_mode, rt_s(&S37)), "||")))) {
     RT_RET(rt_get(&F_c, rt_chk(s900_expr(up, v1052_e), "bindRhs")));
   }
-  RT_RET(({ wv t1974 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, v1052_e), "bindRhs"))); wv t1975 = rt_text((rt_cond(v1054_mutable) ? rt_i(1) : rt_i(0))); rt_cat(5, (wv[]){ rt_s(&S606), t1974, rt_s(&S385), t1975, rt_s(&S16) }); }));
+  RT_RET(({ wv t1979 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, v1052_e), "bindRhs"))); wv t1980 = rt_text((rt_cond(v1054_mutable) ? rt_i(1) : rt_i(0))); rt_cat(5, (wv[]){ rt_s(&S611), t1979, rt_s(&S390), t1980, rt_s(&S16) }); }));
 }
 
 static wv s881_setStmt(struct fr183 *up, wv v1055_s) {
@@ -7554,33 +8065,33 @@ static wv s881_setStmt(struct fr183 *up, wv v1055_s) {
   v1055_s = rt_bind(v1055_s, 0);
   wv v1056_t = rt_bind(rt_get(&F_target, v1055_s), 0);
   if (rt_cond(rt_eq(rt_get(&F_k, v1056_t), rt_s(&S211)))) {
-    wv v1063_d = rt_bind(({ wv t1976 = rt_get(&F_pos, v1056_t); wv t1977 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1976, t1977); }), 0);
+    wv v1063_d = rt_bind(({ wv t1981 = rt_get(&F_pos, v1056_t); wv t1982 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t1981, t1982); }), 0);
     wv v1064_at = rt_bind(rt_chk(s867_place(up, v1063_d), "setStmt"), 0);
     if (rt_cond(rt_eq(rt_get(&F_op, v1055_s), RT_NULL))) {
-      wv v1067_v = rt_bind(({ wv t1980 = rt_get(&F_e, v1055_s); wv t1981 = (rt_cond(rt_get(&F_isRef, ({ wv t1978 = v1063_d; wv t1979 = rt_def(up->v833_decls, "decls"); rt_idx(t1978, t1979); }))) ? rt_s(&S37) : rt_s(&S36)); rt_chk(s880_bindRhs(up, t1980, t1981), "setStmt"); }), 0);
+      wv v1067_v = rt_bind(({ wv t1985 = rt_get(&F_e, v1055_s); wv t1986 = (rt_cond(rt_get(&F_isRef, ({ wv t1983 = v1063_d; wv t1984 = rt_def(up->v833_decls, "decls"); rt_idx(t1983, t1984); }))) ? rt_s(&S37) : rt_s(&S36)); rt_chk(s880_bindRhs(up, t1985, t1986), "setStmt"); }), 0);
       if (rt_cond(rt_not(rt_chk(s868_tdz(up, v1063_d), "setStmt")))) {
-        (void)rt_chk(s859_emit(up, ({ wv t1982 = rt_text(v1064_at); wv t1983 = rt_text(v1067_v); rt_cat(4, (wv[]){ t1982, rt_s(&S495), t1983, rt_s(&S14) }); })), "setStmt");
+        (void)rt_chk(s859_emit(up, ({ wv t1987 = rt_text(v1064_at); wv t1988 = rt_text(v1067_v); rt_cat(4, (wv[]){ t1987, rt_s(&S500), t1988, rt_s(&S14) }); })), "setStmt");
         RT_RET(RT_NULL);
       }
       wv v1068_temp = rt_bind(rt_chk(s860_tmp(up), "setStmt"), 0);
-      (void)rt_chk(s859_emit(up, ({ wv t1984 = rt_text(v1068_temp); wv t1985 = rt_text(v1067_v); rt_cat(5, (wv[]){ rt_s(&S584), t1984, rt_s(&S495), t1985, rt_s(&S14) }); })), "setStmt");
-      (void)rt_chk(s859_emit(up, ({ wv t1988 = rt_text(v1064_at); wv t1989 = rt_text(rt_chk(w1_quote(rt_get(&F_name, ({ wv t1986 = v1063_d; wv t1987 = rt_def(up->v833_decls, "decls"); rt_idx(t1986, t1987); }))), "setStmt")); rt_cat(5, (wv[]){ rt_s(&S607), t1988, rt_s(&S385), t1989, rt_s(&S485) }); })), "setStmt");
-      (void)rt_chk(s859_emit(up, ({ wv t1990 = rt_text(v1064_at); wv t1991 = rt_text(v1068_temp); rt_cat(4, (wv[]){ t1990, rt_s(&S495), t1991, rt_s(&S14) }); })), "setStmt");
+      (void)rt_chk(s859_emit(up, ({ wv t1989 = rt_text(v1068_temp); wv t1990 = rt_text(v1067_v); rt_cat(5, (wv[]){ rt_s(&S589), t1989, rt_s(&S500), t1990, rt_s(&S14) }); })), "setStmt");
+      (void)rt_chk(s859_emit(up, ({ wv t1993 = rt_text(v1064_at); wv t1994 = rt_text(rt_chk(w1_quote(rt_get(&F_name, ({ wv t1991 = v1063_d; wv t1992 = rt_def(up->v833_decls, "decls"); rt_idx(t1991, t1992); }))), "setStmt")); rt_cat(5, (wv[]){ rt_s(&S612), t1993, rt_s(&S390), t1994, rt_s(&S490) }); })), "setStmt");
+      (void)rt_chk(s859_emit(up, ({ wv t1995 = rt_text(v1064_at); wv t1996 = rt_text(v1068_temp); rt_cat(4, (wv[]){ t1995, rt_s(&S500), t1996, rt_s(&S14) }); })), "setStmt");
       RT_RET(RT_NULL);
     }
     wv v1065_v = rt_bind(rt_chk(s900_expr(up, rt_get(&F_e, v1055_s)), "setStmt"), 1);
     if (rt_cond(rt_b(rt_bool(rt_ne(rt_get(&F_k, rt_get(&F_e, v1055_s)), rt_s(&S138)), "&&") && rt_bool(rt_ne(rt_get(&F_k, rt_get(&F_e, v1055_s)), rt_s(&S211)), "&&")))) {
       wv v1069_temp = rt_bind(rt_chk(s860_tmp(up), "setStmt"), 0);
-      (void)rt_chk(s859_emit(up, ({ wv t1992 = rt_text(v1069_temp); wv t1993 = rt_text(rt_get(&F_c, v1065_v)); rt_cat(5, (wv[]){ rt_s(&S584), t1992, rt_s(&S495), t1993, rt_s(&S14) }); })), "setStmt");
-      v1065_v = ({ wv t1994 = v1069_temp; wv t1995 = rt_def(w7_constK, "constK"); rt_rec(1, 2, K55, (wv[]){ t1994, t1995 }); });
+      (void)rt_chk(s859_emit(up, ({ wv t1997 = rt_text(v1069_temp); wv t1998 = rt_text(rt_get(&F_c, v1065_v)); rt_cat(5, (wv[]){ rt_s(&S589), t1997, rt_s(&S500), t1998, rt_s(&S14) }); })), "setStmt");
+      v1065_v = ({ wv t1999 = v1069_temp; wv t2000 = rt_def(w7_constK, "constK"); rt_rec(1, 2, K55, (wv[]){ t1999, t2000 }); });
     }
-    wv v1066_sq = rt_bind(rt_chk(s870_seq(up, ({ wv t1996 = rt_chk(s869_read(up, v1063_d), "setStmt"); wv t1997 = v1065_v; rt_arr(2, (wv[]){ t1996, t1997 }, 0); })), "setStmt"), 0);
-    (void)rt_chk(s859_emit(up, ({ wv t2003 = rt_text(v1064_at); wv t2004 = rt_text(rt_get(&F_c, ({ wv t2001 = v1066_sq; wv t2002 = ({ wv t1998 = rt_text(rt_chk(w7_binFn(rt_get(&F_op, v1055_s)), "setStmt")); wv t1999 = rt_text(rt_idx(rt_i(0), rt_get(&F_cs, v1066_sq))); wv t2000 = rt_text(rt_idx(rt_i(1), rt_get(&F_cs, v1066_sq))); rt_cat(7, (wv[]){ rt_s(&S608), t1998, rt_s(&S97), t1999, rt_s(&S385), t2000, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2001, t2002), "setStmt"); }))); rt_cat(4, (wv[]){ t2003, rt_s(&S495), t2004, rt_s(&S14) }); })), "setStmt");
+    wv v1066_sq = rt_bind(rt_chk(s870_seq(up, ({ wv t2001 = rt_chk(s869_read(up, v1063_d), "setStmt"); wv t2002 = v1065_v; rt_arr(2, (wv[]){ t2001, t2002 }, 0); })), "setStmt"), 0);
+    (void)rt_chk(s859_emit(up, ({ wv t2008 = rt_text(v1064_at); wv t2009 = rt_text(rt_get(&F_c, ({ wv t2006 = v1066_sq; wv t2007 = ({ wv t2003 = rt_text(rt_chk(w7_binFn(rt_get(&F_op, v1055_s)), "setStmt")); wv t2004 = rt_text(rt_idx(rt_i(0), rt_get(&F_cs, v1066_sq))); wv t2005 = rt_text(rt_idx(rt_i(1), rt_get(&F_cs, v1066_sq))); rt_cat(7, (wv[]){ rt_s(&S613), t2003, rt_s(&S97), t2004, rt_s(&S390), t2005, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2006, t2007), "setStmt"); }))); rt_cat(4, (wv[]){ t2008, rt_s(&S500), t2009, rt_s(&S14) }); })), "setStmt");
     RT_RET(RT_NULL);
   }
   wv v1057_key = RT_NULL;
   if (rt_cond(rt_eq(rt_get(&F_k, v1056_t), rt_s(&S189)))) {
-    v1057_key = ({ wv t2005 = rt_chk(s862_fieldRef(up, rt_get(&F_field, v1056_t)), "setStmt"); wv t2006 = rt_def(w7_constK, "constK"); rt_rec(1, 2, K55, (wv[]){ t2005, t2006 }); });
+    v1057_key = ({ wv t2010 = rt_chk(s862_fieldRef(up, rt_get(&F_field, v1056_t)), "setStmt"); wv t2011 = rt_def(w7_constK, "constK"); rt_rec(1, 2, K55, (wv[]){ t2010, t2011 }); });
   }
   wv v1058_v = rt_bind(rt_chk(s900_expr(up, rt_get(&F_e, v1055_s)), "setStmt"), 0);
   wv v1059_i = rt_bind((rt_cond(rt_eq(rt_get(&F_k, v1056_t), rt_s(&S189))) ? v1057_key : rt_chk(s900_expr(up, rt_get(&F_index, v1056_t)), "setStmt")), 0);
@@ -7588,10 +8099,10 @@ static wv s881_setStmt(struct fr183 *up, wv v1055_s) {
   wv v1061_sq = rt_bind(rt_chk(s870_seq(up, rt_arr(3, (wv[]){ v1058_v, v1059_i, v1060_box }, 0)), "setStmt"), 0);
   wv v1062_which = rt_bind((rt_cond(rt_eq(rt_get(&F_k, v1056_t), rt_s(&S189))) ? rt_s(&S189) : rt_s(&S188)), 0);
   if (rt_cond(rt_eq(rt_get(&F_op, v1055_s), RT_NULL))) {
-    (void)rt_chk(s859_emit(up, rt_cat(2, (wv[]){ rt_text(rt_get(&F_c, ({ wv t2009 = v1061_sq; wv t2010 = ({ wv t2007 = rt_text(v1062_which); wv t2008 = rt_text(std_join(rt_get(&F_cs, v1061_sq), rt_s(&S385))); rt_cat(5, (wv[]){ rt_s(&S609), t2007, rt_s(&S97), t2008, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2009, t2010), "setStmt"); }))), rt_s(&S14) })), "setStmt");
+    (void)rt_chk(s859_emit(up, rt_cat(2, (wv[]){ rt_text(rt_get(&F_c, ({ wv t2014 = v1061_sq; wv t2015 = ({ wv t2012 = rt_text(v1062_which); wv t2013 = rt_text(std_join(rt_get(&F_cs, v1061_sq), rt_s(&S390))); rt_cat(5, (wv[]){ rt_s(&S614), t2012, rt_s(&S97), t2013, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2014, t2015), "setStmt"); }))), rt_s(&S14) })), "setStmt");
     RT_RET(RT_NULL);
   }
-  (void)rt_chk(s859_emit(up, rt_cat(2, (wv[]){ rt_text(rt_get(&F_c, ({ wv t2014 = v1061_sq; wv t2015 = ({ wv t2011 = rt_text(v1062_which); wv t2012 = rt_text(std_join(rt_get(&F_cs, v1061_sq), rt_s(&S385))); wv t2013 = rt_text(rt_chk(w7_binFn(rt_get(&F_op, v1055_s)), "setStmt")); rt_cat(7, (wv[]){ rt_s(&S610), t2011, rt_s(&S97), t2012, rt_s(&S611), t2013, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2014, t2015), "setStmt"); }))), rt_s(&S14) })), "setStmt");
+  (void)rt_chk(s859_emit(up, rt_cat(2, (wv[]){ rt_text(rt_get(&F_c, ({ wv t2019 = v1061_sq; wv t2020 = ({ wv t2016 = rt_text(v1062_which); wv t2017 = rt_text(std_join(rt_get(&F_cs, v1061_sq), rt_s(&S390))); wv t2018 = rt_text(rt_chk(w7_binFn(rt_get(&F_op, v1055_s)), "setStmt")); rt_cat(7, (wv[]){ rt_s(&S615), t2016, rt_s(&S97), t2017, rt_s(&S616), t2018, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2019, t2020), "setStmt"); }))), rt_s(&S14) })), "setStmt");
   RT_RET(RT_NULL);
 }
 
@@ -7600,8 +8111,8 @@ static wv s882_exprs(struct fr183 *up, wv v1070_list) {
   v1070_list = rt_bind(v1070_list, 0);
   wv v1071_xs = rt_arr(0, NULL, 1);
   wv v1072_k = rt_i(0);
-  while (rt_cond(({ wv t2016 = v1072_k; wv t2017 = std_length(v1070_list); rt_lt(t2016, t2017); }))) {
-    (void)({ wv t2018 = v1071_xs; wv t2019 = rt_chk(s900_expr(up, rt_idx(v1072_k, v1070_list)), "exprs"); std_push(t2018, t2019); });
+  while (rt_cond(({ wv t2021 = v1072_k; wv t2022 = std_length(v1070_list); rt_lt(t2021, t2022); }))) {
+    (void)({ wv t2023 = v1071_xs; wv t2024 = rt_chk(s900_expr(up, rt_idx(v1072_k, v1070_list)), "exprs"); std_push(t2023, t2024); });
     v1072_k = rt_add(v1072_k, rt_i(1));
   }
   RT_RET(v1071_xs);
@@ -7612,44 +8123,44 @@ static wv s883_array(struct fr183 *up, wv v1073_e, wv v1074_mutable) {
   v1073_e = rt_bind(v1073_e, 0);
   v1074_mutable = rt_bind(v1074_mutable, 0);
   wv v1075_sq = rt_bind(rt_chk(s870_seq(up, rt_chk(s882_exprs(up, rt_get(&F_items, v1073_e)), "array")), "array"), 0);
-  RT_RET(({ wv t2023 = v1075_sq; wv t2024 = ({ wv t2020 = rt_text(std_length(rt_get(&F_cs, v1075_sq))); wv t2021 = rt_text(rt_chk(w7_values(rt_get(&F_cs, v1075_sq)), "array")); wv t2022 = rt_text((rt_cond(v1074_mutable) ? rt_i(1) : rt_i(0))); rt_cat(7, (wv[]){ rt_s(&S612), t2020, rt_s(&S385), t2021, rt_s(&S385), t2022, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2023, t2024), "array"); }));
+  RT_RET(({ wv t2028 = v1075_sq; wv t2029 = ({ wv t2025 = rt_text(std_length(rt_get(&F_cs, v1075_sq))); wv t2026 = rt_text(rt_chk(w7_values(rt_get(&F_cs, v1075_sq)), "array")); wv t2027 = rt_text((rt_cond(v1074_mutable) ? rt_i(1) : rt_i(0))); rt_cat(7, (wv[]){ rt_s(&S617), t2025, rt_s(&S390), t2026, rt_s(&S390), t2027, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2028, t2029), "array"); }));
 }
 
 static wv s884_record(struct fr183 *up, wv v1076_e, wv v1077_mutable) {
   rt_enter("record");
   v1076_e = rt_bind(v1076_e, 0);
   v1077_mutable = rt_bind(v1077_mutable, 0);
-  wv v1078_shape = rt_s(&S571);
+  wv v1078_shape = rt_s(&S576);
   if (rt_cond(rt_gt(std_length(rt_get(&F_fields, v1076_e)), rt_i(0)))) {
     wv v1082_names = rt_arr(0, NULL, 1);
     wv v1083_k = rt_i(0);
-    while (rt_cond(({ wv t2025 = v1083_k; wv t2026 = std_length(rt_get(&F_fields, v1076_e)); rt_lt(t2025, t2026); }))) {
-      (void)({ wv t2029 = v1082_names; wv t2030 = rt_get(&F_name, ({ wv t2027 = v1083_k; wv t2028 = rt_get(&F_fields, v1076_e); rt_idx(t2027, t2028); })); std_push(t2029, t2030); });
+    while (rt_cond(({ wv t2030 = v1083_k; wv t2031 = std_length(rt_get(&F_fields, v1076_e)); rt_lt(t2030, t2031); }))) {
+      (void)({ wv t2034 = v1082_names; wv t2035 = rt_get(&F_name, ({ wv t2032 = v1083_k; wv t2033 = rt_get(&F_fields, v1076_e); rt_idx(t2032, t2033); })); std_push(t2034, t2035); });
       v1083_k = rt_add(v1083_k, rt_i(1));
     }
     wv v1084_key = rt_bind(std_join(v1082_names, rt_s(&S96)), 0);
     v1083_k = rt_i(0);
-    while (rt_cond(({ wv t2031 = v1083_k; wv t2032 = std_length(v1082_names); rt_lt(t2031, t2032); }))) {
+    while (rt_cond(({ wv t2036 = v1083_k; wv t2037 = std_length(v1082_names); rt_lt(t2036, t2037); }))) {
       (void)rt_chk(s862_fieldRef(up, rt_idx(v1083_k, v1082_names)), "record");
       v1083_k = rt_add(v1083_k, rt_i(1));
     }
     v1083_k = rt_i(0);
-    while (rt_cond(rt_b(rt_bool(({ wv t2033 = v1083_k; wv t2034 = std_length(rt_def(up->v824_shapes, "shapes")); rt_lt(t2033, t2034); }), "&&") && rt_bool(({ wv t2037 = ({ wv t2035 = v1083_k; wv t2036 = rt_def(up->v824_shapes, "shapes"); rt_idx(t2035, t2036); }); wv t2038 = v1084_key; rt_ne(t2037, t2038); }), "&&")))) {
+    while (rt_cond(rt_b(rt_bool(({ wv t2038 = v1083_k; wv t2039 = std_length(rt_def(up->v824_shapes, "shapes")); rt_lt(t2038, t2039); }), "&&") && rt_bool(({ wv t2042 = ({ wv t2040 = v1083_k; wv t2041 = rt_def(up->v824_shapes, "shapes"); rt_idx(t2040, t2041); }); wv t2043 = v1084_key; rt_ne(t2042, t2043); }), "&&")))) {
       v1083_k = rt_add(v1083_k, rt_i(1));
     }
-    if (rt_cond(({ wv t2039 = v1083_k; wv t2040 = std_length(rt_def(up->v824_shapes, "shapes")); rt_eq(t2039, t2040); }))) {
-      (void)({ wv t2041 = rt_def(up->v824_shapes, "shapes"); wv t2042 = v1084_key; std_push(t2041, t2042); });
+    if (rt_cond(({ wv t2044 = v1083_k; wv t2045 = std_length(rt_def(up->v824_shapes, "shapes")); rt_eq(t2044, t2045); }))) {
+      (void)({ wv t2046 = rt_def(up->v824_shapes, "shapes"); wv t2047 = v1084_key; std_push(t2046, t2047); });
     }
-    v1078_shape = rt_cat(2, (wv[]){ rt_s(&S613), rt_text(v1083_k) });
+    v1078_shape = rt_cat(2, (wv[]){ rt_s(&S618), rt_text(v1083_k) });
   }
   wv v1079_vals = rt_arr(0, NULL, 1);
   wv v1080_k = rt_i(0);
-  while (rt_cond(({ wv t2043 = v1080_k; wv t2044 = std_length(rt_get(&F_fields, v1076_e)); rt_lt(t2043, t2044); }))) {
-    (void)({ wv t2047 = v1079_vals; wv t2048 = rt_chk(s900_expr(up, rt_get(&F_e, ({ wv t2045 = v1080_k; wv t2046 = rt_get(&F_fields, v1076_e); rt_idx(t2045, t2046); }))), "record"); std_push(t2047, t2048); });
+  while (rt_cond(({ wv t2048 = v1080_k; wv t2049 = std_length(rt_get(&F_fields, v1076_e)); rt_lt(t2048, t2049); }))) {
+    (void)({ wv t2052 = v1079_vals; wv t2053 = rt_chk(s900_expr(up, rt_get(&F_e, ({ wv t2050 = v1080_k; wv t2051 = rt_get(&F_fields, v1076_e); rt_idx(t2050, t2051); }))), "record"); std_push(t2052, t2053); });
     v1080_k = rt_add(v1080_k, rt_i(1));
   }
   wv v1081_sq = rt_bind(rt_chk(s870_seq(up, v1079_vals), "record"), 0);
-  RT_RET(({ wv t2053 = v1081_sq; wv t2054 = ({ wv t2049 = rt_text((rt_cond(v1077_mutable) ? rt_i(1) : rt_i(0))); wv t2050 = rt_text(std_length(rt_get(&F_cs, v1081_sq))); wv t2051 = rt_text(v1078_shape); wv t2052 = rt_text(rt_chk(w7_values(rt_get(&F_cs, v1081_sq)), "record")); rt_cat(9, (wv[]){ rt_s(&S614), t2049, rt_s(&S385), t2050, rt_s(&S385), t2051, rt_s(&S385), t2052, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2053, t2054), "record"); }));
+  RT_RET(({ wv t2058 = v1081_sq; wv t2059 = ({ wv t2054 = rt_text((rt_cond(v1077_mutable) ? rt_i(1) : rt_i(0))); wv t2055 = rt_text(std_length(rt_get(&F_cs, v1081_sq))); wv t2056 = rt_text(v1078_shape); wv t2057 = rt_text(rt_chk(w7_values(rt_get(&F_cs, v1081_sq)), "record")); rt_cat(9, (wv[]){ rt_s(&S619), t2054, rt_s(&S390), t2055, rt_s(&S390), t2056, rt_s(&S390), t2057, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2058, t2059), "record"); }));
 }
 
 static wv s885_onfailStmt(struct fr183 *up, wv v1085_s) {
@@ -7658,38 +8169,38 @@ static wv s885_onfailStmt(struct fr183 *up, wv v1085_s) {
   wv v1086_call = rt_bind(rt_get(&F_e, v1085_s), 0);
   wv v1087_args = rt_arr(0, NULL, 1);
   wv v1088_k = rt_i(0);
-  while (rt_cond(({ wv t2055 = v1088_k; wv t2056 = std_length(rt_get(&F_args, v1086_call)); rt_lt(t2055, t2056); }))) {
-    wv v1092_a = rt_bind(({ wv t2057 = v1088_k; wv t2058 = rt_get(&F_args, v1086_call); rt_idx(t2057, t2058); }), 0);
-    if (rt_cond(({ wv t2059 = rt_def(w7_plainKinds, "plainKinds"); wv t2060 = rt_get(&F_k, v1092_a); rt_chk(w1_contains(t2059, t2060), "onfailStmt"); }))) {
-      (void)({ wv t2061 = v1087_args; wv t2062 = rt_get(&F_c, rt_chk(s900_expr(up, v1092_a), "onfailStmt")); std_push(t2061, t2062); });
+  while (rt_cond(({ wv t2060 = v1088_k; wv t2061 = std_length(rt_get(&F_args, v1086_call)); rt_lt(t2060, t2061); }))) {
+    wv v1092_a = rt_bind(({ wv t2062 = v1088_k; wv t2063 = rt_get(&F_args, v1086_call); rt_idx(t2062, t2063); }), 0);
+    if (rt_cond(({ wv t2064 = rt_def(w7_plainKinds, "plainKinds"); wv t2065 = rt_get(&F_k, v1092_a); rt_chk(w1_contains(t2064, t2065), "onfailStmt"); }))) {
+      (void)({ wv t2066 = v1087_args; wv t2067 = rt_get(&F_c, rt_chk(s900_expr(up, v1092_a), "onfailStmt")); std_push(t2066, t2067); });
     } else {
       wv v1093_temp = rt_bind(rt_chk(s860_tmp(up), "onfailStmt"), 0);
-      (void)rt_chk(s859_emit(up, ({ wv t2063 = rt_text(v1093_temp); wv t2064 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, v1092_a), "onfailStmt"))); rt_cat(5, (wv[]){ rt_s(&S584), t2063, rt_s(&S495), t2064, rt_s(&S14) }); })), "onfailStmt");
+      (void)rt_chk(s859_emit(up, ({ wv t2068 = rt_text(v1093_temp); wv t2069 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, v1092_a), "onfailStmt"))); rt_cat(5, (wv[]){ rt_s(&S589), t2068, rt_s(&S500), t2069, rt_s(&S14) }); })), "onfailStmt");
       (void)std_push(v1087_args, v1093_temp);
     }
     v1088_k = rt_add(v1088_k, rt_i(1));
   }
   wv v1089_r = rt_bind(rt_chk(s860_tmp(up), "onfailStmt"), 0);
-  (void)rt_chk(s859_emit(up, ({ wv t2067 = rt_text(v1089_r); wv t2068 = rt_text(({ wv t2065 = rt_get(&F_callee, v1086_call); wv t2066 = v1087_args; rt_chk(s899_callC(up, t2065, t2066, rt_b(0)), "onfailStmt"); })); rt_cat(5, (wv[]){ rt_s(&S584), t2067, rt_s(&S495), t2068, rt_s(&S14) }); })), "onfailStmt");
-  (void)rt_chk(s859_emit(up, rt_s(&S615)), "onfailStmt");
+  (void)rt_chk(s859_emit(up, ({ wv t2072 = rt_text(v1089_r); wv t2073 = rt_text(({ wv t2070 = rt_get(&F_callee, v1086_call); wv t2071 = v1087_args; rt_chk(s899_callC(up, t2070, t2071, rt_b(0)), "onfailStmt"); })); rt_cat(5, (wv[]){ rt_s(&S589), t2072, rt_s(&S500), t2073, rt_s(&S14) }); })), "onfailStmt");
+  (void)rt_chk(s859_emit(up, rt_s(&S620)), "onfailStmt");
   up->v830_indent = rt_add(rt_def(up->v830_indent, "indent"), rt_i(1));
   wv v1090_h = rt_bind(rt_get(&F_handler, v1085_s), 0);
   if (rt_cond(rt_ne(rt_get(&F_param, v1090_h), RT_NULL))) {
-    (void)rt_chk(s878_bindDecl(up, ({ wv t2069 = rt_get(&F_paramPos, v1090_h); wv t2070 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t2069, t2070); }), rt_s(&S616)), "onfailStmt");
+    (void)rt_chk(s878_bindDecl(up, ({ wv t2074 = rt_get(&F_paramPos, v1090_h); wv t2075 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t2074, t2075); }), rt_s(&S621)), "onfailStmt");
   }
-  (void)rt_chk(s859_emit(up, rt_s(&S617)), "onfailStmt");
+  (void)rt_chk(s859_emit(up, rt_s(&S622)), "onfailStmt");
   (void)rt_chk(s859_emit(up, rt_s(&S100)), "onfailStmt");
   up->v830_indent = rt_add(rt_def(up->v830_indent, "indent"), rt_i(1));
   (void)rt_chk(s873_resets(up, rt_get(&F_body, v1090_h)), "onfailStmt");
   (void)rt_chk(s872_stmts(up, rt_get(&F_stmts, rt_get(&F_body, v1090_h))), "onfailStmt");
-  (void)rt_chk(s859_emit(up, ({ wv t2071 = rt_text(v1089_r); wv t2072 = rt_text(rt_chk(s875_valueOf(up, rt_get(&F_body, v1090_h)), "onfailStmt")); rt_cat(4, (wv[]){ t2071, rt_s(&S495), t2072, rt_s(&S14) }); })), "onfailStmt");
+  (void)rt_chk(s859_emit(up, ({ wv t2076 = rt_text(v1089_r); wv t2077 = rt_text(rt_chk(s875_valueOf(up, rt_get(&F_body, v1090_h)), "onfailStmt")); rt_cat(4, (wv[]){ t2076, rt_s(&S500), t2077, rt_s(&S14) }); })), "onfailStmt");
   up->v830_indent = rt_sub(rt_def(up->v830_indent, "indent"), rt_i(1));
   (void)rt_chk(s859_emit(up, rt_s(&S15)), "onfailStmt");
   up->v830_indent = rt_sub(rt_def(up->v830_indent, "indent"), rt_i(1));
   (void)rt_chk(s859_emit(up, rt_s(&S15)), "onfailStmt");
   wv v1091_rest = rt_bind(v1085_s, 1);
   rt_set_mem(RT_NULL, &F_handler, v1091_rest);
-  ({ wv t2075 = ({ wv t2073 = v1089_r; wv t2074 = rt_get(&F_pos, v1085_s); rt_rec(0, 4, K50, (wv[]){ rt_s(&S528), t2073, t2074, rt_b(0) }); }); wv t2076 = v1091_rest; rt_set_mem(t2075, &F_e, t2076); });
+  ({ wv t2080 = ({ wv t2078 = v1089_r; wv t2079 = rt_get(&F_pos, v1085_s); rt_rec(0, 4, K50, (wv[]){ rt_s(&S533), t2078, t2079, rt_b(0) }); }); wv t2081 = v1091_rest; rt_set_mem(t2080, &F_e, t2081); });
   (void)rt_chk(s876_stmt(up, v1091_rest), "onfailStmt");
   RT_RET(RT_NULL);
 }
@@ -7698,16 +8209,16 @@ static wv s886_chainStmt(struct fr183 *up, wv v1094_e) {
   rt_enter("chainStmt");
   v1094_e = rt_bind(v1094_e, 0);
   wv v1095_k = rt_i(0);
-  while (rt_cond(({ wv t2077 = v1095_k; wv t2078 = std_length(rt_get(&F_branches, v1094_e)); rt_lt(t2077, t2078); }))) {
-    wv v1096_b = rt_bind(({ wv t2079 = v1095_k; wv t2080 = rt_get(&F_branches, v1094_e); rt_idx(t2079, t2080); }), 0);
-    (void)rt_chk(s859_emit(up, ({ wv t2081 = rt_text((rt_cond(rt_gt(v1095_k, rt_i(0))) ? rt_s(&S529) : rt_s(&S13))); wv t2082 = rt_text(rt_chk(s887_test(up, v1096_b), "chainStmt")); rt_cat(4, (wv[]){ t2081, rt_s(&S530), t2082, rt_s(&S498) }); })), "chainStmt");
+  while (rt_cond(({ wv t2082 = v1095_k; wv t2083 = std_length(rt_get(&F_branches, v1094_e)); rt_lt(t2082, t2083); }))) {
+    wv v1096_b = rt_bind(({ wv t2084 = v1095_k; wv t2085 = rt_get(&F_branches, v1094_e); rt_idx(t2084, t2085); }), 0);
+    (void)rt_chk(s859_emit(up, ({ wv t2086 = rt_text((rt_cond(rt_gt(v1095_k, rt_i(0))) ? rt_s(&S534) : rt_s(&S13))); wv t2087 = rt_text(rt_chk(s887_test(up, v1096_b), "chainStmt")); rt_cat(4, (wv[]){ t2086, rt_s(&S535), t2087, rt_s(&S503) }); })), "chainStmt");
     up->v830_indent = rt_add(rt_def(up->v830_indent, "indent"), rt_i(1));
     (void)rt_chk(s874_blockBody(up, rt_get(&F_body, v1096_b)), "chainStmt");
     up->v830_indent = rt_sub(rt_def(up->v830_indent, "indent"), rt_i(1));
     v1095_k = rt_add(v1095_k, rt_i(1));
   }
   if (rt_cond(rt_ne(rt_get(&F_els, v1094_e), RT_NULL))) {
-    (void)rt_chk(s859_emit(up, rt_s(&S531)), "chainStmt");
+    (void)rt_chk(s859_emit(up, rt_s(&S536)), "chainStmt");
     up->v830_indent = rt_add(rt_def(up->v830_indent, "indent"), rt_i(1));
     (void)rt_chk(s874_blockBody(up, rt_get(&F_els, v1094_e)), "chainStmt");
     up->v830_indent = rt_sub(rt_def(up->v830_indent, "indent"), rt_i(1));
@@ -7719,7 +8230,7 @@ static wv s886_chainStmt(struct fr183 *up, wv v1094_e) {
 static wv s887_test(struct fr183 *up, wv v1097_b) {
   rt_enter("test");
   v1097_b = rt_bind(v1097_b, 0);
-  RT_RET(({ wv t2083 = rt_text((rt_cond(rt_get(&F_neg, v1097_b)) ? rt_s(&S94) : rt_s(&S13))); wv t2084 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_cond, v1097_b)), "test"))); rt_cat(4, (wv[]){ t2083, rt_s(&S592), t2084, rt_s(&S16) }); }));
+  RT_RET(({ wv t2088 = rt_text((rt_cond(rt_get(&F_neg, v1097_b)) ? rt_s(&S94) : rt_s(&S13))); wv t2089 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_cond, v1097_b)), "test"))); rt_cat(4, (wv[]){ t2088, rt_s(&S597), t2089, rt_s(&S16) }); }));
 }
 
 static wv s888_branchCount(struct fr183 *up, wv v1098_e) {
@@ -7732,7 +8243,7 @@ static wv s889_branchBody(struct fr183 *up, wv v1099_e, wv v1100_i) {
   rt_enter("branchBody");
   v1099_e = rt_bind(v1099_e, 0);
   v1100_i = rt_bind(v1100_i, 0);
-  RT_RET((rt_cond(rt_eq(rt_get(&F_k, v1099_e), rt_s(&S184))) ? rt_get(&F_body, ({ wv t2085 = v1100_i; wv t2086 = rt_get(&F_branches, v1099_e); rt_idx(t2085, t2086); })) : rt_get(&F_body, ({ wv t2087 = v1100_i; wv t2088 = rt_get(&F_cases, v1099_e); rt_idx(t2087, t2088); }))));
+  RT_RET((rt_cond(rt_eq(rt_get(&F_k, v1099_e), rt_s(&S184))) ? rt_get(&F_body, ({ wv t2090 = v1100_i; wv t2091 = rt_get(&F_branches, v1099_e); rt_idx(t2090, t2091); })) : rt_get(&F_body, ({ wv t2092 = v1100_i; wv t2093 = rt_get(&F_cases, v1099_e); rt_idx(t2092, t2093); }))));
 }
 
 static wv s890_branchTest(struct fr183 *up, wv v1101_e, wv v1102_t, wv v1103_i) {
@@ -7740,18 +8251,18 @@ static wv s890_branchTest(struct fr183 *up, wv v1101_e, wv v1102_t, wv v1103_i) 
   v1101_e = rt_bind(v1101_e, 0);
   v1102_t = rt_bind(v1102_t, 0);
   v1103_i = rt_bind(v1103_i, 0);
-  RT_RET((rt_cond(rt_eq(rt_get(&F_k, v1101_e), rt_s(&S184))) ? rt_chk(s887_test(up, ({ wv t2089 = v1103_i; wv t2090 = rt_get(&F_branches, v1101_e); rt_idx(t2089, t2090); })), "branchTest") : ({ wv t2093 = v1102_t; wv t2094 = ({ wv t2091 = v1103_i; wv t2092 = rt_get(&F_cases, v1101_e); rt_idx(t2091, t2092); }); rt_chk(s895_caseTest(up, t2093, t2094), "branchTest"); })));
+  RT_RET((rt_cond(rt_eq(rt_get(&F_k, v1101_e), rt_s(&S184))) ? rt_chk(s887_test(up, ({ wv t2094 = v1103_i; wv t2095 = rt_get(&F_branches, v1101_e); rt_idx(t2094, t2095); })), "branchTest") : ({ wv t2098 = v1102_t; wv t2099 = ({ wv t2096 = v1103_i; wv t2097 = rt_get(&F_cases, v1101_e); rt_idx(t2096, t2097); }); rt_chk(s895_caseTest(up, t2098, t2099), "branchTest"); })));
 }
 
 static wv s891_isPlain(struct fr183 *up, wv v1104_e) {
   rt_enter("isPlain");
   v1104_e = rt_bind(v1104_e, 0);
   wv v1105_k = rt_i(0);
-  while (rt_cond(({ wv t2095 = v1105_k; wv t2096 = rt_chk(s888_branchCount(up, v1104_e), "isPlain"); rt_le(t2095, t2096); }))) {
-    wv v1106_b = rt_bind((rt_cond(({ wv t2097 = v1105_k; wv t2098 = rt_chk(s888_branchCount(up, v1104_e), "isPlain"); rt_lt(t2097, t2098); })) ? rt_chk(s889_branchBody(up, v1104_e, v1105_k), "isPlain") : rt_get(&F_els, v1104_e)), 0);
+  while (rt_cond(({ wv t2100 = v1105_k; wv t2101 = rt_chk(s888_branchCount(up, v1104_e), "isPlain"); rt_le(t2100, t2101); }))) {
+    wv v1106_b = rt_bind((rt_cond(({ wv t2102 = v1105_k; wv t2103 = rt_chk(s888_branchCount(up, v1104_e), "isPlain"); rt_lt(t2102, t2103); })) ? rt_chk(s889_branchBody(up, v1104_e, v1105_k), "isPlain") : rt_get(&F_els, v1104_e)), 0);
     wv v1107_j = rt_i(0);
-    while (rt_cond(({ wv t2099 = v1107_j; wv t2100 = std_length(rt_get(&F_stmts, v1106_b)); rt_lt(t2099, t2100); }))) {
-      if (rt_cond(rt_ne(rt_get(&F_k, ({ wv t2101 = v1107_j; wv t2102 = rt_get(&F_stmts, v1106_b); rt_idx(t2101, t2102); })), rt_s(&S200)))) {
+    while (rt_cond(({ wv t2104 = v1107_j; wv t2105 = std_length(rt_get(&F_stmts, v1106_b)); rt_lt(t2104, t2105); }))) {
+      if (rt_cond(rt_ne(rt_get(&F_k, ({ wv t2106 = v1107_j; wv t2107 = rt_get(&F_stmts, v1106_b); rt_idx(t2106, t2107); })), rt_s(&S200)))) {
         RT_RET(rt_b(0));
       }
       v1107_j = rt_add(v1107_j, rt_i(1));
@@ -7768,7 +8279,7 @@ static wv s892_ternaryChain(struct fr183 *up, wv v1108_e, wv v1109_t) {
   wv v1110_code = rt_bind(rt_chk(s875_valueOf(up, rt_get(&F_els, v1108_e)), "ternaryChain"), 1);
   wv v1111_k = rt_sub(rt_chk(s888_branchCount(up, v1108_e), "ternaryChain"), rt_i(1));
   while (rt_cond(rt_ge(v1111_k, rt_i(0)))) {
-    v1110_code = ({ wv t2103 = rt_text(rt_chk(s890_branchTest(up, v1108_e, v1109_t, v1111_k), "ternaryChain")); wv t2104 = rt_text(rt_chk(s875_valueOf(up, rt_chk(s889_branchBody(up, v1108_e, v1111_k), "ternaryChain")), "ternaryChain")); wv t2105 = rt_text(v1110_code); rt_cat(7, (wv[]){ rt_s(&S97), t2103, rt_s(&S532), t2104, rt_s(&S533), t2105, rt_s(&S16) }); });
+    v1110_code = ({ wv t2108 = rt_text(rt_chk(s890_branchTest(up, v1108_e, v1109_t, v1111_k), "ternaryChain")); wv t2109 = rt_text(rt_chk(s875_valueOf(up, rt_chk(s889_branchBody(up, v1108_e, v1111_k), "ternaryChain")), "ternaryChain")); wv t2110 = rt_text(v1110_code); rt_cat(7, (wv[]){ rt_s(&S97), t2108, rt_s(&S537), t2109, rt_s(&S538), t2110, rt_s(&S16) }); });
     v1111_k = rt_sub(v1111_k, rt_i(1));
   }
   RT_RET(v1110_code);
@@ -7783,53 +8294,53 @@ static wv s893_branchValue(struct fr183 *up, wv v1112_e, wv v1113_t, wv v1114_su
   wv v1116_savedIndent = rt_bind(rt_def(up->v830_indent, "indent"), 0);
   wv v1117_savedLoops = rt_bind(rt_def(up->v831_loops, "loops"), 0);
   wv v1118_savedIife = rt_bind(rt_def(up->v832_iife, "iife"), 0);
-  wv t2106 = rt_add(v1116_savedIndent, rt_i(1));
+  wv t2111 = rt_add(v1116_savedIndent, rt_i(1));
   (void)rt_def(up->v830_indent, "indent");
-  up->v830_indent = t2106;
-  wv t2107 = rt_i(0);
+  up->v830_indent = t2111;
+  wv t2112 = rt_i(0);
   (void)rt_def(up->v831_loops, "loops");
-  up->v831_loops = t2107;
-  wv t2108 = rt_b(1);
+  up->v831_loops = t2112;
+  wv t2113 = rt_b(1);
   (void)rt_def(up->v832_iife, "iife");
-  up->v832_iife = t2108;
+  up->v832_iife = t2113;
   if (rt_cond(rt_ne(v1114_subject, RT_NULL))) {
-    (void)rt_chk(s859_emit(up, ({ wv t2109 = rt_text(v1113_t); wv t2110 = rt_text(v1114_subject); rt_cat(5, (wv[]){ rt_s(&S584), t2109, rt_s(&S495), t2110, rt_s(&S14) }); })), "branchValue");
+    (void)rt_chk(s859_emit(up, ({ wv t2114 = rt_text(v1113_t); wv t2115 = rt_text(v1114_subject); rt_cat(5, (wv[]){ rt_s(&S589), t2114, rt_s(&S500), t2115, rt_s(&S14) }); })), "branchValue");
   }
   wv v1119_r = rt_bind(rt_chk(s860_tmp(up), "branchValue"), 0);
-  (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S584), rt_text(v1119_r), rt_s(&S14) })), "branchValue");
+  (void)rt_chk(s859_emit(up, rt_cat(3, (wv[]){ rt_s(&S589), rt_text(v1119_r), rt_s(&S14) })), "branchValue");
   wv v1120_k = rt_i(0);
-  while (rt_cond(({ wv t2111 = v1120_k; wv t2112 = rt_chk(s888_branchCount(up, v1112_e), "branchValue"); rt_lt(t2111, t2112); }))) {
+  while (rt_cond(({ wv t2116 = v1120_k; wv t2117 = rt_chk(s888_branchCount(up, v1112_e), "branchValue"); rt_lt(t2116, t2117); }))) {
     wv v1122_b = rt_bind(rt_chk(s889_branchBody(up, v1112_e, v1120_k), "branchValue"), 0);
-    (void)rt_chk(s859_emit(up, ({ wv t2113 = rt_text((rt_cond(rt_gt(v1120_k, rt_i(0))) ? rt_s(&S529) : rt_s(&S13))); wv t2114 = rt_text(rt_chk(s890_branchTest(up, v1112_e, v1113_t, v1120_k), "branchValue")); rt_cat(4, (wv[]){ t2113, rt_s(&S530), t2114, rt_s(&S498) }); })), "branchValue");
+    (void)rt_chk(s859_emit(up, ({ wv t2118 = rt_text((rt_cond(rt_gt(v1120_k, rt_i(0))) ? rt_s(&S534) : rt_s(&S13))); wv t2119 = rt_text(rt_chk(s890_branchTest(up, v1112_e, v1113_t, v1120_k), "branchValue")); rt_cat(4, (wv[]){ t2118, rt_s(&S535), t2119, rt_s(&S503) }); })), "branchValue");
     up->v830_indent = rt_add(rt_def(up->v830_indent, "indent"), rt_i(1));
     (void)rt_chk(s873_resets(up, v1122_b), "branchValue");
     (void)rt_chk(s872_stmts(up, rt_get(&F_stmts, v1122_b)), "branchValue");
-    (void)rt_chk(s859_emit(up, ({ wv t2115 = rt_text(v1119_r); wv t2116 = rt_text(rt_chk(s875_valueOf(up, v1122_b), "branchValue")); rt_cat(4, (wv[]){ t2115, rt_s(&S495), t2116, rt_s(&S14) }); })), "branchValue");
+    (void)rt_chk(s859_emit(up, ({ wv t2120 = rt_text(v1119_r); wv t2121 = rt_text(rt_chk(s875_valueOf(up, v1122_b), "branchValue")); rt_cat(4, (wv[]){ t2120, rt_s(&S500), t2121, rt_s(&S14) }); })), "branchValue");
     up->v830_indent = rt_sub(rt_def(up->v830_indent, "indent"), rt_i(1));
     v1120_k = rt_add(v1120_k, rt_i(1));
   }
-  (void)rt_chk(s859_emit(up, rt_s(&S531)), "branchValue");
+  (void)rt_chk(s859_emit(up, rt_s(&S536)), "branchValue");
   up->v830_indent = rt_add(rt_def(up->v830_indent, "indent"), rt_i(1));
   (void)rt_chk(s873_resets(up, rt_get(&F_els, v1112_e)), "branchValue");
   (void)rt_chk(s872_stmts(up, rt_get(&F_stmts, rt_get(&F_els, v1112_e))), "branchValue");
-  (void)rt_chk(s859_emit(up, ({ wv t2117 = rt_text(v1119_r); wv t2118 = rt_text(rt_chk(s875_valueOf(up, rt_get(&F_els, v1112_e)), "branchValue")); rt_cat(4, (wv[]){ t2117, rt_s(&S495), t2118, rt_s(&S14) }); })), "branchValue");
+  (void)rt_chk(s859_emit(up, ({ wv t2122 = rt_text(v1119_r); wv t2123 = rt_text(rt_chk(s875_valueOf(up, rt_get(&F_els, v1112_e)), "branchValue")); rt_cat(4, (wv[]){ t2122, rt_s(&S500), t2123, rt_s(&S14) }); })), "branchValue");
   up->v830_indent = rt_sub(rt_def(up->v830_indent, "indent"), rt_i(1));
   (void)rt_chk(s859_emit(up, rt_s(&S15)), "branchValue");
   (void)rt_chk(s859_emit(up, rt_cat(2, (wv[]){ rt_text(v1119_r), rt_s(&S14) })), "branchValue");
-  wv v1121_body = rt_bind(std_join(({ wv t2119 = rt_def(up->v829_out, "out"); wv t2120 = v1115_start; wv t2121 = std_length(rt_def(up->v829_out, "out")); std_slice(t2119, t2120, t2121); }), rt_s(&S2)), 0);
-  while (rt_cond(({ wv t2122 = std_length(rt_def(up->v829_out, "out")); wv t2123 = v1115_start; rt_gt(t2122, t2123); }))) {
+  wv v1121_body = rt_bind(std_join(({ wv t2124 = rt_def(up->v829_out, "out"); wv t2125 = v1115_start; wv t2126 = std_length(rt_def(up->v829_out, "out")); std_slice(t2124, t2125, t2126); }), rt_s(&S2)), 0);
+  while (rt_cond(({ wv t2127 = std_length(rt_def(up->v829_out, "out")); wv t2128 = v1115_start; rt_gt(t2127, t2128); }))) {
     (void)std_pop(rt_def(up->v829_out, "out"));
   }
-  wv t2124 = rt_bind(v1116_savedIndent, 1);
+  wv t2129 = rt_bind(v1116_savedIndent, 1);
   (void)rt_def(up->v830_indent, "indent");
-  up->v830_indent = t2124;
-  wv t2125 = rt_bind(v1117_savedLoops, 1);
+  up->v830_indent = t2129;
+  wv t2130 = rt_bind(v1117_savedLoops, 1);
   (void)rt_def(up->v831_loops, "loops");
-  up->v831_loops = t2125;
-  wv t2126 = rt_bind(v1118_savedIife, 1);
+  up->v831_loops = t2130;
+  wv t2131 = rt_bind(v1118_savedIife, 1);
   (void)rt_def(up->v832_iife, "iife");
-  up->v832_iife = t2126;
-  RT_RET(({ wv t2127 = rt_text(v1121_body); wv t2128 = rt_text(rt_chk(w7_repeat(rt_s(&S480), rt_def(up->v830_indent, "indent")), "branchValue")); rt_cat(5, (wv[]){ rt_s(&S618), t2127, rt_s(&S2), t2128, rt_s(&S619) }); }));
+  up->v832_iife = t2131;
+  RT_RET(({ wv t2132 = rt_text(v1121_body); wv t2133 = rt_text(rt_chk(w7_repeat(rt_s(&S485), rt_def(up->v830_indent, "indent")), "branchValue")); rt_cat(5, (wv[]){ rt_s(&S623), t2132, rt_s(&S2), t2133, rt_s(&S624) }); }));
 }
 
 static wv s894_chainExpr(struct fr183 *up, wv v1123_e) {
@@ -7847,11 +8358,11 @@ static wv s895_caseTest(struct fr183 *up, wv v1124_t, wv v1125_a) {
   v1125_a = rt_bind(v1125_a, 0);
   wv v1126_tests = rt_arr(0, NULL, 1);
   wv v1127_k = rt_i(0);
-  while (rt_cond(({ wv t2129 = v1127_k; wv t2130 = std_length(rt_get(&F_values, v1125_a)); rt_lt(t2129, t2130); }))) {
-    (void)({ wv t2135 = v1126_tests; wv t2136 = ({ wv t2133 = rt_text(v1124_t); wv t2134 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, ({ wv t2131 = v1127_k; wv t2132 = rt_get(&F_values, v1125_a); rt_idx(t2131, t2132); })), "caseTest"))); rt_cat(5, (wv[]){ rt_s(&S620), t2133, rt_s(&S385), t2134, rt_s(&S16) }); }); std_push(t2135, t2136); });
+  while (rt_cond(({ wv t2134 = v1127_k; wv t2135 = std_length(rt_get(&F_values, v1125_a)); rt_lt(t2134, t2135); }))) {
+    (void)({ wv t2140 = v1126_tests; wv t2141 = ({ wv t2138 = rt_text(v1124_t); wv t2139 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, ({ wv t2136 = v1127_k; wv t2137 = rt_get(&F_values, v1125_a); rt_idx(t2136, t2137); })), "caseTest"))); rt_cat(5, (wv[]){ rt_s(&S625), t2138, rt_s(&S390), t2139, rt_s(&S16) }); }); std_push(t2140, t2141); });
     v1127_k = rt_add(v1127_k, rt_i(1));
   }
-  RT_RET(std_join(v1126_tests, rt_s(&S537)));
+  RT_RET(std_join(v1126_tests, rt_s(&S542)));
 }
 
 static wv s896_matchElse(struct fr183 *up, wv v1128_e, wv v1129_t) {
@@ -7861,25 +8372,25 @@ static wv s896_matchElse(struct fr183 *up, wv v1128_e, wv v1129_t) {
   if (rt_cond(rt_b(rt_bool(rt_ne(rt_get(&F_els, v1128_e), RT_NULL), "||") || rt_bool(rt_ne(rt_get(&F_k, rt_idx(rt_i(0), rt_get(&F_values, rt_idx(rt_i(0), rt_get(&F_cases, v1128_e))))), rt_s(&S189)), "||")))) {
     RT_RET(rt_get(&F_els, v1128_e));
   }
-  RT_RET(({ wv t2137 = rt_arr(0, NULL, 0); wv t2138 = rt_rec(0, 4, K50, (wv[]){ rt_s(&S528), rt_cat(3, (wv[]){ rt_s(&S621), rt_text(v1129_t), rt_s(&S622) }), RT_NULL, rt_b(0) }); rt_rec(0, 3, K21, (wv[]){ t2137, t2138, RT_NULL }); }));
+  RT_RET(({ wv t2142 = rt_arr(0, NULL, 0); wv t2143 = rt_rec(0, 4, K50, (wv[]){ rt_s(&S533), rt_cat(3, (wv[]){ rt_s(&S626), rt_text(v1129_t), rt_s(&S627) }), RT_NULL, rt_b(0) }); rt_rec(0, 3, K21, (wv[]){ t2142, t2143, RT_NULL }); }));
 }
 
 static wv s897_matchStmt(struct fr183 *up, wv v1130_e) {
   rt_enter("matchStmt");
   v1130_e = rt_bind(v1130_e, 0);
   wv v1131_t = rt_bind(rt_chk(s860_tmp(up), "matchStmt"), 0);
-  (void)rt_chk(s859_emit(up, ({ wv t2139 = rt_text(v1131_t); wv t2140 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_subject, v1130_e)), "matchStmt"))); rt_cat(5, (wv[]){ rt_s(&S584), t2139, rt_s(&S495), t2140, rt_s(&S14) }); })), "matchStmt");
+  (void)rt_chk(s859_emit(up, ({ wv t2144 = rt_text(v1131_t); wv t2145 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_subject, v1130_e)), "matchStmt"))); rt_cat(5, (wv[]){ rt_s(&S589), t2144, rt_s(&S500), t2145, rt_s(&S14) }); })), "matchStmt");
   wv v1132_k = rt_i(0);
-  while (rt_cond(({ wv t2141 = v1132_k; wv t2142 = std_length(rt_get(&F_cases, v1130_e)); rt_lt(t2141, t2142); }))) {
-    (void)rt_chk(s859_emit(up, ({ wv t2147 = rt_text((rt_cond(rt_gt(v1132_k, rt_i(0))) ? rt_s(&S529) : rt_s(&S13))); wv t2148 = rt_text(({ wv t2145 = v1131_t; wv t2146 = ({ wv t2143 = v1132_k; wv t2144 = rt_get(&F_cases, v1130_e); rt_idx(t2143, t2144); }); rt_chk(s895_caseTest(up, t2145, t2146), "matchStmt"); })); rt_cat(4, (wv[]){ t2147, rt_s(&S530), t2148, rt_s(&S498) }); })), "matchStmt");
+  while (rt_cond(({ wv t2146 = v1132_k; wv t2147 = std_length(rt_get(&F_cases, v1130_e)); rt_lt(t2146, t2147); }))) {
+    (void)rt_chk(s859_emit(up, ({ wv t2152 = rt_text((rt_cond(rt_gt(v1132_k, rt_i(0))) ? rt_s(&S534) : rt_s(&S13))); wv t2153 = rt_text(({ wv t2150 = v1131_t; wv t2151 = ({ wv t2148 = v1132_k; wv t2149 = rt_get(&F_cases, v1130_e); rt_idx(t2148, t2149); }); rt_chk(s895_caseTest(up, t2150, t2151), "matchStmt"); })); rt_cat(4, (wv[]){ t2152, rt_s(&S535), t2153, rt_s(&S503) }); })), "matchStmt");
     up->v830_indent = rt_add(rt_def(up->v830_indent, "indent"), rt_i(1));
-    (void)rt_chk(s874_blockBody(up, rt_get(&F_body, ({ wv t2149 = v1132_k; wv t2150 = rt_get(&F_cases, v1130_e); rt_idx(t2149, t2150); }))), "matchStmt");
+    (void)rt_chk(s874_blockBody(up, rt_get(&F_body, ({ wv t2154 = v1132_k; wv t2155 = rt_get(&F_cases, v1130_e); rt_idx(t2154, t2155); }))), "matchStmt");
     up->v830_indent = rt_sub(rt_def(up->v830_indent, "indent"), rt_i(1));
     v1132_k = rt_add(v1132_k, rt_i(1));
   }
   wv v1133_els = rt_bind(rt_chk(s896_matchElse(up, v1130_e, v1131_t), "matchStmt"), 0);
   if (rt_cond(rt_ne(v1133_els, RT_NULL))) {
-    (void)rt_chk(s859_emit(up, rt_s(&S531)), "matchStmt");
+    (void)rt_chk(s859_emit(up, rt_s(&S536)), "matchStmt");
     up->v830_indent = rt_add(rt_def(up->v830_indent, "indent"), rt_i(1));
     (void)rt_chk(s874_blockBody(up, v1133_els), "matchStmt");
     up->v830_indent = rt_sub(rt_def(up->v830_indent, "indent"), rt_i(1));
@@ -7894,9 +8405,9 @@ static wv s898_matchExpr(struct fr183 *up, wv v1134_e) {
   wv v1135_t = rt_bind(rt_chk(s860_tmp(up), "matchExpr"), 0);
   wv v1136_subject = rt_bind(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_subject, v1134_e)), "matchExpr")), 0);
   wv v1137_withElse = rt_bind(v1134_e, 1);
-  ({ wv t2151 = rt_chk(s896_matchElse(up, v1134_e, v1135_t), "matchExpr"); wv t2152 = v1137_withElse; rt_set_mem(t2151, &F_els, t2152); });
+  ({ wv t2156 = rt_chk(s896_matchElse(up, v1134_e, v1135_t), "matchExpr"); wv t2157 = v1137_withElse; rt_set_mem(t2156, &F_els, t2157); });
   if (rt_cond(rt_chk(s891_isPlain(up, v1137_withElse), "matchExpr"))) {
-    RT_RET(({ wv t2153 = rt_text(v1135_t); wv t2154 = rt_text(v1136_subject); wv t2155 = rt_text(rt_chk(s892_ternaryChain(up, v1137_withElse, v1135_t), "matchExpr")); rt_cat(7, (wv[]){ rt_s(&S623), t2153, rt_s(&S495), t2154, rt_s(&S624), t2155, rt_s(&S586) }); }));
+    RT_RET(({ wv t2158 = rt_text(v1135_t); wv t2159 = rt_text(v1136_subject); wv t2160 = rt_text(rt_chk(s892_ternaryChain(up, v1137_withElse, v1135_t), "matchExpr")); rt_cat(7, (wv[]){ rt_s(&S628), t2158, rt_s(&S500), t2159, rt_s(&S629), t2160, rt_s(&S591) }); }));
   }
   RT_RET(rt_chk(s893_branchValue(up, v1137_withElse, v1135_t, v1136_subject), "matchExpr"));
 }
@@ -7907,87 +8418,87 @@ static wv s899_callC(struct fr183 *up, wv v1138_callee, wv v1139_args, wv v1140_
   v1140_checked = rt_bind(v1140_checked, 0);
   wv v1141_code = rt_s(&S13);
   if (rt_cond(rt_eq(rt_get(&F_k, v1138_callee), rt_s(&S156)))) {
-    v1141_code = ({ wv t2156 = rt_text(rt_get(&F_name, v1138_callee)); wv t2157 = rt_text(std_join(v1139_args, rt_s(&S385))); rt_cat(5, (wv[]){ rt_s(&S625), t2156, rt_s(&S97), t2157, rt_s(&S16) }); });
-    if (rt_cond(rt_not(({ wv t2158 = rt_def(w7_signalers, "signalers"); wv t2159 = rt_get(&F_name, v1138_callee); rt_chk(w1_contains(t2158, t2159), "callC"); })))) {
+    v1141_code = ({ wv t2161 = rt_text(rt_get(&F_name, v1138_callee)); wv t2162 = rt_text(std_join(v1139_args, rt_s(&S390))); rt_cat(5, (wv[]){ rt_s(&S630), t2161, rt_s(&S97), t2162, rt_s(&S16) }); });
+    if (rt_cond(rt_not(({ wv t2163 = rt_def(w7_signalers, "signalers"); wv t2164 = rt_get(&F_name, v1138_callee); rt_chk(w1_contains(t2163, t2164), "callC"); })))) {
       RT_RET(v1141_code);
     }
   } else {
     wv v1142_f = rt_s(&S13);
     wv v1143_parent = RT_NULL;
     if (rt_cond(rt_eq(rt_get(&F_k, v1138_callee), rt_s(&S189)))) {
-      v1142_f = ({ wv t2160 = rt_text(rt_chk(s843_modId(up, rt_chk(s864_stolenFrom(up, rt_get(&F_rec, v1138_callee)), "callC")), "callC")); wv t2161 = rt_text(rt_get(&F_field, v1138_callee)); rt_cat(4, (wv[]){ rt_s(&S478), t2160, rt_s(&S12), t2161 }); });
+      v1142_f = ({ wv t2165 = rt_text(rt_chk(s843_modId(up, rt_chk(s864_stolenFrom(up, rt_get(&F_rec, v1138_callee)), "callC")), "callC")); wv t2166 = rt_text(rt_get(&F_field, v1138_callee)); rt_cat(4, (wv[]){ rt_s(&S483), t2165, rt_s(&S12), t2166 }); });
     } else {
-      wv v1146_d = rt_bind(({ wv t2162 = rt_get(&F_pos, v1138_callee); wv t2163 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t2162, t2163); }), 0);
-      wv v1147_sf = rt_bind(rt_get(&F_fnIndex, ({ wv t2164 = v1146_d; wv t2165 = rt_def(up->v833_decls, "decls"); rt_idx(t2164, t2165); })), 0);
-      v1142_f = rt_bind(rt_get(&F_cname, ({ wv t2166 = v1147_sf; wv t2167 = rt_def(up->v834_fns, "fns"); rt_idx(t2166, t2167); })), 1);
-      wv v1148_pf = rt_bind(rt_get(&F_parent, ({ wv t2168 = v1147_sf; wv t2169 = rt_def(up->v834_fns, "fns"); rt_idx(t2168, t2169); })), 0);
-      if (rt_cond(rt_not(rt_get(&F_top, ({ wv t2170 = v1148_pf; wv t2171 = rt_def(up->v834_fns, "fns"); rt_idx(t2170, t2171); }))))) {
+      wv v1146_d = rt_bind(({ wv t2167 = rt_get(&F_pos, v1138_callee); wv t2168 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t2167, t2168); }), 0);
+      wv v1147_sf = rt_bind(rt_get(&F_fnIndex, ({ wv t2169 = v1146_d; wv t2170 = rt_def(up->v833_decls, "decls"); rt_idx(t2169, t2170); })), 0);
+      v1142_f = rt_bind(rt_get(&F_cname, ({ wv t2171 = v1147_sf; wv t2172 = rt_def(up->v834_fns, "fns"); rt_idx(t2171, t2172); })), 1);
+      wv v1148_pf = rt_bind(rt_get(&F_parent, ({ wv t2173 = v1147_sf; wv t2174 = rt_def(up->v834_fns, "fns"); rt_idx(t2173, t2174); })), 0);
+      if (rt_cond(rt_not(rt_get(&F_top, ({ wv t2175 = v1148_pf; wv t2176 = rt_def(up->v834_fns, "fns"); rt_idx(t2175, t2176); }))))) {
         v1143_parent = rt_bind(v1148_pf, 1);
       }
     }
     wv v1144_all = rt_arr(0, NULL, 1);
     if (rt_cond(rt_ne(v1143_parent, RT_NULL))) {
-      (void)({ wv t2180 = v1144_all; wv t2181 = (rt_cond(({ wv t2172 = v1143_parent; wv t2173 = rt_def(up->v842_cur, "cur"); rt_eq(t2172, t2173); })) ? rt_s(&S626) : rt_cat(2, (wv[]){ rt_s(&S580), rt_text(rt_chk(w7_repeat(rt_s(&S581), rt_sub(({ wv t2178 = rt_get(&F_depth, ({ wv t2174 = rt_def(up->v842_cur, "cur"); wv t2175 = rt_def(up->v834_fns, "fns"); rt_idx(t2174, t2175); })); wv t2179 = rt_get(&F_depth, ({ wv t2176 = v1143_parent; wv t2177 = rt_def(up->v834_fns, "fns"); rt_idx(t2176, t2177); })); rt_sub(t2178, t2179); }), rt_i(1))), "callC")) })); std_push(t2180, t2181); });
+      (void)({ wv t2185 = v1144_all; wv t2186 = (rt_cond(({ wv t2177 = v1143_parent; wv t2178 = rt_def(up->v842_cur, "cur"); rt_eq(t2177, t2178); })) ? rt_s(&S631) : rt_cat(2, (wv[]){ rt_s(&S585), rt_text(rt_chk(w7_repeat(rt_s(&S586), rt_sub(({ wv t2183 = rt_get(&F_depth, ({ wv t2179 = rt_def(up->v842_cur, "cur"); wv t2180 = rt_def(up->v834_fns, "fns"); rt_idx(t2179, t2180); })); wv t2184 = rt_get(&F_depth, ({ wv t2181 = v1143_parent; wv t2182 = rt_def(up->v834_fns, "fns"); rt_idx(t2181, t2182); })); rt_sub(t2183, t2184); }), rt_i(1))), "callC")) })); std_push(t2185, t2186); });
     }
     wv v1145_k = rt_i(0);
-    while (rt_cond(({ wv t2182 = v1145_k; wv t2183 = std_length(v1139_args); rt_lt(t2182, t2183); }))) {
-      (void)({ wv t2184 = v1144_all; wv t2185 = rt_idx(v1145_k, v1139_args); std_push(t2184, t2185); });
+    while (rt_cond(({ wv t2187 = v1145_k; wv t2188 = std_length(v1139_args); rt_lt(t2187, t2188); }))) {
+      (void)({ wv t2189 = v1144_all; wv t2190 = rt_idx(v1145_k, v1139_args); std_push(t2189, t2190); });
       v1145_k = rt_add(v1145_k, rt_i(1));
     }
-    v1141_code = ({ wv t2186 = rt_text(v1142_f); wv t2187 = rt_text(std_join(v1144_all, rt_s(&S385))); rt_cat(4, (wv[]){ t2186, rt_s(&S97), t2187, rt_s(&S16) }); });
+    v1141_code = ({ wv t2191 = rt_text(v1142_f); wv t2192 = rt_text(std_join(v1144_all, rt_s(&S390))); rt_cat(4, (wv[]){ t2191, rt_s(&S97), t2192, rt_s(&S16) }); });
   }
-  RT_RET((rt_cond(v1140_checked) ? ({ wv t2192 = rt_text(v1141_code); wv t2193 = rt_text((rt_cond(rt_get(&F_top, ({ wv t2188 = rt_def(up->v842_cur, "cur"); wv t2189 = rt_def(up->v834_fns, "fns"); rt_idx(t2188, t2189); }))) ? rt_s(&S571) : rt_chk(w1_quote(rt_get(&F_name, ({ wv t2190 = rt_def(up->v842_cur, "cur"); wv t2191 = rt_def(up->v834_fns, "fns"); rt_idx(t2190, t2191); }))), "callC"))); rt_cat(5, (wv[]){ rt_s(&S627), t2192, rt_s(&S385), t2193, rt_s(&S16) }); }) : v1141_code));
+  RT_RET((rt_cond(v1140_checked) ? ({ wv t2197 = rt_text(v1141_code); wv t2198 = rt_text((rt_cond(rt_get(&F_top, ({ wv t2193 = rt_def(up->v842_cur, "cur"); wv t2194 = rt_def(up->v834_fns, "fns"); rt_idx(t2193, t2194); }))) ? rt_s(&S576) : rt_chk(w1_quote(rt_get(&F_name, ({ wv t2195 = rt_def(up->v842_cur, "cur"); wv t2196 = rt_def(up->v834_fns, "fns"); rt_idx(t2195, t2196); }))), "callC"))); rt_cat(5, (wv[]){ rt_s(&S632), t2197, rt_s(&S390), t2198, rt_s(&S16) }); }) : v1141_code));
 }
 
 static wv s900_expr(struct fr183 *up, wv v1149_e) {
   rt_enter("expr");
   wv v1150_kind = rt_bind(rt_get(&F_k, v1149_e), 0);
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S138)))) {
-    RT_RET(({ wv t2194 = rt_cat(3, (wv[]){ rt_s(&S593), rt_text(rt_get(&F_v, v1149_e)), rt_s(&S16) }); wv t2195 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2194, t2195 }); }));
+    RT_RET(({ wv t2199 = rt_cat(3, (wv[]){ rt_s(&S598), rt_text(rt_get(&F_v, v1149_e)), rt_s(&S16) }); wv t2200 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2199, t2200 }); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S148)))) {
-    RT_RET(({ wv t2196 = rt_cat(3, (wv[]){ rt_s(&S628), rt_text(rt_get(&F_v, v1149_e)), rt_s(&S16) }); wv t2197 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2196, t2197 }); }));
+    RT_RET(({ wv t2201 = rt_cat(3, (wv[]){ rt_s(&S633), rt_text(rt_get(&F_v, v1149_e)), rt_s(&S16) }); wv t2202 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2201, t2202 }); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S171)))) {
     wv v1151_parts = rt_arr(0, NULL, 1);
     wv v1152_k = rt_i(0);
-    while (rt_cond(({ wv t2198 = v1152_k; wv t2199 = std_length(rt_get(&F_parts, v1149_e)); rt_lt(t2198, t2199); }))) {
-      wv v1154_part = rt_bind(({ wv t2200 = v1152_k; wv t2201 = rt_get(&F_parts, v1149_e); rt_idx(t2200, t2201); }), 0);
+    while (rt_cond(({ wv t2203 = v1152_k; wv t2204 = std_length(rt_get(&F_parts, v1149_e)); rt_lt(t2203, t2204); }))) {
+      wv v1154_part = rt_bind(({ wv t2205 = v1152_k; wv t2206 = rt_get(&F_parts, v1149_e); rt_idx(t2205, t2206); }), 0);
       if (rt_cond(rt_eq(std_typeOf(v1154_part), rt_s(&S185)))) {
         if (rt_cond(rt_ne(v1154_part, rt_s(&S13)))) {
-          (void)({ wv t2204 = v1151_parts; wv t2205 = ({ wv t2202 = rt_cat(3, (wv[]){ rt_s(&S629), rt_text(rt_chk(s861_str(up, v1154_part), "expr")), rt_s(&S16) }); wv t2203 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2202, t2203 }); }); std_push(t2204, t2205); });
+          (void)({ wv t2209 = v1151_parts; wv t2210 = ({ wv t2207 = rt_cat(3, (wv[]){ rt_s(&S634), rt_text(rt_chk(s861_str(up, v1154_part), "expr")), rt_s(&S16) }); wv t2208 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2207, t2208 }); }); std_push(t2209, t2210); });
         }
       } else {
-        (void)({ wv t2208 = v1151_parts; wv t2209 = ({ wv t2206 = rt_cat(3, (wv[]){ rt_s(&S630), rt_text(rt_get(&F_c, rt_chk(s900_expr(up, v1154_part), "expr"))), rt_s(&S16) }); wv t2207 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2206, t2207 }); }); std_push(t2208, t2209); });
+        (void)({ wv t2213 = v1151_parts; wv t2214 = ({ wv t2211 = rt_cat(3, (wv[]){ rt_s(&S635), rt_text(rt_get(&F_c, rt_chk(s900_expr(up, v1154_part), "expr"))), rt_s(&S16) }); wv t2212 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2211, t2212 }); }); std_push(t2213, t2214); });
       }
       v1152_k = rt_add(v1152_k, rt_i(1));
     }
     if (rt_cond(rt_eq(std_length(v1151_parts), rt_i(0)))) {
-      RT_RET(({ wv t2210 = rt_cat(3, (wv[]){ rt_s(&S629), rt_text(rt_chk(s861_str(up, rt_s(&S13)), "expr")), rt_s(&S16) }); wv t2211 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2210, t2211 }); }));
+      RT_RET(({ wv t2215 = rt_cat(3, (wv[]){ rt_s(&S634), rt_text(rt_chk(s861_str(up, rt_s(&S13)), "expr")), rt_s(&S16) }); wv t2216 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2215, t2216 }); }));
     }
-    if (rt_cond(rt_b(rt_bool(rt_eq(std_length(v1151_parts), rt_i(1)), "&&") && rt_bool(({ wv t2212 = rt_get(&F_k, rt_idx(rt_i(0), v1151_parts)); wv t2213 = rt_def(w7_constK, "constK"); rt_eq(t2212, t2213); }), "&&")))) {
+    if (rt_cond(rt_b(rt_bool(rt_eq(std_length(v1151_parts), rt_i(1)), "&&") && rt_bool(({ wv t2217 = rt_get(&F_k, rt_idx(rt_i(0), v1151_parts)); wv t2218 = rt_def(w7_constK, "constK"); rt_eq(t2217, t2218); }), "&&")))) {
       RT_RET(rt_idx(rt_i(0), v1151_parts));
     }
     wv v1153_sq = rt_bind(rt_chk(s870_seq(up, v1151_parts), "expr"), 0);
-    RT_RET(({ wv t2216 = v1153_sq; wv t2217 = ({ wv t2214 = rt_text(std_length(rt_get(&F_cs, v1153_sq))); wv t2215 = rt_text(rt_chk(w7_values(rt_get(&F_cs, v1153_sq)), "expr")); rt_cat(5, (wv[]){ rt_s(&S631), t2214, rt_s(&S385), t2215, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2216, t2217), "expr"); }));
+    RT_RET(({ wv t2221 = v1153_sq; wv t2222 = ({ wv t2219 = rt_text(std_length(rt_get(&F_cs, v1153_sq))); wv t2220 = rt_text(rt_chk(w7_values(rt_get(&F_cs, v1153_sq)), "expr")); rt_cat(5, (wv[]){ rt_s(&S636), t2219, rt_s(&S390), t2220, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2221, t2222), "expr"); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S281)))) {
-    RT_RET(({ wv t2218 = rt_cat(3, (wv[]){ rt_s(&S632), rt_text((rt_cond(rt_get(&F_v, v1149_e)) ? rt_i(1) : rt_i(0))), rt_s(&S16) }); wv t2219 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2218, t2219 }); }));
+    RT_RET(({ wv t2223 = rt_cat(3, (wv[]){ rt_s(&S637), rt_text((rt_cond(rt_get(&F_v, v1149_e)) ? rt_i(1) : rt_i(0))), rt_s(&S16) }); wv t2224 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2223, t2224 }); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S51)))) {
-    RT_RET(rt_rec(0, 2, K55, (wv[]){ rt_s(&S589), rt_def(w7_constK, "constK") }));
+    RT_RET(rt_rec(0, 2, K55, (wv[]){ rt_s(&S594), rt_def(w7_constK, "constK") }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S52)))) {
-    RT_RET(rt_rec(0, 2, K55, (wv[]){ rt_s(&S633), rt_def(w7_constK, "constK") }));
+    RT_RET(rt_rec(0, 2, K55, (wv[]){ rt_s(&S638), rt_def(w7_constK, "constK") }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S53)))) {
-    RT_RET(rt_rec(0, 2, K55, (wv[]){ rt_s(&S634), rt_def(w7_constK, "constK") }));
+    RT_RET(rt_rec(0, 2, K55, (wv[]){ rt_s(&S639), rt_def(w7_constK, "constK") }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S211)))) {
-    RT_RET(rt_chk(s869_read(up, ({ wv t2220 = rt_get(&F_pos, v1149_e); wv t2221 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t2220, t2221); })), "expr"));
+    RT_RET(rt_chk(s869_read(up, ({ wv t2225 = rt_get(&F_pos, v1149_e); wv t2226 = rt_def(up->v839_curSlot, "curSlot"); rt_idx(t2225, t2226); })), "expr"));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S156)))) {
-    RT_RET(({ wv t2222 = rt_cat(3, (wv[]){ rt_s(&S625), rt_text(rt_get(&F_name, v1149_e)), rt_s(&S635) }); wv t2223 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2222, t2223 }); }));
+    RT_RET(({ wv t2227 = rt_cat(3, (wv[]){ rt_s(&S630), rt_text(rt_get(&F_name, v1149_e)), rt_s(&S640) }); wv t2228 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2227, t2228 }); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S186)))) {
     RT_RET(rt_chk(s883_array(up, v1149_e, rt_b(0)), "expr"));
@@ -7996,145 +8507,145 @@ static wv s900_expr(struct fr183 *up, wv v1149_e) {
     RT_RET(rt_chk(s884_record(up, v1149_e, rt_b(0)), "expr"));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S188)))) {
-    wv v1155_sq = rt_bind(rt_chk(s870_seq(up, ({ wv t2224 = rt_chk(s900_expr(up, rt_get(&F_index, v1149_e)), "expr"); wv t2225 = rt_chk(s900_expr(up, rt_get(&F_arr, v1149_e)), "expr"); rt_arr(2, (wv[]){ t2224, t2225 }, 0); })), "expr"), 0);
-    RT_RET(({ wv t2228 = v1155_sq; wv t2229 = ({ wv t2226 = rt_text(rt_idx(rt_i(0), rt_get(&F_cs, v1155_sq))); wv t2227 = rt_text(rt_idx(rt_i(1), rt_get(&F_cs, v1155_sq))); rt_cat(5, (wv[]){ rt_s(&S636), t2226, rt_s(&S385), t2227, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2228, t2229), "expr"); }));
+    wv v1155_sq = rt_bind(rt_chk(s870_seq(up, ({ wv t2229 = rt_chk(s900_expr(up, rt_get(&F_index, v1149_e)), "expr"); wv t2230 = rt_chk(s900_expr(up, rt_get(&F_arr, v1149_e)), "expr"); rt_arr(2, (wv[]){ t2229, t2230 }, 0); })), "expr"), 0);
+    RT_RET(({ wv t2233 = v1155_sq; wv t2234 = ({ wv t2231 = rt_text(rt_idx(rt_i(0), rt_get(&F_cs, v1155_sq))); wv t2232 = rt_text(rt_idx(rt_i(1), rt_get(&F_cs, v1155_sq))); rt_cat(5, (wv[]){ rt_s(&S641), t2231, rt_s(&S390), t2232, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2233, t2234), "expr"); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S189)))) {
     wv v1156_lin = rt_bind(rt_chk(s866_enumOf(up, rt_get(&F_rec, v1149_e)), "expr"), 0);
     if (rt_cond(rt_ne(v1156_lin, RT_NULL))) {
       wv v1160_ms = rt_bind(rt_get(&F_members, rt_get(&F_node, v1156_lin)), 0);
       wv v1161_k = rt_i(0);
-      while (rt_cond(({ wv t2230 = rt_get(&F_name, rt_idx(v1161_k, v1160_ms)); wv t2231 = rt_get(&F_field, v1149_e); rt_ne(t2230, t2231); }))) {
+      while (rt_cond(({ wv t2235 = rt_get(&F_name, rt_idx(v1161_k, v1160_ms)); wv t2236 = rt_get(&F_field, v1149_e); rt_ne(t2235, t2236); }))) {
         v1161_k = rt_add(v1161_k, rt_i(1));
       }
-      RT_RET(({ wv t2234 = ({ wv t2232 = rt_text(rt_get(&F_c, v1156_lin)); wv t2233 = rt_text(v1161_k); rt_cat(5, (wv[]){ rt_s(&S637), t2232, rt_s(&S98), t2233, rt_s(&S508) }); }); wv t2235 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2234, t2235 }); }));
+      RT_RET(({ wv t2239 = ({ wv t2237 = rt_text(rt_get(&F_c, v1156_lin)); wv t2238 = rt_text(v1161_k); rt_cat(5, (wv[]){ rt_s(&S642), t2237, rt_s(&S98), t2238, rt_s(&S513) }); }); wv t2240 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2239, t2240 }); }));
     }
     wv v1157_lib = rt_bind(rt_chk(s864_stolenFrom(up, rt_get(&F_rec, v1149_e)), "expr"), 0);
     if (rt_cond(rt_ne(v1157_lib, RT_NULL))) {
-      RT_RET(({ wv t2238 = ({ wv t2236 = rt_text(rt_chk(s843_modId(up, v1157_lib), "expr")); wv t2237 = rt_text(rt_get(&F_field, v1149_e)); rt_cat(4, (wv[]){ rt_s(&S478), t2236, rt_s(&S12), t2237 }); }); wv t2239 = rt_def(w7_pureK, "pureK"); rt_rec(0, 2, K55, (wv[]){ t2238, t2239 }); }));
+      RT_RET(({ wv t2243 = ({ wv t2241 = rt_text(rt_chk(s843_modId(up, v1157_lib), "expr")); wv t2242 = rt_text(rt_get(&F_field, v1149_e)); rt_cat(4, (wv[]){ rt_s(&S483), t2241, rt_s(&S12), t2242 }); }); wv t2244 = rt_def(w7_pureK, "pureK"); rt_rec(0, 2, K55, (wv[]){ t2243, t2244 }); }));
     }
-    wv v1158_key = ({ wv t2240 = rt_chk(s862_fieldRef(up, rt_get(&F_field, v1149_e)), "expr"); wv t2241 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2240, t2241 }); });
-    wv v1159_sq = rt_bind(rt_chk(s870_seq(up, ({ wv t2242 = v1158_key; wv t2243 = rt_chk(s900_expr(up, rt_get(&F_rec, v1149_e)), "expr"); rt_arr(2, (wv[]){ t2242, t2243 }, 0); })), "expr"), 0);
-    RT_RET(({ wv t2246 = v1159_sq; wv t2247 = ({ wv t2244 = rt_text(rt_idx(rt_i(0), rt_get(&F_cs, v1159_sq))); wv t2245 = rt_text(rt_idx(rt_i(1), rt_get(&F_cs, v1159_sq))); rt_cat(5, (wv[]){ rt_s(&S638), t2244, rt_s(&S385), t2245, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2246, t2247), "expr"); }));
+    wv v1158_key = ({ wv t2245 = rt_chk(s862_fieldRef(up, rt_get(&F_field, v1149_e)), "expr"); wv t2246 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2245, t2246 }); });
+    wv v1159_sq = rt_bind(rt_chk(s870_seq(up, ({ wv t2247 = v1158_key; wv t2248 = rt_chk(s900_expr(up, rt_get(&F_rec, v1149_e)), "expr"); rt_arr(2, (wv[]){ t2247, t2248 }, 0); })), "expr"), 0);
+    RT_RET(({ wv t2251 = v1159_sq; wv t2252 = ({ wv t2249 = rt_text(rt_idx(rt_i(0), rt_get(&F_cs, v1159_sq))); wv t2250 = rt_text(rt_idx(rt_i(1), rt_get(&F_cs, v1159_sq))); rt_cat(5, (wv[]){ rt_s(&S643), t2249, rt_s(&S390), t2250, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2251, t2252), "expr"); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S190)))) {
-    RT_RET(({ wv t2250 = ({ wv t2248 = rt_text(rt_chk(w7_unFn(rt_get(&F_op, v1149_e)), "expr")); wv t2249 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_e, v1149_e)), "expr"))); rt_cat(5, (wv[]){ rt_s(&S608), t2248, rt_s(&S97), t2249, rt_s(&S16) }); }); wv t2251 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2250, t2251 }); }));
+    RT_RET(({ wv t2255 = ({ wv t2253 = rt_text(rt_chk(w7_unFn(rt_get(&F_op, v1149_e)), "expr")); wv t2254 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_e, v1149_e)), "expr"))); rt_cat(5, (wv[]){ rt_s(&S613), t2253, rt_s(&S97), t2254, rt_s(&S16) }); }); wv t2256 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2255, t2256 }); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S191)))) {
     if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_op, v1149_e), rt_s(&S80)), "||") || rt_bool(rt_eq(rt_get(&F_op, v1149_e), rt_s(&S81)), "||")))) {
-      RT_RET(({ wv t2257 = ({ wv t2252 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_l, v1149_e)), "expr"))); wv t2253 = rt_text(rt_get(&F_op, v1149_e)); wv t2254 = rt_text(rt_get(&F_op, v1149_e)); wv t2255 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_r, v1149_e)), "expr"))); wv t2256 = rt_text(rt_get(&F_op, v1149_e)); rt_cat(11, (wv[]){ rt_s(&S639), t2252, rt_s(&S556), t2253, rt_s(&S557), t2254, rt_s(&S640), t2255, rt_s(&S556), t2256, rt_s(&S559) }); }); wv t2258 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2257, t2258 }); }));
+      RT_RET(({ wv t2262 = ({ wv t2257 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_l, v1149_e)), "expr"))); wv t2258 = rt_text(rt_get(&F_op, v1149_e)); wv t2259 = rt_text(rt_get(&F_op, v1149_e)); wv t2260 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_r, v1149_e)), "expr"))); wv t2261 = rt_text(rt_get(&F_op, v1149_e)); rt_cat(11, (wv[]){ rt_s(&S644), t2257, rt_s(&S561), t2258, rt_s(&S562), t2259, rt_s(&S645), t2260, rt_s(&S561), t2261, rt_s(&S564) }); }); wv t2263 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2262, t2263 }); }));
     }
-    wv v1162_sq = rt_bind(rt_chk(s870_seq(up, ({ wv t2259 = rt_chk(s900_expr(up, rt_get(&F_l, v1149_e)), "expr"); wv t2260 = rt_chk(s900_expr(up, rt_get(&F_r, v1149_e)), "expr"); rt_arr(2, (wv[]){ t2259, t2260 }, 0); })), "expr"), 0);
-    RT_RET(({ wv t2264 = v1162_sq; wv t2265 = ({ wv t2261 = rt_text(rt_chk(w7_binFn(rt_get(&F_op, v1149_e)), "expr")); wv t2262 = rt_text(rt_idx(rt_i(0), rt_get(&F_cs, v1162_sq))); wv t2263 = rt_text(rt_idx(rt_i(1), rt_get(&F_cs, v1162_sq))); rt_cat(7, (wv[]){ rt_s(&S608), t2261, rt_s(&S97), t2262, rt_s(&S385), t2263, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2264, t2265), "expr"); }));
+    wv v1162_sq = rt_bind(rt_chk(s870_seq(up, ({ wv t2264 = rt_chk(s900_expr(up, rt_get(&F_l, v1149_e)), "expr"); wv t2265 = rt_chk(s900_expr(up, rt_get(&F_r, v1149_e)), "expr"); rt_arr(2, (wv[]){ t2264, t2265 }, 0); })), "expr"), 0);
+    RT_RET(({ wv t2269 = v1162_sq; wv t2270 = ({ wv t2266 = rt_text(rt_chk(w7_binFn(rt_get(&F_op, v1149_e)), "expr")); wv t2267 = rt_text(rt_idx(rt_i(0), rt_get(&F_cs, v1162_sq))); wv t2268 = rt_text(rt_idx(rt_i(1), rt_get(&F_cs, v1162_sq))); rt_cat(7, (wv[]){ rt_s(&S613), t2266, rt_s(&S97), t2267, rt_s(&S390), t2268, rt_s(&S16) }); }); rt_chk(s871_wrap(up, t2269, t2270), "expr"); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S192)))) {
-    RT_RET(({ wv t2269 = ({ wv t2266 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_c, v1149_e)), "expr"))); wv t2267 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_a, v1149_e)), "expr"))); wv t2268 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_b, v1149_e)), "expr"))); rt_cat(7, (wv[]){ rt_s(&S641), t2266, rt_s(&S561), t2267, rt_s(&S533), t2268, rt_s(&S16) }); }); wv t2270 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2269, t2270 }); }));
+    RT_RET(({ wv t2274 = ({ wv t2271 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_c, v1149_e)), "expr"))); wv t2272 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_a, v1149_e)), "expr"))); wv t2273 = rt_text(rt_get(&F_c, rt_chk(s900_expr(up, rt_get(&F_b, v1149_e)), "expr"))); rt_cat(7, (wv[]){ rt_s(&S646), t2271, rt_s(&S566), t2272, rt_s(&S538), t2273, rt_s(&S16) }); }); wv t2275 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2274, t2275 }); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S182)))) {
     wv v1163_sq = rt_bind(rt_chk(s870_seq(up, rt_chk(s882_exprs(up, rt_get(&F_args, v1149_e)), "expr")), "expr"), 0);
-    RT_RET(({ wv t2273 = v1163_sq; wv t2274 = ({ wv t2271 = rt_get(&F_callee, v1149_e); wv t2272 = rt_get(&F_cs, v1163_sq); rt_chk(s899_callC(up, t2271, t2272, rt_b(1)), "expr"); }); rt_chk(s871_wrap(up, t2273, t2274), "expr"); }));
+    RT_RET(({ wv t2278 = v1163_sq; wv t2279 = ({ wv t2276 = rt_get(&F_callee, v1149_e); wv t2277 = rt_get(&F_cs, v1163_sq); rt_chk(s899_callC(up, t2276, t2277, rt_b(1)), "expr"); }); rt_chk(s871_wrap(up, t2278, t2279), "expr"); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S184)))) {
-    RT_RET(({ wv t2275 = rt_chk(s894_chainExpr(up, v1149_e), "expr"); wv t2276 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2275, t2276 }); }));
+    RT_RET(({ wv t2280 = rt_chk(s894_chainExpr(up, v1149_e), "expr"); wv t2281 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2280, t2281 }); }));
   }
   if (rt_cond(rt_eq(v1150_kind, rt_s(&S44)))) {
-    RT_RET(({ wv t2277 = rt_chk(s898_matchExpr(up, v1149_e), "expr"); wv t2278 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2277, t2278 }); }));
+    RT_RET(({ wv t2282 = rt_chk(s898_matchExpr(up, v1149_e), "expr"); wv t2283 = rt_def(w7_effectK, "effectK"); rt_rec(0, 2, K55, (wv[]){ t2282, t2283 }); }));
   }
-  if (rt_cond(rt_eq(v1150_kind, rt_s(&S528)))) {
-    RT_RET(({ wv t2279 = rt_get(&F_js, v1149_e); wv t2280 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2279, t2280 }); }));
+  if (rt_cond(rt_eq(v1150_kind, rt_s(&S533)))) {
+    RT_RET(({ wv t2284 = rt_get(&F_js, v1149_e); wv t2285 = rt_def(w7_constK, "constK"); rt_rec(0, 2, K55, (wv[]){ t2284, t2285 }); }));
   }
-  rt_panic(rt_cat(2, (wv[]){ rt_s(&S562), rt_text(v1150_kind) }));
+  rt_panic(rt_cat(2, (wv[]){ rt_s(&S567), rt_text(v1150_kind) }));
   RT_RET(RT_NULL);
 }
 
 static wv s901_assemble(struct fr183 *up) {
   rt_enter("assemble");
-  wv v1164_all = rt_arr(3, (wv[]){ std_join(std_split(up->v819_runtime, rt_s(&S642)), rt_s(&S2)), rt_s(&S643), rt_s(&S13) }, 1);
+  wv v1164_all = rt_arr(3, (wv[]){ std_join(std_split(up->v819_runtime, rt_s(&S647)), rt_s(&S2)), rt_s(&S648), rt_s(&S13) }, 1);
   wv v1165_k = rt_i(0);
-  while (rt_cond(({ wv t2281 = v1165_k; wv t2282 = std_length(rt_def(up->v822_strings, "strings")); rt_lt(t2281, t2282); }))) {
-    (void)({ wv t2287 = v1164_all; wv t2288 = ({ wv t2285 = rt_text(v1165_k); wv t2286 = rt_text(rt_chk(w7_wstrInit(({ wv t2283 = v1165_k; wv t2284 = rt_def(up->v822_strings, "strings"); rt_idx(t2283, t2284); })), "assemble")); rt_cat(5, (wv[]){ rt_s(&S644), t2285, rt_s(&S495), t2286, rt_s(&S14) }); }); std_push(t2287, t2288); });
+  while (rt_cond(({ wv t2286 = v1165_k; wv t2287 = std_length(rt_def(up->v822_strings, "strings")); rt_lt(t2286, t2287); }))) {
+    (void)({ wv t2292 = v1164_all; wv t2293 = ({ wv t2290 = rt_text(v1165_k); wv t2291 = rt_text(rt_chk(w7_wstrInit(({ wv t2288 = v1165_k; wv t2289 = rt_def(up->v822_strings, "strings"); rt_idx(t2288, t2289); })), "assemble")); rt_cat(5, (wv[]){ rt_s(&S649), t2290, rt_s(&S500), t2291, rt_s(&S14) }); }); std_push(t2292, t2293); });
     v1165_k = rt_add(v1165_k, rt_i(1));
   }
   v1165_k = rt_i(0);
-  while (rt_cond(({ wv t2289 = v1165_k; wv t2290 = std_length(rt_def(up->v823_fields, "fields")); rt_lt(t2289, t2290); }))) {
-    (void)({ wv t2297 = v1164_all; wv t2298 = ({ wv t2295 = rt_text(({ wv t2291 = v1165_k; wv t2292 = rt_def(up->v823_fields, "fields"); rt_idx(t2291, t2292); })); wv t2296 = rt_text(rt_chk(w7_wstrInit(({ wv t2293 = v1165_k; wv t2294 = rt_def(up->v823_fields, "fields"); rt_idx(t2293, t2294); })), "assemble")); rt_cat(5, (wv[]){ rt_s(&S645), t2295, rt_s(&S495), t2296, rt_s(&S14) }); }); std_push(t2297, t2298); });
+  while (rt_cond(({ wv t2294 = v1165_k; wv t2295 = std_length(rt_def(up->v823_fields, "fields")); rt_lt(t2294, t2295); }))) {
+    (void)({ wv t2302 = v1164_all; wv t2303 = ({ wv t2300 = rt_text(({ wv t2296 = v1165_k; wv t2297 = rt_def(up->v823_fields, "fields"); rt_idx(t2296, t2297); })); wv t2301 = rt_text(rt_chk(w7_wstrInit(({ wv t2298 = v1165_k; wv t2299 = rt_def(up->v823_fields, "fields"); rt_idx(t2298, t2299); })), "assemble")); rt_cat(5, (wv[]){ rt_s(&S650), t2300, rt_s(&S500), t2301, rt_s(&S14) }); }); std_push(t2302, t2303); });
     v1165_k = rt_add(v1165_k, rt_i(1));
   }
   v1165_k = rt_i(0);
-  while (rt_cond(({ wv t2299 = v1165_k; wv t2300 = std_length(rt_def(up->v824_shapes, "shapes")); rt_lt(t2299, t2300); }))) {
-    wv v1166_names = rt_bind(std_split(({ wv t2301 = v1165_k; wv t2302 = rt_def(up->v824_shapes, "shapes"); rt_idx(t2301, t2302); }), rt_s(&S96)), 0);
+  while (rt_cond(({ wv t2304 = v1165_k; wv t2305 = std_length(rt_def(up->v824_shapes, "shapes")); rt_lt(t2304, t2305); }))) {
+    wv v1166_names = rt_bind(std_split(({ wv t2306 = v1165_k; wv t2307 = rt_def(up->v824_shapes, "shapes"); rt_idx(t2306, t2307); }), rt_s(&S96)), 0);
     wv v1167_refs = rt_arr(0, NULL, 1);
     wv v1168_j = rt_i(0);
-    while (rt_cond(({ wv t2303 = v1168_j; wv t2304 = std_length(v1166_names); rt_lt(t2303, t2304); }))) {
-      (void)({ wv t2305 = v1167_refs; wv t2306 = rt_cat(2, (wv[]){ rt_s(&S575), rt_text(rt_idx(v1168_j, v1166_names)) }); std_push(t2305, t2306); });
+    while (rt_cond(({ wv t2308 = v1168_j; wv t2309 = std_length(v1166_names); rt_lt(t2308, t2309); }))) {
+      (void)({ wv t2310 = v1167_refs; wv t2311 = rt_cat(2, (wv[]){ rt_s(&S580), rt_text(rt_idx(v1168_j, v1166_names)) }); std_push(t2310, t2311); });
       v1168_j = rt_add(v1168_j, rt_i(1));
     }
-    (void)({ wv t2309 = v1164_all; wv t2310 = ({ wv t2307 = rt_text(v1165_k); wv t2308 = rt_text(std_join(v1167_refs, rt_s(&S385))); rt_cat(5, (wv[]){ rt_s(&S646), t2307, rt_s(&S577), t2308, rt_s(&S578) }); }); std_push(t2309, t2310); });
+    (void)({ wv t2314 = v1164_all; wv t2315 = ({ wv t2312 = rt_text(v1165_k); wv t2313 = rt_text(std_join(v1167_refs, rt_s(&S390))); rt_cat(5, (wv[]){ rt_s(&S651), t2312, rt_s(&S582), t2313, rt_s(&S583) }); }); std_push(t2314, t2315); });
     v1165_k = rt_add(v1165_k, rt_i(1));
   }
   v1165_k = rt_i(0);
-  while (rt_cond(({ wv t2311 = v1165_k; wv t2312 = std_length(rt_def(up->v825_enumDefs, "enumDefs")); rt_lt(t2311, t2312); }))) {
-    (void)({ wv t2315 = v1164_all; wv t2316 = ({ wv t2313 = v1165_k; wv t2314 = rt_def(up->v825_enumDefs, "enumDefs"); rt_idx(t2313, t2314); }); std_push(t2315, t2316); });
+  while (rt_cond(({ wv t2316 = v1165_k; wv t2317 = std_length(rt_def(up->v825_enumDefs, "enumDefs")); rt_lt(t2316, t2317); }))) {
+    (void)({ wv t2320 = v1164_all; wv t2321 = ({ wv t2318 = v1165_k; wv t2319 = rt_def(up->v825_enumDefs, "enumDefs"); rt_idx(t2318, t2319); }); std_push(t2320, t2321); });
     v1165_k = rt_add(v1165_k, rt_i(1));
   }
   v1165_k = rt_i(0);
-  while (rt_cond(({ wv t2317 = v1165_k; wv t2318 = std_length(rt_def(up->v827_frames, "frames")); rt_lt(t2317, t2318); }))) {
-    wv v1169_f = rt_bind(({ wv t2319 = v1165_k; wv t2320 = rt_def(up->v827_frames, "frames"); rt_idx(t2319, t2320); }), 0);
+  while (rt_cond(({ wv t2322 = v1165_k; wv t2323 = std_length(rt_def(up->v827_frames, "frames")); rt_lt(t2322, t2323); }))) {
+    wv v1169_f = rt_bind(({ wv t2324 = v1165_k; wv t2325 = rt_def(up->v827_frames, "frames"); rt_idx(t2324, t2325); }), 0);
     wv v1170_members = rt_arr(0, NULL, 1);
-    wv v1171_pf = rt_bind(rt_get(&F_parent, ({ wv t2321 = v1169_f; wv t2322 = rt_def(up->v834_fns, "fns"); rt_idx(t2321, t2322); })), 0);
-    if (rt_cond(rt_not(rt_get(&F_top, ({ wv t2323 = v1171_pf; wv t2324 = rt_def(up->v834_fns, "fns"); rt_idx(t2323, t2324); }))))) {
-      (void)({ wv t2325 = v1170_members; wv t2326 = rt_cat(3, (wv[]){ rt_s(&S598), rt_text(v1171_pf), rt_s(&S647) }); std_push(t2325, t2326); });
+    wv v1171_pf = rt_bind(rt_get(&F_parent, ({ wv t2326 = v1169_f; wv t2327 = rt_def(up->v834_fns, "fns"); rt_idx(t2326, t2327); })), 0);
+    if (rt_cond(rt_not(rt_get(&F_top, ({ wv t2328 = v1171_pf; wv t2329 = rt_def(up->v834_fns, "fns"); rt_idx(t2328, t2329); }))))) {
+      (void)({ wv t2330 = v1170_members; wv t2331 = rt_cat(3, (wv[]){ rt_s(&S603), rt_text(v1171_pf), rt_s(&S652) }); std_push(t2330, t2331); });
     }
     wv v1172_j = rt_i(0);
-    while (rt_cond(({ wv t2327 = v1172_j; wv t2328 = std_length(rt_def(up->v833_decls, "decls")); rt_lt(t2327, t2328); }))) {
-      if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(({ wv t2331 = rt_get(&F_func, ({ wv t2329 = v1172_j; wv t2330 = rt_def(up->v833_decls, "decls"); rt_idx(t2329, t2330); })); wv t2332 = v1169_f; rt_eq(t2331, t2332); }), "&&") && rt_bool(rt_get(&F_captured, ({ wv t2333 = v1172_j; wv t2334 = rt_def(up->v833_decls, "decls"); rt_idx(t2333, t2334); })), "&&")), "&&") && rt_bool(rt_ne(rt_get(&F_kind, ({ wv t2335 = v1172_j; wv t2336 = rt_def(up->v833_decls, "decls"); rt_idx(t2335, t2336); })), rt_s(&S33)), "&&")))) {
-        (void)({ wv t2339 = v1170_members; wv t2340 = rt_cat(3, (wv[]){ rt_s(&S584), rt_text(rt_get(&F_cname, ({ wv t2337 = v1172_j; wv t2338 = rt_def(up->v833_decls, "decls"); rt_idx(t2337, t2338); }))), rt_s(&S14) }); std_push(t2339, t2340); });
+    while (rt_cond(({ wv t2332 = v1172_j; wv t2333 = std_length(rt_def(up->v833_decls, "decls")); rt_lt(t2332, t2333); }))) {
+      if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(({ wv t2336 = rt_get(&F_func, ({ wv t2334 = v1172_j; wv t2335 = rt_def(up->v833_decls, "decls"); rt_idx(t2334, t2335); })); wv t2337 = v1169_f; rt_eq(t2336, t2337); }), "&&") && rt_bool(rt_get(&F_captured, ({ wv t2338 = v1172_j; wv t2339 = rt_def(up->v833_decls, "decls"); rt_idx(t2338, t2339); })), "&&")), "&&") && rt_bool(rt_ne(rt_get(&F_kind, ({ wv t2340 = v1172_j; wv t2341 = rt_def(up->v833_decls, "decls"); rt_idx(t2340, t2341); })), rt_s(&S33)), "&&")))) {
+        (void)({ wv t2344 = v1170_members; wv t2345 = rt_cat(3, (wv[]){ rt_s(&S589), rt_text(rt_get(&F_cname, ({ wv t2342 = v1172_j; wv t2343 = rt_def(up->v833_decls, "decls"); rt_idx(t2342, t2343); }))), rt_s(&S14) }); std_push(t2344, t2345); });
       }
       v1172_j = rt_add(v1172_j, rt_i(1));
     }
     if (rt_cond(rt_eq(std_length(v1170_members), rt_i(0)))) {
-      (void)std_push(v1170_members, rt_s(&S648));
+      (void)std_push(v1170_members, rt_s(&S653));
     }
-    (void)({ wv t2343 = v1164_all; wv t2344 = ({ wv t2341 = rt_text(v1169_f); wv t2342 = rt_text(std_join(v1170_members, rt_s(&S0))); rt_cat(5, (wv[]){ rt_s(&S598), t2341, rt_s(&S649), t2342, rt_s(&S578) }); }); std_push(t2343, t2344); });
+    (void)({ wv t2348 = v1164_all; wv t2349 = ({ wv t2346 = rt_text(v1169_f); wv t2347 = rt_text(std_join(v1170_members, rt_s(&S0))); rt_cat(5, (wv[]){ rt_s(&S603), t2346, rt_s(&S654), t2347, rt_s(&S583) }); }); std_push(t2348, t2349); });
     v1165_k = rt_add(v1165_k, rt_i(1));
   }
   v1165_k = rt_i(0);
-  while (rt_cond(({ wv t2345 = v1165_k; wv t2346 = std_length(rt_def(up->v826_globals, "globals")); rt_lt(t2345, t2346); }))) {
-    (void)({ wv t2349 = v1164_all; wv t2350 = rt_cat(3, (wv[]){ rt_s(&S601), rt_text(({ wv t2347 = v1165_k; wv t2348 = rt_def(up->v826_globals, "globals"); rt_idx(t2347, t2348); })), rt_s(&S14) }); std_push(t2349, t2350); });
+  while (rt_cond(({ wv t2350 = v1165_k; wv t2351 = std_length(rt_def(up->v826_globals, "globals")); rt_lt(t2350, t2351); }))) {
+    (void)({ wv t2354 = v1164_all; wv t2355 = rt_cat(3, (wv[]){ rt_s(&S606), rt_text(({ wv t2352 = v1165_k; wv t2353 = rt_def(up->v826_globals, "globals"); rt_idx(t2352, t2353); })), rt_s(&S14) }); std_push(t2354, t2355); });
     v1165_k = rt_add(v1165_k, rt_i(1));
   }
   v1165_k = rt_i(0);
-  while (rt_cond(({ wv t2351 = v1165_k; wv t2352 = std_length(rt_def(up->v828_functions, "functions")); rt_lt(t2351, t2352); }))) {
-    (void)({ wv t2355 = v1164_all; wv t2356 = rt_cat(2, (wv[]){ rt_text(rt_get(&F_proto, ({ wv t2353 = v1165_k; wv t2354 = rt_def(up->v828_functions, "functions"); rt_idx(t2353, t2354); }))), rt_s(&S14) }); std_push(t2355, t2356); });
+  while (rt_cond(({ wv t2356 = v1165_k; wv t2357 = std_length(rt_def(up->v828_functions, "functions")); rt_lt(t2356, t2357); }))) {
+    (void)({ wv t2360 = v1164_all; wv t2361 = rt_cat(2, (wv[]){ rt_text(rt_get(&F_proto, ({ wv t2358 = v1165_k; wv t2359 = rt_def(up->v828_functions, "functions"); rt_idx(t2358, t2359); }))), rt_s(&S14) }); std_push(t2360, t2361); });
     v1165_k = rt_add(v1165_k, rt_i(1));
   }
   v1165_k = rt_i(0);
-  while (rt_cond(({ wv t2357 = v1165_k; wv t2358 = std_length(rt_def(up->v828_functions, "functions")); rt_lt(t2357, t2358); }))) {
+  while (rt_cond(({ wv t2362 = v1165_k; wv t2363 = std_length(rt_def(up->v828_functions, "functions")); rt_lt(t2362, t2363); }))) {
     (void)std_push(v1164_all, rt_s(&S13));
-    (void)({ wv t2361 = v1164_all; wv t2362 = rt_cat(2, (wv[]){ rt_text(rt_get(&F_proto, ({ wv t2359 = v1165_k; wv t2360 = rt_def(up->v828_functions, "functions"); rt_idx(t2359, t2360); }))), rt_s(&S650) }); std_push(t2361, t2362); });
-    wv v1173_lines = rt_bind(rt_get(&F_lines, ({ wv t2363 = v1165_k; wv t2364 = rt_def(up->v828_functions, "functions"); rt_idx(t2363, t2364); })), 0);
+    (void)({ wv t2366 = v1164_all; wv t2367 = rt_cat(2, (wv[]){ rt_text(rt_get(&F_proto, ({ wv t2364 = v1165_k; wv t2365 = rt_def(up->v828_functions, "functions"); rt_idx(t2364, t2365); }))), rt_s(&S655) }); std_push(t2366, t2367); });
+    wv v1173_lines = rt_bind(rt_get(&F_lines, ({ wv t2368 = v1165_k; wv t2369 = rt_def(up->v828_functions, "functions"); rt_idx(t2368, t2369); })), 0);
     wv v1174_j = rt_i(0);
-    while (rt_cond(({ wv t2365 = v1174_j; wv t2366 = std_length(v1173_lines); rt_lt(t2365, t2366); }))) {
-      (void)({ wv t2367 = v1164_all; wv t2368 = rt_idx(v1174_j, v1173_lines); std_push(t2367, t2368); });
+    while (rt_cond(({ wv t2370 = v1174_j; wv t2371 = std_length(v1173_lines); rt_lt(t2370, t2371); }))) {
+      (void)({ wv t2372 = v1164_all; wv t2373 = rt_idx(v1174_j, v1173_lines); std_push(t2372, t2373); });
       v1174_j = rt_add(v1174_j, rt_i(1));
     }
     (void)std_push(v1164_all, rt_s(&S15));
     v1165_k = rt_add(v1165_k, rt_i(1));
   }
   (void)std_push(v1164_all, rt_s(&S13));
-  (void)std_push(v1164_all, rt_s(&S651));
+  (void)std_push(v1164_all, rt_s(&S656));
   if (rt_cond(rt_gt(std_length(rt_def(up->v823_fields, "fields")), rt_i(0)))) {
     wv v1175_refs = rt_arr(0, NULL, 1);
     v1165_k = rt_i(0);
-    while (rt_cond(({ wv t2369 = v1165_k; wv t2370 = std_length(rt_def(up->v823_fields, "fields")); rt_lt(t2369, t2370); }))) {
-      (void)({ wv t2373 = v1175_refs; wv t2374 = rt_cat(2, (wv[]){ rt_s(&S575), rt_text(({ wv t2371 = v1165_k; wv t2372 = rt_def(up->v823_fields, "fields"); rt_idx(t2371, t2372); })) }); std_push(t2373, t2374); });
+    while (rt_cond(({ wv t2374 = v1165_k; wv t2375 = std_length(rt_def(up->v823_fields, "fields")); rt_lt(t2374, t2375); }))) {
+      (void)({ wv t2378 = v1175_refs; wv t2379 = rt_cat(2, (wv[]){ rt_s(&S580), rt_text(({ wv t2376 = v1165_k; wv t2377 = rt_def(up->v823_fields, "fields"); rt_idx(t2376, t2377); })) }); std_push(t2378, t2379); });
       v1165_k = rt_add(v1165_k, rt_i(1));
     }
-    (void)({ wv t2377 = v1164_all; wv t2378 = ({ wv t2375 = rt_text(std_length(rt_def(up->v823_fields, "fields"))); wv t2376 = rt_text(std_join(v1175_refs, rt_s(&S385))); rt_cat(5, (wv[]){ rt_s(&S652), t2375, rt_s(&S653), t2376, rt_s(&S654) }); }); std_push(t2377, t2378); });
+    (void)({ wv t2382 = v1164_all; wv t2383 = ({ wv t2380 = rt_text(std_length(rt_def(up->v823_fields, "fields"))); wv t2381 = rt_text(std_join(v1175_refs, rt_s(&S390))); rt_cat(5, (wv[]){ rt_s(&S657), t2380, rt_s(&S658), t2381, rt_s(&S659) }); }); std_push(t2382, t2383); });
   }
   v1165_k = rt_i(0);
-  while (rt_cond(({ wv t2379 = v1165_k; wv t2380 = std_length(rt_def(up->v829_out, "out")); rt_lt(t2379, t2380); }))) {
-    (void)({ wv t2383 = v1164_all; wv t2384 = ({ wv t2381 = v1165_k; wv t2382 = rt_def(up->v829_out, "out"); rt_idx(t2381, t2382); }); std_push(t2383, t2384); });
+  while (rt_cond(({ wv t2384 = v1165_k; wv t2385 = std_length(rt_def(up->v829_out, "out")); rt_lt(t2384, t2385); }))) {
+    (void)({ wv t2388 = v1164_all; wv t2389 = ({ wv t2386 = v1165_k; wv t2387 = rt_def(up->v829_out, "out"); rt_idx(t2386, t2387); }); std_push(t2388, t2389); });
     v1165_k = rt_add(v1165_k, rt_i(1));
   }
   (void)std_push(v1164_all, rt_s(&S15));
@@ -8147,25 +8658,25 @@ static wv w8_dumpTokens(wv v1178_toks, wv v1179_indent) {
   v1178_toks = rt_bind(v1178_toks, 0);
   v1179_indent = rt_bind(v1179_indent, 0);
   wv v1180_k = rt_i(0);
-  while (rt_cond(({ wv t2395 = v1180_k; wv t2396 = std_length(v1178_toks); rt_lt(t2395, t2396); }))) {
+  while (rt_cond(({ wv t2400 = v1180_k; wv t2401 = std_length(v1178_toks); rt_lt(t2400, t2401); }))) {
     wv v1181_tk = rt_bind(rt_idx(v1180_k, v1178_toks), 0);
-    wv v1182_line = ({ wv t2397 = rt_text(v1179_indent); wv t2398 = rt_text(rt_get(&F_t, v1181_tk)); wv t2399 = rt_text(rt_get(&F_pos, v1181_tk)); wv t2400 = rt_text(rt_get(&F_end, v1181_tk)); wv t2401 = rt_text(rt_get(&F_sp, v1181_tk)); rt_cat(8, (wv[]){ t2397, t2398, rt_s(&S0), t2399, rt_s(&S0), t2400, rt_s(&S0), t2401 }); });
+    wv v1182_line = ({ wv t2402 = rt_text(v1179_indent); wv t2403 = rt_text(rt_get(&F_t, v1181_tk)); wv t2404 = rt_text(rt_get(&F_pos, v1181_tk)); wv t2405 = rt_text(rt_get(&F_end, v1181_tk)); wv t2406 = rt_text(rt_get(&F_sp, v1181_tk)); rt_cat(8, (wv[]){ t2402, t2403, rt_s(&S0), t2404, rt_s(&S0), t2405, rt_s(&S0), t2406 }); });
     if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_eq(rt_get(&F_t, v1181_tk), rt_s(&S137)), "||") || rt_bool(rt_eq(rt_get(&F_t, v1181_tk), rt_s(&S156)), "||")), "||") || rt_bool(rt_eq(rt_get(&F_t, v1181_tk), rt_s(&S111)), "||")))) {
-      v1182_line = ({ wv t2402 = v1182_line; wv t2403 = rt_cat(2, (wv[]){ rt_s(&S0), rt_text(rt_get(&F_v, v1181_tk)) }); rt_add(t2402, t2403); });
+      v1182_line = ({ wv t2407 = v1182_line; wv t2408 = rt_cat(2, (wv[]){ rt_s(&S0), rt_text(rt_get(&F_v, v1181_tk)) }); rt_add(t2407, t2408); });
     } else if (rt_cond(rt_b(rt_bool(rt_eq(rt_get(&F_t, v1181_tk), rt_s(&S138)), "||") || rt_bool(rt_eq(rt_get(&F_t, v1181_tk), rt_s(&S148)), "||")))) {
-      v1182_line = ({ wv t2406 = v1182_line; wv t2407 = ({ wv t2404 = rt_text(rt_get(&F_text, v1181_tk)); wv t2405 = rt_text(rt_get(&F_v, v1181_tk)); rt_cat(4, (wv[]){ rt_s(&S0), t2404, rt_s(&S0), t2405 }); }); rt_add(t2406, t2407); });
+      v1182_line = ({ wv t2411 = v1182_line; wv t2412 = ({ wv t2409 = rt_text(rt_get(&F_text, v1181_tk)); wv t2410 = rt_text(rt_get(&F_v, v1181_tk)); rt_cat(4, (wv[]){ rt_s(&S0), t2409, rt_s(&S0), t2410 }); }); rt_add(t2411, t2412); });
     }
     (void)std_print(v1182_line);
     if (rt_cond(rt_eq(rt_get(&F_t, v1181_tk), rt_s(&S171)))) {
       wv v1183_p = rt_i(0);
-      while (rt_cond(({ wv t2408 = v1183_p; wv t2409 = std_length(rt_get(&F_parts, v1181_tk)); rt_lt(t2408, t2409); }))) {
-        wv v1184_part = rt_bind(({ wv t2410 = v1183_p; wv t2411 = rt_get(&F_parts, v1181_tk); rt_idx(t2410, t2411); }), 0);
+      while (rt_cond(({ wv t2413 = v1183_p; wv t2414 = std_length(rt_get(&F_parts, v1181_tk)); rt_lt(t2413, t2414); }))) {
+        wv v1184_part = rt_bind(({ wv t2415 = v1183_p; wv t2416 = rt_get(&F_parts, v1181_tk); rt_idx(t2415, t2416); }), 0);
         if (rt_cond(rt_eq(std_typeOf(v1184_part), rt_s(&S185)))) {
-          (void)std_print(({ wv t2412 = rt_text(v1179_indent); wv t2413 = rt_text(rt_chk(w1_quote(v1184_part), "dumpTokens")); rt_cat(3, (wv[]){ t2412, rt_s(&S655), t2413 }); }));
+          (void)std_print(({ wv t2417 = rt_text(v1179_indent); wv t2418 = rt_text(rt_chk(w1_quote(v1184_part), "dumpTokens")); rt_cat(3, (wv[]){ t2417, rt_s(&S660), t2418 }); }));
         } else {
-          (void)std_print(({ wv t2414 = rt_text(v1179_indent); wv t2415 = rt_text(rt_get(&F_pos, v1184_part)); rt_cat(3, (wv[]){ t2414, rt_s(&S656), t2415 }); }));
-          (void)({ wv t2416 = rt_get(&F_tokens, v1184_part); wv t2417 = rt_add(v1179_indent, rt_s(&S657)); rt_chk(w8_dumpTokens(t2416, t2417), "dumpTokens"); });
-          (void)std_print(rt_cat(2, (wv[]){ rt_text(v1179_indent), rt_s(&S658) }));
+          (void)std_print(({ wv t2419 = rt_text(v1179_indent); wv t2420 = rt_text(rt_get(&F_pos, v1184_part)); rt_cat(3, (wv[]){ t2419, rt_s(&S661), t2420 }); }));
+          (void)({ wv t2421 = rt_get(&F_tokens, v1184_part); wv t2422 = rt_add(v1179_indent, rt_s(&S662)); rt_chk(w8_dumpTokens(t2421, t2422), "dumpTokens"); });
+          (void)std_print(rt_cat(2, (wv[]){ rt_text(v1179_indent), rt_s(&S663) }));
         }
         v1183_p = rt_add(v1183_p, rt_i(1));
       }
@@ -8180,13 +8691,13 @@ static wv w8_sorted(wv v1185_xs) {
   v1185_xs = rt_bind(v1185_xs, 0);
   wv v1186_out = rt_arr(0, NULL, 1);
   wv v1187_k = rt_i(0);
-  while (rt_cond(({ wv t2418 = v1187_k; wv t2419 = std_length(v1185_xs); rt_lt(t2418, t2419); }))) {
-    (void)({ wv t2420 = v1186_out; wv t2421 = rt_idx(v1187_k, v1185_xs); std_push(t2420, t2421); });
+  while (rt_cond(({ wv t2423 = v1187_k; wv t2424 = std_length(v1185_xs); rt_lt(t2423, t2424); }))) {
+    (void)({ wv t2425 = v1186_out; wv t2426 = rt_idx(v1187_k, v1185_xs); std_push(t2425, t2426); });
     wv v1188_j = rt_sub(std_length(v1186_out), rt_i(1));
-    while (rt_cond(rt_b(rt_bool(rt_gt(v1188_j, rt_i(0)), "&&") && rt_bool(({ wv t2424 = ({ wv t2422 = rt_sub(v1188_j, rt_i(1)); wv t2423 = v1186_out; rt_idx(t2422, t2423); }); wv t2425 = rt_idx(v1188_j, v1186_out); rt_gt(t2424, t2425); }), "&&")))) {
+    while (rt_cond(rt_b(rt_bool(rt_gt(v1188_j, rt_i(0)), "&&") && rt_bool(({ wv t2429 = ({ wv t2427 = rt_sub(v1188_j, rt_i(1)); wv t2428 = v1186_out; rt_idx(t2427, t2428); }); wv t2430 = rt_idx(v1188_j, v1186_out); rt_gt(t2429, t2430); }), "&&")))) {
       wv v1189_swap = rt_bind(rt_idx(v1188_j, v1186_out), 0);
-      ({ wv t2428 = ({ wv t2426 = rt_sub(v1188_j, rt_i(1)); wv t2427 = v1186_out; rt_idx(t2426, t2427); }); wv t2429 = v1188_j; wv t2430 = v1186_out; rt_set_idx(t2428, t2429, t2430); });
-      ({ wv t2431 = v1189_swap; wv t2432 = rt_sub(v1188_j, rt_i(1)); wv t2433 = v1186_out; rt_set_idx(t2431, t2432, t2433); });
+      ({ wv t2433 = ({ wv t2431 = rt_sub(v1188_j, rt_i(1)); wv t2432 = v1186_out; rt_idx(t2431, t2432); }); wv t2434 = v1188_j; wv t2435 = v1186_out; rt_set_idx(t2433, t2434, t2435); });
+      ({ wv t2436 = v1189_swap; wv t2437 = rt_sub(v1188_j, rt_i(1)); wv t2438 = v1186_out; rt_set_idx(t2436, t2437, t2438); });
       v1188_j = rt_sub(v1188_j, rt_i(1));
     }
     v1187_k = rt_add(v1187_k, rt_i(1));
@@ -8202,29 +8713,29 @@ static wv w8_dumpValue(wv v1190_x, wv v1191_indent) {
   if (rt_cond(rt_eq(v1192_type, rt_s(&S185)))) {
     RT_RET(rt_chk(w1_quote(v1190_x), "dumpValue"));
   }
-  wv v1193_inner = rt_add(v1191_indent, rt_s(&S480));
-  if (rt_cond(rt_eq(v1192_type, rt_s(&S659)))) {
+  wv v1193_inner = rt_add(v1191_indent, rt_s(&S485));
+  if (rt_cond(rt_eq(v1192_type, rt_s(&S664)))) {
     if (rt_cond(rt_eq(std_length(v1190_x), rt_i(0)))) {
-      RT_RET(rt_s(&S660));
+      RT_RET(rt_s(&S665));
     }
     wv v1194_out = rt_s(&S98);
     wv v1195_k = rt_i(0);
-    while (rt_cond(({ wv t2434 = v1195_k; wv t2435 = std_length(v1190_x); rt_lt(t2434, t2435); }))) {
-      v1194_out = ({ wv t2440 = ({ wv t2436 = rt_add(v1194_out, rt_s(&S2)); wv t2437 = v1193_inner; rt_add(t2436, t2437); }); wv t2441 = ({ wv t2438 = rt_idx(v1195_k, v1190_x); wv t2439 = v1193_inner; rt_chk(w8_dumpValue(t2438, t2439), "dumpValue"); }); rt_add(t2440, t2441); });
+    while (rt_cond(({ wv t2439 = v1195_k; wv t2440 = std_length(v1190_x); rt_lt(t2439, t2440); }))) {
+      v1194_out = ({ wv t2445 = ({ wv t2441 = rt_add(v1194_out, rt_s(&S2)); wv t2442 = v1193_inner; rt_add(t2441, t2442); }); wv t2446 = ({ wv t2443 = rt_idx(v1195_k, v1190_x); wv t2444 = v1193_inner; rt_chk(w8_dumpValue(t2443, t2444), "dumpValue"); }); rt_add(t2445, t2446); });
       v1195_k = rt_add(v1195_k, rt_i(1));
     }
-    RT_RET(rt_add(({ wv t2442 = rt_add(v1194_out, rt_s(&S2)); wv t2443 = v1191_indent; rt_add(t2442, t2443); }), rt_s(&S99)));
+    RT_RET(rt_add(({ wv t2447 = rt_add(v1194_out, rt_s(&S2)); wv t2448 = v1191_indent; rt_add(t2447, t2448); }), rt_s(&S99)));
   }
-  if (rt_cond(rt_eq(v1192_type, rt_s(&S661)))) {
+  if (rt_cond(rt_eq(v1192_type, rt_s(&S666)))) {
     wv v1196_keys = rt_bind(rt_chk(w8_sorted(std_fields(v1190_x)), "dumpValue"), 0);
     wv v1197_out = rt_s(&S100);
     wv v1198_k = rt_i(0);
-    while (rt_cond(({ wv t2444 = v1198_k; wv t2445 = std_length(v1196_keys); rt_lt(t2444, t2445); }))) {
+    while (rt_cond(({ wv t2449 = v1198_k; wv t2450 = std_length(v1196_keys); rt_lt(t2449, t2450); }))) {
       wv v1199_key = rt_bind(rt_idx(v1198_k, v1196_keys), 0);
-      v1197_out = ({ wv t2452 = ({ wv t2448 = v1197_out; wv t2449 = ({ wv t2446 = rt_text(v1193_inner); wv t2447 = rt_text(v1199_key); rt_cat(4, (wv[]){ rt_s(&S2), t2446, t2447, rt_s(&S29) }); }); rt_add(t2448, t2449); }); wv t2453 = ({ wv t2450 = rt_idx(v1199_key, v1190_x); wv t2451 = v1193_inner; rt_chk(w8_dumpValue(t2450, t2451), "dumpValue"); }); rt_add(t2452, t2453); });
+      v1197_out = ({ wv t2457 = ({ wv t2453 = v1197_out; wv t2454 = ({ wv t2451 = rt_text(v1193_inner); wv t2452 = rt_text(v1199_key); rt_cat(4, (wv[]){ rt_s(&S2), t2451, t2452, rt_s(&S29) }); }); rt_add(t2453, t2454); }); wv t2458 = ({ wv t2455 = rt_idx(v1199_key, v1190_x); wv t2456 = v1193_inner; rt_chk(w8_dumpValue(t2455, t2456), "dumpValue"); }); rt_add(t2457, t2458); });
       v1198_k = rt_add(v1198_k, rt_i(1));
     }
-    RT_RET(({ wv t2454 = v1197_out; wv t2455 = rt_cat(3, (wv[]){ rt_s(&S2), rt_text(v1191_indent), rt_s(&S15) }); rt_add(t2454, t2455); }));
+    RT_RET(({ wv t2459 = v1197_out; wv t2460 = rt_cat(3, (wv[]){ rt_s(&S2), rt_text(v1191_indent), rt_s(&S15) }); rt_add(t2459, t2460); }));
   }
   RT_RET(std_toString(v1190_x));
 }
@@ -8237,7 +8748,7 @@ static wv w9_dirOf(wv v1200_path) {
   while (rt_cond(rt_b(rt_bool(rt_ge(v1202_k, rt_i(0)), "&&") && rt_bool(rt_ne(rt_idx(v1202_k, v1201_cs), rt_s(&S87)), "&&")))) {
     v1202_k = rt_sub(v1202_k, rt_i(1));
   }
-  RT_RET(std_join(({ wv t2456 = v1201_cs; wv t2457 = rt_add(v1202_k, rt_i(1)); std_slice(t2456, rt_i(0), t2457); }), rt_s(&S13)));
+  RT_RET(std_join(({ wv t2461 = v1201_cs; wv t2462 = rt_add(v1202_k, rt_i(1)); std_slice(t2461, rt_i(0), t2462); }), rt_s(&S13)));
 }
 
 static wv w9_normalize(wv v1203_path) {
@@ -8246,13 +8757,13 @@ static wv w9_normalize(wv v1203_path) {
   wv v1204_segs = rt_bind(std_split(v1203_path, rt_s(&S87)), 0);
   wv v1205_out = rt_arr(0, NULL, 1);
   wv v1206_k = rt_i(0);
-  while (rt_cond(({ wv t2458 = v1206_k; wv t2459 = std_length(v1204_segs); rt_lt(t2458, t2459); }))) {
+  while (rt_cond(({ wv t2463 = v1206_k; wv t2464 = std_length(v1204_segs); rt_lt(t2463, t2464); }))) {
     wv v1207_seg = rt_bind(rt_idx(v1206_k, v1204_segs), 0);
     v1206_k = rt_add(v1206_k, rt_i(1));
     if (rt_cond(rt_b(rt_bool(rt_eq(v1207_seg, rt_s(&S129)), "||") || rt_bool(rt_b(rt_bool(rt_eq(v1207_seg, rt_s(&S13)), "&&") && rt_bool(rt_gt(std_length(v1205_out), rt_i(0)), "&&")), "||")))) {
       continue;
     }
-    if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(v1207_seg, rt_s(&S662)), "&&") && rt_bool(rt_gt(std_length(v1205_out), rt_i(0)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(rt_i(-1), v1205_out), rt_s(&S662)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(rt_i(-1), v1205_out), rt_s(&S13)), "&&")))) {
+    if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(v1207_seg, rt_s(&S667)), "&&") && rt_bool(rt_gt(std_length(v1205_out), rt_i(0)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(rt_i(-1), v1205_out), rt_s(&S667)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(rt_i(-1), v1205_out), rt_s(&S13)), "&&")))) {
       (void)std_pop(v1205_out);
     } else {
       (void)std_push(v1205_out, v1207_seg);
@@ -8267,8 +8778,8 @@ static wv w9_with(wv v1208_xs, wv v1209_x) {
   v1209_x = rt_bind(v1209_x, 0);
   wv v1210_out = rt_arr(0, NULL, 1);
   wv v1211_k = rt_i(0);
-  while (rt_cond(({ wv t2460 = v1211_k; wv t2461 = std_length(v1208_xs); rt_lt(t2460, t2461); }))) {
-    (void)({ wv t2462 = v1210_out; wv t2463 = rt_idx(v1211_k, v1208_xs); std_push(t2462, t2463); });
+  while (rt_cond(({ wv t2465 = v1211_k; wv t2466 = std_length(v1208_xs); rt_lt(t2465, t2466); }))) {
+    (void)({ wv t2467 = v1210_out; wv t2468 = rt_idx(v1211_k, v1208_xs); std_push(t2467, t2468); });
     v1211_k = rt_add(v1211_k, rt_i(1));
   }
   (void)std_push(v1210_out, v1209_x);
@@ -8292,7 +8803,7 @@ static wv w9_loadProgram(wv v1216_entryFile, wv v1217_entryChars) {
   v1216_entryFile = rt_bind(v1216_entryFile, 0);
   fr.v1218_modules = rt_arr(0, NULL, 1);
   wv v1221_path = rt_bind(rt_chk(w9_normalize(std_join(std_split(v1216_entryFile, rt_s(&S19)), rt_s(&S87))), "loadProgram"), 0);
-  (void)({ wv t2514 = v1216_entryFile; wv t2515 = v1217_entryChars; wv t2516 = v1221_path; wv t2517 = rt_arr(1, (wv[]){ v1221_path }, 0); rt_chk(s1220_visit(&fr, t2514, t2515, t2516, t2517), "loadProgram"); });
+  (void)({ wv t2519 = v1216_entryFile; wv t2520 = v1217_entryChars; wv t2521 = v1221_path; wv t2522 = rt_arr(1, (wv[]){ v1221_path }, 0); rt_chk(s1220_visit(&fr, t2519, t2520, t2521, t2522), "loadProgram"); });
   RT_RET(fr.v1218_modules);
 }
 
@@ -8300,8 +8811,8 @@ static wv s1219_loaded(struct fr252 *up, wv v1222_path) {
   rt_enter("loaded");
   v1222_path = rt_bind(v1222_path, 0);
   wv v1223_k = rt_i(0);
-  while (rt_cond(({ wv t2464 = v1223_k; wv t2465 = std_length(rt_def(up->v1218_modules, "modules")); rt_lt(t2464, t2465); }))) {
-    if (rt_cond(({ wv t2468 = rt_get(&F_path, ({ wv t2466 = v1223_k; wv t2467 = rt_def(up->v1218_modules, "modules"); rt_idx(t2466, t2467); })); wv t2469 = v1222_path; rt_eq(t2468, t2469); }))) {
+  while (rt_cond(({ wv t2469 = v1223_k; wv t2470 = std_length(rt_def(up->v1218_modules, "modules")); rt_lt(t2469, t2470); }))) {
+    if (rt_cond(({ wv t2473 = rt_get(&F_path, ({ wv t2471 = v1223_k; wv t2472 = rt_def(up->v1218_modules, "modules"); rt_idx(t2471, t2472); })); wv t2474 = v1222_path; rt_eq(t2473, t2474); }))) {
       RT_RET(v1223_k);
     }
     v1223_k = rt_add(v1223_k, rt_i(1));
@@ -8319,41 +8830,41 @@ static wv s1220_visit(struct fr252 *up, wv v1224_file, wv v1225_chars, wv v1226_
   wv v1228_program = rt_bind(rt_chk(w4_parse(rt_chk(w3_lex(v1225_chars), "visit")), "visit"), 0);
   wv v1229_imports = rt_arr(0, NULL, 1);
   wv v1230_k = rt_i(0);
-  while (rt_cond(({ wv t2470 = v1230_k; wv t2471 = std_length(rt_get(&F_stmts, v1228_program)); rt_lt(t2470, t2471); }))) {
-    wv v1233_s = rt_bind(({ wv t2472 = v1230_k; wv t2473 = rt_get(&F_stmts, v1228_program); rt_idx(t2472, t2473); }), 0);
+  while (rt_cond(({ wv t2475 = v1230_k; wv t2476 = std_length(rt_get(&F_stmts, v1228_program)); rt_lt(t2475, t2476); }))) {
+    wv v1233_s = rt_bind(({ wv t2477 = v1230_k; wv t2478 = rt_get(&F_stmts, v1228_program); rt_idx(t2477, t2478); }), 0);
     v1230_k = rt_add(v1230_k, rt_i(1));
     if (rt_cond(rt_ne(rt_get(&F_k, v1233_s), rt_s(&S47)))) {
       continue;
     }
-    wv v1234_libPath = rt_bind(rt_chk(w9_normalize(({ wv t2474 = rt_chk(w9_dirOf(v1226_path), "visit"); wv t2475 = rt_get(&F_path, v1233_s); rt_add(t2474, t2475); })), "visit"), 0);
+    wv v1234_libPath = rt_bind(rt_chk(w9_normalize(({ wv t2479 = rt_chk(w9_dirOf(v1226_path), "visit"); wv t2480 = rt_get(&F_path, v1233_s); rt_add(t2479, t2480); })), "visit"), 0);
     wv v1235_at = rt_i(0);
-    while (rt_cond(rt_b(rt_bool(({ wv t2476 = v1235_at; wv t2477 = std_length(v1227_chain); rt_lt(t2476, t2477); }), "&&") && rt_bool(({ wv t2478 = rt_idx(v1235_at, v1227_chain); wv t2479 = v1234_libPath; rt_ne(t2478, t2479); }), "&&")))) {
+    while (rt_cond(rt_b(rt_bool(({ wv t2481 = v1235_at; wv t2482 = std_length(v1227_chain); rt_lt(t2481, t2482); }), "&&") && rt_bool(({ wv t2483 = rt_idx(v1235_at, v1227_chain); wv t2484 = v1234_libPath; rt_ne(t2483, t2484); }), "&&")))) {
       v1235_at = rt_add(v1235_at, rt_i(1));
     }
-    if (rt_cond(({ wv t2480 = v1235_at; wv t2481 = std_length(v1227_chain); rt_lt(t2480, t2481); }))) {
-      wv v1237_cycle = rt_bind(({ wv t2485 = ({ wv t2482 = v1227_chain; wv t2483 = v1235_at; wv t2484 = std_length(v1227_chain); std_slice(t2482, t2483, t2484); }); wv t2486 = v1234_libPath; rt_chk(w9_with(t2485, t2486), "visit"); }), 0);
-      (void)({ wv t2487 = v1224_file; wv t2488 = v1225_chars; wv t2489 = rt_get(&F_pathPos, v1233_s); wv t2490 = rt_cat(2, (wv[]){ rt_s(&S663), rt_text(std_join(v1237_cycle, rt_s(&S664))) }); rt_chk(w9_failIn(t2487, t2488, t2489, t2490), "visit"); });
+    if (rt_cond(({ wv t2485 = v1235_at; wv t2486 = std_length(v1227_chain); rt_lt(t2485, t2486); }))) {
+      wv v1237_cycle = rt_bind(({ wv t2490 = ({ wv t2487 = v1227_chain; wv t2488 = v1235_at; wv t2489 = std_length(v1227_chain); std_slice(t2487, t2488, t2489); }); wv t2491 = v1234_libPath; rt_chk(w9_with(t2490, t2491), "visit"); }), 0);
+      (void)({ wv t2492 = v1224_file; wv t2493 = v1225_chars; wv t2494 = rt_get(&F_pathPos, v1233_s); wv t2495 = rt_cat(2, (wv[]){ rt_s(&S668), rt_text(std_join(v1237_cycle, rt_s(&S669))) }); rt_chk(w9_failIn(t2492, t2493, t2494, t2495), "visit"); });
     }
     wv v1236_lib = rt_bind(rt_chk(s1219_loaded(up, v1234_libPath), "visit"), 1);
     if (rt_cond(rt_eq(v1236_lib, RT_NULL))) {
-      wv t2491 = std_readFile(v1234_libPath);
+      wv t2496 = std_readFile(v1234_libPath);
       if (rt_failcode) {
         rt_failcode = 0;
         {
-          (void)({ wv t2492 = v1224_file; wv t2493 = v1225_chars; wv t2494 = rt_get(&F_pathPos, v1233_s); wv t2495 = rt_cat(3, (wv[]){ rt_s(&S665), rt_text(v1234_libPath), rt_s(&S113) }); rt_chk(w9_failIn(t2492, t2493, t2494, t2495), "visit"); });
-          t2491 = RT_NULL;
+          (void)({ wv t2497 = v1224_file; wv t2498 = v1225_chars; wv t2499 = rt_get(&F_pathPos, v1233_s); wv t2500 = rt_cat(3, (wv[]){ rt_s(&S670), rt_text(v1234_libPath), rt_s(&S113) }); rt_chk(w9_failIn(t2497, t2498, t2499, t2500), "visit"); });
+          t2496 = RT_NULL;
         }
       }
-      wv v1238_text = rt_bind(t2491, 0);
+      wv v1238_text = rt_bind(t2496, 0);
       wv v1239_cs = rt_bind(std_split(v1238_text, rt_s(&S13)), 0);
-      wv v1240_bom = rt_bind((rt_cond(rt_b(rt_bool(rt_gt(std_length(v1239_cs), rt_i(0)), "&&") && rt_bool(rt_eq(rt_idx(rt_i(0), v1239_cs), rt_s(&S666)), "&&"))) ? rt_i(1) : rt_i(0)), 0);
-      v1236_lib = rt_bind(({ wv t2499 = v1234_libPath; wv t2500 = ({ wv t2496 = v1239_cs; wv t2497 = v1240_bom; wv t2498 = std_length(v1239_cs); std_slice(t2496, t2497, t2498); }); wv t2501 = v1234_libPath; wv t2502 = rt_chk(w9_with(v1227_chain, v1234_libPath), "visit"); rt_chk(s1220_visit(up, t2499, t2500, t2501, t2502), "visit"); }), 1);
+      wv v1240_bom = rt_bind((rt_cond(rt_b(rt_bool(rt_gt(std_length(v1239_cs), rt_i(0)), "&&") && rt_bool(rt_eq(rt_idx(rt_i(0), v1239_cs), rt_s(&S671)), "&&"))) ? rt_i(1) : rt_i(0)), 0);
+      v1236_lib = rt_bind(({ wv t2504 = v1234_libPath; wv t2505 = ({ wv t2501 = v1239_cs; wv t2502 = v1240_bom; wv t2503 = std_length(v1239_cs); std_slice(t2501, t2502, t2503); }); wv t2506 = v1234_libPath; wv t2507 = rt_chk(w9_with(v1227_chain, v1234_libPath), "visit"); rt_chk(s1220_visit(up, t2504, t2505, t2506, t2507), "visit"); }), 1);
     }
-    (void)({ wv t2503 = v1229_imports; wv t2504 = rt_rec(0, 2, K58, (wv[]){ v1233_s, v1236_lib }); std_push(t2503, t2504); });
+    (void)({ wv t2508 = v1229_imports; wv t2509 = rt_rec(0, 2, K58, (wv[]){ v1233_s, v1236_lib }); std_push(t2508, t2509); });
   }
   wv v1231_refTargets = rt_arr(0, NULL, 1);
-  wv v1232_mod = ({ wv t2505 = v1224_file; wv t2506 = v1225_chars; wv t2507 = v1226_path; wv t2508 = v1228_program; wv t2509 = v1229_imports; wv t2510 = rt_arr(0, NULL, 0); wv t2511 = v1231_refTargets; rt_rec(1, 8, K59, (wv[]){ t2505, t2506, t2507, t2508, t2509, t2510, rt_b(0), t2511 }); });
-  (void)({ wv t2512 = rt_def(up->v1218_modules, "modules"); wv t2513 = v1232_mod; std_push(t2512, t2513); });
+  wv v1232_mod = ({ wv t2510 = v1224_file; wv t2511 = v1225_chars; wv t2512 = v1226_path; wv t2513 = v1228_program; wv t2514 = v1229_imports; wv t2515 = rt_arr(0, NULL, 0); wv t2516 = v1231_refTargets; rt_rec(1, 8, K59, (wv[]){ t2510, t2511, t2512, t2513, t2514, t2515, rt_b(0), t2516 }); });
+  (void)({ wv t2517 = rt_def(up->v1218_modules, "modules"); wv t2518 = v1232_mod; std_push(t2517, t2518); });
   RT_RET(rt_sub(std_length(rt_def(up->v1218_modules, "modules")), rt_i(1)));
 }
 
@@ -8367,47 +8878,47 @@ static wv w_die(void) {
 static wv w_load(wv v1241_file) {
   rt_enter("load");
   v1241_file = rt_bind(v1241_file, 0);
-  wv t2518 = std_readFile(v1241_file);
+  wv t2523 = std_readFile(v1241_file);
   if (rt_failcode) {
     rt_failcode = 0;
     {
-      (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S673), rt_text(v1241_file) }));
+      (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S678), rt_text(v1241_file) }));
       rt_exit(rt_i(2));
-      t2518 = RT_NULL;
+      t2523 = RT_NULL;
     }
   }
-  wv v1242_text = rt_bind(t2518, 0);
+  wv v1242_text = rt_bind(t2523, 0);
   wv v1243_chars = rt_bind(std_split(v1242_text, rt_s(&S13)), 0);
-  wv v1244_bom = rt_bind((rt_cond(rt_b(rt_bool(rt_gt(std_length(v1243_chars), rt_i(0)), "&&") && rt_bool(rt_eq(rt_idx(rt_i(0), v1243_chars), rt_s(&S666)), "&&"))) ? rt_i(1) : rt_i(0)), 0);
-  (void)({ wv t2522 = v1241_file; wv t2523 = ({ wv t2519 = v1243_chars; wv t2520 = v1244_bom; wv t2521 = std_length(v1243_chars); std_slice(t2519, t2520, t2521); }); rt_chk(w2_setSource(t2522, t2523), "load"); });
+  wv v1244_bom = rt_bind((rt_cond(rt_b(rt_bool(rt_gt(std_length(v1243_chars), rt_i(0)), "&&") && rt_bool(rt_eq(rt_idx(rt_i(0), v1243_chars), rt_s(&S671)), "&&"))) ? rt_i(1) : rt_i(0)), 0);
+  (void)({ wv t2527 = v1241_file; wv t2528 = ({ wv t2524 = v1243_chars; wv t2525 = v1244_bom; wv t2526 = std_length(v1243_chars); std_slice(t2524, t2525, t2526); }); rt_chk(w2_setSource(t2527, t2528), "load"); });
   RT_RET(RT_NULL);
 }
 
 static wv w_onWindows(void) {
   rt_enter("onWindows");
-  wv t2528 = rt_s(&S683);
-  wv t2529 = std_env(t2528);
+  wv t2533 = rt_s(&S688);
+  wv t2534 = std_env(t2533);
   if (rt_failcode) {
     rt_failcode = 0;
     {
-      t2529 = rt_s(&S13);
+      t2534 = rt_s(&S13);
     }
   }
-  wv v1246_os = rt_bind(t2529, 0);
-  RT_RET(rt_eq(v1246_os, rt_s(&S684)));
+  wv v1246_os = rt_bind(t2534, 0);
+  RT_RET(rt_eq(v1246_os, rt_s(&S689)));
 }
 
 static wv w_tryRead(wv v1247_path) {
   rt_enter("tryRead");
   v1247_path = rt_bind(v1247_path, 0);
-  wv t2536 = std_readFile(v1247_path);
+  wv t2541 = std_readFile(v1247_path);
   if (rt_failcode) {
     rt_failcode = 0;
     {
-      t2536 = RT_NULL;
+      t2541 = RT_NULL;
     }
   }
-  wv v1248_text = rt_bind(t2536, 0);
+  wv v1248_text = rt_bind(t2541, 0);
   RT_RET(v1248_text);
 }
 
@@ -8418,7 +8929,7 @@ static wv w_programDir(void) {
   while (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_ge(v1250_k, rt_i(0)), "&&") && rt_bool(rt_ne(rt_idx(v1250_k, v1249_cs), rt_s(&S87)), "&&")), "&&") && rt_bool(rt_ne(rt_idx(v1250_k, v1249_cs), rt_s(&S19)), "&&")))) {
     v1250_k = rt_sub(v1250_k, rt_i(1));
   }
-  RT_RET(std_join(({ wv t2537 = v1249_cs; wv t2538 = rt_add(v1250_k, rt_i(1)); std_slice(t2537, rt_i(0), t2538); }), rt_s(&S13)));
+  RT_RET(std_join(({ wv t2542 = v1249_cs; wv t2543 = rt_add(v1250_k, rt_i(1)); std_slice(t2542, rt_i(0), t2543); }), rt_s(&S13)));
 }
 
 static wv w_readRuntime(void) {
@@ -8428,8 +8939,8 @@ static wv w_readRuntime(void) {
     RT_RET(v1251_text);
   }
   wv v1252_dir = rt_bind(rt_chk(w_programDir(), "readRuntime"), 0);
-  wv v1253_here = rt_bind(rt_chk(w_tryRead(({ wv t2539 = v1252_dir; wv t2540 = rt_def(w_runtimePath, "runtimePath"); rt_add(t2539, t2540); })), "readRuntime"), 0);
-  RT_RET((rt_cond(rt_ne(v1253_here, RT_NULL)) ? v1253_here : rt_chk(w_tryRead(({ wv t2541 = rt_add(v1252_dir, rt_s(&S692)); wv t2542 = rt_def(w_runtimePath, "runtimePath"); rt_add(t2541, t2542); })), "readRuntime")));
+  wv v1253_here = rt_bind(rt_chk(w_tryRead(({ wv t2544 = v1252_dir; wv t2545 = rt_def(w_runtimePath, "runtimePath"); rt_add(t2544, t2545); })), "readRuntime"), 0);
+  RT_RET((rt_cond(rt_ne(v1253_here, RT_NULL)) ? v1253_here : rt_chk(w_tryRead(({ wv t2546 = rt_add(v1252_dir, rt_s(&S697)); wv t2547 = rt_def(w_runtimePath, "runtimePath"); rt_add(t2546, t2547); })), "readRuntime")));
 }
 
 static void wvt_main(void) {
@@ -8447,23 +8958,23 @@ static void wvt_main(void) {
   w4_onfailOk = rt_arr(6, (wv[]){ rt_s(&S176), rt_s(&S177), rt_s(&S38), rt_s(&S34), rt_s(&S57), rt_s(&S54) }, 0);
   w4_callees = rt_arr(2, (wv[]){ rt_s(&S137), rt_s(&S156) }, 0);
   w4_exportable = rt_arr(5, (wv[]){ rt_s(&S33), rt_s(&S35), rt_s(&S36), rt_s(&S37), rt_s(&S46) }, 0);
-  w5_stdlib = ({ wv t534 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S324), rt_i(1) }); wv t535 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S325), rt_i(1) }); wv t536 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S326), rt_i(1) }); wv t537 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S327), rt_i(0) }); wv t538 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S328), rt_i(1) }); wv t539 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S329), rt_i(2) }); wv t540 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S330), rt_i(2) }); wv t541 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S331), rt_i(1) }); wv t542 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S332), rt_i(1) }); wv t543 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S333), rt_i(1) }); wv t544 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S334), rt_s(&S35) }); wv t545 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S335), rt_i(1) }); wv t546 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S336), rt_s(&S35) }); wv t547 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S337), rt_i(2) }); wv t548 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S338), rt_i(1) }); wv t549 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S339), rt_i(2) }); wv t550 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S340), rt_i(3) }); wv t551 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S341), rt_i(1) }); wv t552 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S342), rt_i(1) }); wv t553 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S343), rt_i(2) }); wv t554 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S344), rt_i(2) }); wv t555 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S345), rt_i(1) }); wv t556 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S346), rt_i(1) }); wv t557 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S347), rt_i(1) }); wv t558 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S348), rt_i(2) }); wv t559 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S349), rt_i(1) }); wv t560 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S350), rt_i(2) }); wv t561 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S351), rt_i(1) }); wv t562 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S352), rt_i(1) }); wv t563 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S353), rt_i(1) }); wv t564 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S354), rt_i(1) }); wv t565 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S355), rt_i(1) }); wv t566 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S356), rt_i(1) }); wv t567 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S357), rt_i(1) }); wv t568 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S358), rt_i(1) }); rt_arr(35, (wv[]){ t534, t535, t536, t537, t538, t539, t540, t541, t542, t543, t544, t545, t546, t547, t548, t549, t550, t551, t552, t553, t554, t555, t556, t557, t558, t559, t560, t561, t562, t563, t564, t565, t566, t567, t568 }, 0); });
+  w5_stdlib = ({ wv t534 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S324), rt_i(1) }); wv t535 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S325), rt_i(1) }); wv t536 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S326), rt_i(1) }); wv t537 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S327), rt_i(0) }); wv t538 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S328), rt_i(0) }); wv t539 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S329), rt_i(1) }); wv t540 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S330), rt_i(2) }); wv t541 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S331), rt_i(2) }); wv t542 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S332), rt_i(1) }); wv t543 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S333), rt_i(1) }); wv t544 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S334), rt_i(1) }); wv t545 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S335), rt_s(&S35) }); wv t546 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S336), rt_i(1) }); wv t547 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S337), rt_s(&S35) }); wv t548 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S338), rt_i(2) }); wv t549 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S339), rt_i(1) }); wv t550 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S340), rt_i(2) }); wv t551 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S341), rt_i(3) }); wv t552 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S342), rt_i(1) }); wv t553 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S343), rt_i(1) }); wv t554 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S344), rt_i(2) }); wv t555 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S345), rt_i(2) }); wv t556 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S346), rt_i(1) }); wv t557 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S347), rt_i(1) }); wv t558 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S348), rt_i(1) }); wv t559 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S349), rt_i(2) }); wv t560 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S350), rt_i(1) }); wv t561 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S351), rt_i(2) }); wv t562 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S352), rt_i(1) }); wv t563 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S353), rt_i(1) }); wv t564 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S354), rt_i(1) }); wv t565 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S355), rt_i(1) }); wv t566 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S356), rt_i(1) }); wv t567 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S357), rt_i(1) }); wv t568 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S358), rt_i(1) }); wv t569 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S359), rt_i(1) }); wv t570 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S360), rt_i(0) }); wv t571 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S361), rt_i(1) }); wv t572 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S362), rt_i(2) }); wv t573 = rt_rec(0, 2, K39, (wv[]){ rt_s(&S363), rt_i(1) }); rt_arr(40, (wv[]){ t534, t535, t536, t537, t538, t539, t540, t541, t542, t543, t544, t545, t546, t547, t548, t549, t550, t551, t552, t553, t554, t555, t556, t557, t558, t559, t560, t561, t562, t563, t564, t565, t566, t567, t568, t569, t570, t571, t572, t573 }, 0); });
   w5_neverCompletes = rt_arr(6, (wv[]){ rt_s(&S34), rt_s(&S57), rt_s(&S54), rt_s(&S55), rt_s(&S42), rt_s(&S43) }, 0);
   w5_onfailValueUsed = rt_arr(5, (wv[]){ rt_s(&S177), rt_s(&S38), rt_s(&S34), rt_s(&S57), rt_s(&S54) }, 0);
   w5_libraryTop = rt_arr(6, (wv[]){ rt_s(&S200), rt_s(&S47), rt_s(&S33), rt_s(&S177), rt_s(&S46), rt_s(&S203) }, 0);
   w6_binOps = rt_arr(17, (wv[]){ rt_s(&S84), rt_s(&S85), rt_s(&S86), rt_s(&S87), rt_s(&S88), rt_s(&S75), rt_s(&S76), rt_s(&S77), rt_s(&S89), rt_s(&S90), rt_s(&S78), rt_s(&S79), rt_s(&S91), rt_s(&S92), rt_s(&S32), rt_s(&S82), rt_s(&S83) }, 0);
-  w6_binFns = rt_arr(17, (wv[]){ rt_s(&S458), rt_s(&S459), rt_s(&S460), rt_s(&S461), rt_s(&S462), rt_s(&S463), rt_s(&S464), rt_s(&S465), rt_s(&S466), rt_s(&S467), rt_s(&S468), rt_s(&S469), rt_s(&S470), rt_s(&S471), rt_s(&S472), rt_s(&S473), rt_s(&S474) }, 0);
+  w6_binFns = rt_arr(17, (wv[]){ rt_s(&S463), rt_s(&S464), rt_s(&S465), rt_s(&S466), rt_s(&S467), rt_s(&S468), rt_s(&S469), rt_s(&S470), rt_s(&S471), rt_s(&S472), rt_s(&S473), rt_s(&S474), rt_s(&S475), rt_s(&S476), rt_s(&S477), rt_s(&S478), rt_s(&S479) }, 0);
   w6_scalarKinds = rt_arr(9, (wv[]){ rt_s(&S138), rt_s(&S148), rt_s(&S171), rt_s(&S281), rt_s(&S51), rt_s(&S52), rt_s(&S53), rt_s(&S191), rt_s(&S190) }, 0);
   w6_plainKinds = rt_arr(8, (wv[]){ rt_s(&S138), rt_s(&S148), rt_s(&S281), rt_s(&S51), rt_s(&S52), rt_s(&S53), rt_s(&S211), rt_s(&S156) }, 0);
   w7_binOps = rt_arr(17, (wv[]){ rt_s(&S84), rt_s(&S85), rt_s(&S86), rt_s(&S87), rt_s(&S88), rt_s(&S75), rt_s(&S76), rt_s(&S77), rt_s(&S89), rt_s(&S90), rt_s(&S78), rt_s(&S79), rt_s(&S91), rt_s(&S92), rt_s(&S32), rt_s(&S82), rt_s(&S83) }, 0);
-  w7_binFns = rt_arr(17, (wv[]){ rt_s(&S458), rt_s(&S459), rt_s(&S460), rt_s(&S461), rt_s(&S462), rt_s(&S463), rt_s(&S464), rt_s(&S465), rt_s(&S466), rt_s(&S467), rt_s(&S468), rt_s(&S469), rt_s(&S470), rt_s(&S471), rt_s(&S472), rt_s(&S473), rt_s(&S474) }, 0);
+  w7_binFns = rt_arr(17, (wv[]){ rt_s(&S463), rt_s(&S464), rt_s(&S465), rt_s(&S466), rt_s(&S467), rt_s(&S468), rt_s(&S469), rt_s(&S470), rt_s(&S471), rt_s(&S472), rt_s(&S473), rt_s(&S474), rt_s(&S475), rt_s(&S476), rt_s(&S477), rt_s(&S478), rt_s(&S479) }, 0);
   w7_scalarKinds = rt_arr(9, (wv[]){ rt_s(&S138), rt_s(&S148), rt_s(&S171), rt_s(&S281), rt_s(&S51), rt_s(&S52), rt_s(&S53), rt_s(&S191), rt_s(&S190) }, 0);
   w7_plainKinds = rt_arr(8, (wv[]){ rt_s(&S138), rt_s(&S148), rt_s(&S281), rt_s(&S51), rt_s(&S52), rt_s(&S53), rt_s(&S211), rt_s(&S156) }, 0);
-  w7_signalers = rt_arr(10, (wv[]){ rt_s(&S327), rt_s(&S328), rt_s(&S329), rt_s(&S330), rt_s(&S332), rt_s(&S333), rt_s(&S335), rt_s(&S337), rt_s(&S346), rt_s(&S347) }, 0);
+  w7_signalers = rt_arr(11, (wv[]){ rt_s(&S327), rt_s(&S328), rt_s(&S329), rt_s(&S330), rt_s(&S331), rt_s(&S333), rt_s(&S334), rt_s(&S336), rt_s(&S338), rt_s(&S347), rt_s(&S348) }, 0);
   w7_constK = rt_i(0);
   w7_pureK = rt_i(1);
   w7_effectK = rt_i(2);
-  w_usage = rt_add(rt_add(rt_add(rt_add(rt_add(rt_s(&S667), rt_s(&S668)), rt_s(&S669)), rt_s(&S670)), rt_s(&S671)), rt_s(&S672));
+  w_usage = rt_add(rt_add(rt_add(rt_add(rt_add(rt_s(&S672), rt_s(&S673)), rt_s(&S674)), rt_s(&S675)), rt_s(&S676)), rt_s(&S677));
   w_argv = rt_bind(std_args(), 0);
   w_mode = rt_s(&S13);
   w_input = rt_s(&S13);
@@ -8472,24 +8983,24 @@ static void wvt_main(void) {
   w_runtimePath = rt_s(&S13);
   w_cc = rt_s(&S13);
   w_arg = rt_i(0);
-  while (rt_cond(({ wv t2524 = w_arg; wv t2525 = std_length(w_argv); rt_lt(t2524, t2525); }))) {
+  while (rt_cond(({ wv t2529 = w_arg; wv t2530 = std_length(w_argv); rt_lt(t2529, t2530); }))) {
     v1245_a = rt_bind(rt_idx(w_arg, w_argv), 0);
-    if (rt_cond(rt_b(rt_bool(rt_eq(w_arg, rt_i(0)), "&&") && rt_bool(rt_eq(v1245_a, rt_s(&S674)), "&&")))) {
+    if (rt_cond(rt_b(rt_bool(rt_eq(w_arg, rt_i(0)), "&&") && rt_bool(rt_eq(v1245_a, rt_s(&S679)), "&&")))) {
       w_mode = rt_bind(v1245_a, 1);
-    } else if (rt_cond(rt_b(rt_bool(rt_eq(v1245_a, rt_s(&S675)), "||") || rt_bool(rt_eq(v1245_a, rt_s(&S676)), "||")))) {
+    } else if (rt_cond(rt_b(rt_bool(rt_eq(v1245_a, rt_s(&S680)), "||") || rt_bool(rt_eq(v1245_a, rt_s(&S681)), "||")))) {
       w_mode = rt_bind(v1245_a, 1);
-    } else if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(v1245_a, rt_s(&S677)), "||") || rt_bool(rt_eq(v1245_a, rt_s(&S678)), "||")), "||") || rt_bool(rt_eq(v1245_a, rt_s(&S679)), "||")), "||") || rt_bool(rt_eq(v1245_a, rt_s(&S680)), "||")))) {
+    } else if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(v1245_a, rt_s(&S682)), "||") || rt_bool(rt_eq(v1245_a, rt_s(&S683)), "||")), "||") || rt_bool(rt_eq(v1245_a, rt_s(&S684)), "||")), "||") || rt_bool(rt_eq(v1245_a, rt_s(&S685)), "||")))) {
       w_arg = rt_add(w_arg, rt_i(1));
-      if (rt_cond(({ wv t2526 = w_arg; wv t2527 = std_length(w_argv); rt_ge(t2526, t2527); }))) {
+      if (rt_cond(({ wv t2531 = w_arg; wv t2532 = std_length(w_argv); rt_ge(t2531, t2532); }))) {
         (void)rt_chk(w_die(), NULL);
       }
-      if (rt_cond(rt_eq(v1245_a, rt_s(&S677)))) {
+      if (rt_cond(rt_eq(v1245_a, rt_s(&S682)))) {
         w_output = rt_bind(rt_idx(w_arg, w_argv), 1);
-      } else if (rt_cond(rt_eq(v1245_a, rt_s(&S678)))) {
+      } else if (rt_cond(rt_eq(v1245_a, rt_s(&S683)))) {
         w_runtimePath = rt_bind(rt_idx(w_arg, w_argv), 1);
-      } else if (rt_cond(rt_eq(v1245_a, rt_s(&S680)))) {
+      } else if (rt_cond(rt_eq(v1245_a, rt_s(&S685)))) {
         w_cc = rt_bind(rt_idx(w_arg, w_argv), 1);
-      } else if (rt_cond(rt_b(rt_bool(rt_eq(rt_idx(w_arg, w_argv), rt_s(&S681)), "||") || rt_bool(rt_eq(rt_idx(w_arg, w_argv), rt_s(&S682)), "||")))) {
+      } else if (rt_cond(rt_b(rt_bool(rt_eq(rt_idx(w_arg, w_argv), rt_s(&S686)), "||") || rt_bool(rt_eq(rt_idx(w_arg, w_argv), rt_s(&S687)), "||")))) {
         w_target = rt_bind(rt_idx(w_arg, w_argv), 1);
       } else {
         (void)rt_chk(w_die(), NULL);
@@ -8501,47 +9012,47 @@ static void wvt_main(void) {
     }
     w_arg = rt_add(w_arg, rt_i(1));
   }
-  w_inspect = rt_b(rt_bool(rt_eq(w_mode, rt_s(&S675)), "||") || rt_bool(rt_eq(w_mode, rt_s(&S676)), "||"));
-  if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(w_input, rt_s(&S13)), "||") || rt_bool(rt_b(rt_bool(w_inspect, "&&") && rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_ne(w_output, rt_s(&S13)), "||") || rt_bool(rt_ne(w_runtimePath, rt_s(&S13)), "||")), "||") || rt_bool(rt_ne(w_target, rt_s(&S13)), "||")), "&&")), "||")), "||") || rt_bool(rt_b(rt_bool(rt_eq(w_mode, rt_s(&S674)), "&&") && rt_bool(rt_ne(w_target, rt_s(&S13)), "&&")), "||")), "||") || rt_bool(rt_b(rt_bool(rt_ne(w_mode, rt_s(&S674)), "&&") && rt_bool(rt_ne(w_cc, rt_s(&S13)), "&&")), "||")))) {
+  w_inspect = rt_b(rt_bool(rt_eq(w_mode, rt_s(&S680)), "||") || rt_bool(rt_eq(w_mode, rt_s(&S681)), "||"));
+  if (rt_cond(rt_b(rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_eq(w_input, rt_s(&S13)), "||") || rt_bool(rt_b(rt_bool(w_inspect, "&&") && rt_bool(rt_b(rt_bool(rt_b(rt_bool(rt_ne(w_output, rt_s(&S13)), "||") || rt_bool(rt_ne(w_runtimePath, rt_s(&S13)), "||")), "||") || rt_bool(rt_ne(w_target, rt_s(&S13)), "||")), "&&")), "||")), "||") || rt_bool(rt_b(rt_bool(rt_eq(w_mode, rt_s(&S679)), "&&") && rt_bool(rt_ne(w_target, rt_s(&S13)), "&&")), "||")), "||") || rt_bool(rt_b(rt_bool(rt_ne(w_mode, rt_s(&S679)), "&&") && rt_bool(rt_ne(w_cc, rt_s(&S13)), "&&")), "||")))) {
     (void)rt_chk(w_die(), NULL);
   }
-  w_dotWvt = rt_b(rt_bool(rt_ge(std_length(w_input), rt_i(4)), "&&") && rt_bool(rt_eq(({ wv t2530 = w_input; wv t2531 = std_length(w_input); std_slice(t2530, rt_i(-4), t2531); }), rt_s(&S231)), "&&"));
-  if (rt_cond(rt_eq(w_mode, rt_s(&S674)))) {
-    w_target = rt_s(&S682);
+  w_dotWvt = rt_b(rt_bool(rt_ge(std_length(w_input), rt_i(4)), "&&") && rt_bool(rt_eq(({ wv t2535 = w_input; wv t2536 = std_length(w_input); std_slice(t2535, rt_i(-4), t2536); }), rt_s(&S231)), "&&"));
+  if (rt_cond(rt_eq(w_mode, rt_s(&S679)))) {
+    w_target = rt_s(&S687);
     if (rt_cond(rt_eq(w_cc, rt_s(&S13)))) {
-      wv t2532 = rt_s(&S685);
-      wv t2533 = std_env(t2532);
+      wv t2537 = rt_s(&S690);
+      wv t2538 = std_env(t2537);
       if (rt_failcode) {
         rt_failcode = 0;
         {
-          t2533 = rt_s(&S686);
+          t2538 = rt_s(&S691);
         }
       }
-      w_cc = rt_bind(t2533, 1);
+      w_cc = rt_bind(t2538, 1);
     }
     if (rt_cond(rt_b(rt_bool(rt_eq(w_output, rt_s(&S13)), "&&") && rt_bool(rt_not(w_dotWvt), "&&")))) {
-      (void)std_eprint(rt_cat(3, (wv[]){ rt_s(&S687), rt_text(w_input), rt_s(&S688) }));
+      (void)std_eprint(rt_cat(3, (wv[]){ rt_s(&S692), rt_text(w_input), rt_s(&S693) }));
       rt_exit(rt_i(2));
     }
     if (rt_cond(rt_eq(w_output, rt_s(&S13)))) {
-      w_output = ({ wv t2534 = std_slice(w_input, rt_i(0), rt_i(-4)); wv t2535 = (rt_cond(rt_chk(w_onWindows(), NULL)) ? rt_s(&S689) : rt_s(&S13)); rt_add(t2534, t2535); });
+      w_output = ({ wv t2539 = std_slice(w_input, rt_i(0), rt_i(-4)); wv t2540 = (rt_cond(rt_chk(w_onWindows(), NULL)) ? rt_s(&S694) : rt_s(&S13)); rt_add(t2539, t2540); });
     }
   }
   if (rt_cond(rt_eq(w_target, rt_s(&S13)))) {
-    w_target = rt_s(&S682);
+    w_target = rt_s(&S687);
   }
   w_runtimeGiven = rt_ne(w_runtimePath, rt_s(&S13));
   if (rt_cond(rt_not(w_runtimeGiven))) {
-    w_runtimePath = rt_bind((rt_cond(rt_eq(w_target, rt_s(&S682))) ? rt_s(&S690) : rt_s(&S691)), 1);
+    w_runtimePath = rt_bind((rt_cond(rt_eq(w_target, rt_s(&S687))) ? rt_s(&S695) : rt_s(&S696)), 1);
   }
   (void)rt_chk(w_load(w_input), NULL);
-  if (rt_cond(rt_eq(w_mode, rt_s(&S675)))) {
+  if (rt_cond(rt_eq(w_mode, rt_s(&S680)))) {
     v1254_tokens = rt_bind(rt_chk(w3_lex(w2_srcChars), NULL), 0);
     (void)rt_chk(w2_flushWarnings(), NULL);
     (void)rt_chk(w8_dumpTokens(v1254_tokens, rt_s(&S13)), NULL);
     rt_exit(rt_i(0));
   }
-  if (rt_cond(rt_eq(w_mode, rt_s(&S676)))) {
+  if (rt_cond(rt_eq(w_mode, rt_s(&S681)))) {
     v1255_program = rt_bind(rt_chk(w4_parse(rt_chk(w3_lex(w2_srcChars), NULL)), NULL), 0);
     (void)rt_chk(w2_flushWarnings(), NULL);
     (void)std_print(rt_chk(w8_dumpValue(v1255_program, rt_s(&S13)), NULL));
@@ -8552,7 +9063,7 @@ static void wvt_main(void) {
   if (rt_cond(rt_gt(std_length(w_problems), rt_i(0)))) {
     (void)rt_chk(w2_flushWarnings(), NULL);
     v1256_p = rt_i(0);
-    while (rt_cond(({ wv t2543 = v1256_p; wv t2544 = std_length(w_problems); rt_lt(t2543, t2544); }))) {
+    while (rt_cond(({ wv t2548 = v1256_p; wv t2549 = std_length(w_problems); rt_lt(t2548, t2549); }))) {
       (void)std_eprint(rt_chk(w2_formatDiag(rt_idx(v1256_p, w_problems)), NULL));
       v1256_p = rt_add(v1256_p, rt_i(1));
     }
@@ -8560,55 +9071,55 @@ static void wvt_main(void) {
   }
   w_runtime = rt_bind(rt_chk(w_readRuntime(), NULL), 0);
   if (rt_cond(rt_eq(w_runtime, RT_NULL))) {
-    (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S673), rt_text(w_runtimePath) }));
+    (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S678), rt_text(w_runtimePath) }));
     rt_exit(rt_i(2));
   }
-  w_code = rt_bind((rt_cond(rt_eq(w_target, rt_s(&S682))) ? rt_chk(w7_generateC(w_modules, w_runtime), NULL) : rt_chk(w6_generate(w_modules, w_runtime), NULL)), 0);
+  w_code = rt_bind((rt_cond(rt_eq(w_target, rt_s(&S687))) ? rt_chk(w7_generateC(w_modules, w_runtime), NULL) : rt_chk(w6_generate(w_modules, w_runtime), NULL)), 0);
   (void)rt_chk(w2_flushWarnings(), NULL);
-  if (rt_cond(rt_ne(w_mode, rt_s(&S674)))) {
+  if (rt_cond(rt_ne(w_mode, rt_s(&S679)))) {
     if (rt_cond(rt_eq(w_output, rt_s(&S13)))) {
-      w_output = ({ wv t2545 = (rt_cond(w_dotWvt) ? std_slice(w_input, rt_i(0), rt_i(-4)) : w_input); wv t2546 = rt_cat(2, (wv[]){ rt_s(&S129), rt_text(w_target) }); rt_add(t2545, t2546); });
+      w_output = ({ wv t2550 = (rt_cond(w_dotWvt) ? std_slice(w_input, rt_i(0), rt_i(-4)) : w_input); wv t2551 = rt_cat(2, (wv[]){ rt_s(&S129), rt_text(w_target) }); rt_add(t2550, t2551); });
     }
-    wv t2547 = std_writeFile(w_output, w_code);
+    wv t2552 = std_writeFile(w_output, w_code);
     if (rt_failcode) {
       rt_failcode = 0;
       {
-        (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S693), rt_text(w_output) }));
+        (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S698), rt_text(w_output) }));
         rt_exit(rt_i(2));
-        t2547 = RT_NULL;
+        t2552 = RT_NULL;
       }
     }
-    (void)t2547;
+    (void)t2552;
     rt_exit(rt_i(0));
   }
-  w_dotExe = rt_b(rt_bool(rt_ge(std_length(w_output), rt_i(4)), "&&") && rt_bool(rt_eq(rt_chk(w1_toLower(({ wv t2548 = w_output; wv t2549 = std_length(w_output); std_slice(t2548, rt_i(-4), t2549); })), NULL), rt_s(&S689)), "&&"));
-  w_cFile = rt_add((rt_cond(w_dotExe) ? std_slice(w_output, rt_i(0), rt_i(-4)) : w_output), rt_s(&S694));
-  wv t2550 = std_writeFile(w_cFile, w_code);
+  w_dotExe = rt_b(rt_bool(rt_ge(std_length(w_output), rt_i(4)), "&&") && rt_bool(rt_eq(rt_chk(w1_toLower(({ wv t2553 = w_output; wv t2554 = std_length(w_output); std_slice(t2553, rt_i(-4), t2554); })), NULL), rt_s(&S694)), "&&"));
+  w_cFile = rt_add((rt_cond(w_dotExe) ? std_slice(w_output, rt_i(0), rt_i(-4)) : w_output), rt_s(&S699));
+  wv t2555 = std_writeFile(w_cFile, w_code);
   if (rt_failcode) {
     rt_failcode = 0;
     {
-      (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S693), rt_text(w_cFile) }));
+      (void)std_eprint(rt_cat(2, (wv[]){ rt_s(&S698), rt_text(w_cFile) }));
       rt_exit(rt_i(2));
-      t2550 = RT_NULL;
+      t2555 = RT_NULL;
     }
   }
-  (void)t2550;
+  (void)t2555;
   w_parts = rt_bind(std_split(std_join(std_split(w_cc, rt_s(&S19)), rt_s(&S87)), rt_s(&S87)), 0);
   w_ccName = rt_bind(rt_chk(w1_toLower(rt_idx(rt_i(-1), w_parts)), NULL), 0);
-  w_flags = rt_arr(4, (wv[]){ rt_s(&S695), rt_s(&S677), w_output, w_cFile }, 0);
-  wv t2551 = (rt_cond(rt_b(rt_bool(rt_eq(w_ccName, rt_s(&S686)), "||") || rt_bool(rt_eq(w_ccName, rt_s(&S696)), "||"))) ? rt_arr(5, (wv[]){ rt_s(&S697), rt_s(&S695), rt_s(&S677), w_output, w_cFile }, 0) : w_flags);
-  wv t2552 = std_run(w_cc, t2551);
+  w_flags = rt_arr(4, (wv[]){ rt_s(&S700), rt_s(&S682), w_output, w_cFile }, 0);
+  wv t2556 = (rt_cond(rt_b(rt_bool(rt_eq(w_ccName, rt_s(&S691)), "||") || rt_bool(rt_eq(w_ccName, rt_s(&S701)), "||"))) ? rt_arr(5, (wv[]){ rt_s(&S702), rt_s(&S700), rt_s(&S682), w_output, w_cFile }, 0) : w_flags);
+  wv t2557 = std_run(w_cc, t2556);
   if (rt_failcode) {
     rt_failcode = 0;
     {
-      (void)std_eprint(rt_cat(3, (wv[]){ rt_s(&S698), rt_text(w_cc), rt_s(&S699) }));
+      (void)std_eprint(rt_cat(3, (wv[]){ rt_s(&S703), rt_text(w_cc), rt_s(&S704) }));
       rt_exit(rt_i(2));
-      t2552 = RT_NULL;
+      t2557 = RT_NULL;
     }
   }
-  w_status = rt_bind(t2552, 0);
+  w_status = rt_bind(t2557, 0);
   if (rt_cond(rt_ne(w_status, rt_i(0)))) {
-    (void)std_eprint(({ wv t2553 = rt_text(w_cc); wv t2554 = rt_text(w_status); rt_cat(4, (wv[]){ rt_s(&S687), t2553, rt_s(&S700), t2554 }); }));
+    (void)std_eprint(({ wv t2558 = rt_text(w_cc); wv t2559 = rt_text(w_status); rt_cat(4, (wv[]){ rt_s(&S692), t2558, rt_s(&S705), t2559 }); }));
     rt_exit(rt_i(2));
   }
   rt_exit(rt_i(0));

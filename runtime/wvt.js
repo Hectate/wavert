@@ -454,6 +454,146 @@ const $rt = (function () {
     }
   }
 
+  // ---- the terminal and keys (§12.2) ----
+  // The first $readKey on a terminal turns on raw mode, which also turns off
+  // Ctrl+C's signal: the runtime ends the program itself when it reads U+0003.
+
+  let keyStarted = false, keyTty = false, keyOn = false;
+  function keyApply(on) {
+    if (!keyOn) return;
+    try { process.stdin.setRawMode(on); } catch { /* the terminal has gone */ }
+  }
+  function keyStart() {
+    if (keyStarted) return;
+    keyStarted = true;
+    if (host.readLine) return;
+    keyTty = !!process.stdin.isTTY;
+    if (!keyTty) return;
+    keyOn = true;
+    process.on('exit', () => keyApply(false));
+  }
+
+  // A synchronous pause, for a non-blocking terminal with nothing to read yet.
+  const pauseCell = new Int32Array(new SharedArrayBuffer(4));
+  const pause = (ms) => Atomics.wait(pauseCell, 0, 0, ms);
+
+  // Reads more of stdin into inBuf; false at the end of input. wait is false to
+  // use only what has been read already.
+  function fillKeys(wait) {
+    if (inEnd) {
+      if (decoder) {
+        inBuf += decoder.decode();
+        decoder = null;
+        return true;
+      }
+      return false;
+    }
+    if (!wait) return false;
+    decoder ??= new TextDecoder('utf-8', { ignoreBOM: true });
+    const chunk = Buffer.alloc(65536);
+    for (;;) {
+      let n = 0;
+      try {
+        n = fs().readSync(0, chunk, 0, chunk.length, null);
+      } catch (e) {
+        if (e.code === 'EAGAIN') { pause(10); continue; }
+        if (e.code !== 'EOF') throw e;
+      }
+      if (n === 0) inEnd = true;
+      else inBuf += decoder.decode(chunk.subarray(0, n), { stream: true });
+      return true;
+    }
+  }
+  // The code point at UTF-16 offset i of inBuf, reading more if wait; -1 if none.
+  function keyCp(i, wait) {
+    while (inBuf.length <= i) if (!fillKeys(wait)) return -1;
+    return inBuf.codePointAt(i);
+  }
+  const cpLen = (c) => (c > 0xffff ? 2 : 1);
+  // A code point that types a character: not a control character.
+  const isChar = (c) => c >= 0x20 && !(c >= 0x7f && c <= 0x9f);
+  const keyFs = ['f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12'];
+
+  // Ctrl with a letter, c from 1 (Ctrl+A) to 26; null if it is discarded.
+  function ctrlKey(c) {
+    if (c === 3 || c === 26) return null;
+    if (c === 8) return 'backspace';
+    if (c === 9) return 'tab';
+    if (c === 10 || c === 13) return 'enter';
+    return 'ctrl+' + String.fromCharCode(0x60 + c);
+  }
+  // The key named by ESC [ params final, with no intermediate bytes; null if none.
+  function csiKey(params, final) {
+    const first = params.split(';')[0];
+    if (!/^\d*$/.test(first)) return null;
+    const num = first === '' ? -1 : Number(first);
+    if (final === '~') {
+      const names = { 1: 'home', 7: 'home', 2: 'insert', 3: 'delete', 4: 'end', 8: 'end', 5: 'pageup', 6: 'pagedown', 23: 'f11', 24: 'f12' };
+      if (names[num]) return names[num];
+      if (num >= 11 && num <= 15) return keyFs[num - 11];
+      if (num >= 17 && num <= 21) return keyFs[num - 12];
+      return null;
+    }
+    if (num !== -1 && num !== 1) return null;
+    return { A: 'up', B: 'down', C: 'right', D: 'left', H: 'home', F: 'end', E: 'clear', G: 'clear', Z: 'tab' }[final] ?? null;
+  }
+  const ss3Keys = { A: 'up', B: 'down', C: 'right', D: 'left', H: 'home', F: 'end', E: 'clear', M: 'enter', P: 'f1', Q: 'f2', R: 'f3', S: 'f4' };
+
+  // A key that starts with ESC: the key, or null if it is discarded. In a
+  // terminal, the rest of an escape sequence is what arrived with the ESC.
+  function escKey(brief) {
+    const b1 = keyCp(1, brief);
+    if (b1 === 0x5b || b1 === 0x4f) { // [ or O
+      const b2 = keyCp(2, brief);
+      if (b1 === 0x4f || b2 === 0x5b) {
+        const at = b1 === 0x4f ? 2 : 3;
+        const f = b1 === 0x4f ? b2 : keyCp(3, brief);
+        if (f >= 0) {
+          inBuf = inBuf.slice(at + 1);
+          const ch = String.fromCharCode(f);
+          return (b1 === 0x4f ? ss3Keys[ch] : 'ABCDE'.includes(ch) ? keyFs[f - 0x41] : null) ?? null;
+        }
+      } else {
+        let i = 2, b = b2;
+        while (b >= 0x30 && b <= 0x3f) b = keyCp(++i, brief);
+        const params = i;
+        while (b >= 0x20 && b <= 0x2f) b = keyCp(++i, brief);
+        if (b >= 0x40 && b <= 0x7e) {
+          const name = params === i ? csiKey(inBuf.slice(2, params), String.fromCharCode(b)) : null;
+          inBuf = inBuf.slice(i + 1);
+          return name;
+        }
+      }
+    } else if (isChar(b1)) {
+      inBuf = inBuf.slice(1 + cpLen(b1));
+      return 'alt+' + String.fromCodePoint(b1);
+    }
+    inBuf = inBuf.slice(1);
+    return 'escape';
+  }
+
+  // The next key: a string, null if it was discarded, or undefined at the end of input.
+  function nextKey() {
+    const c = keyCp(0, true);
+    if (c < 0) return undefined;
+    if (c === 0x1b) return escKey(!keyTty);
+    inBuf = inBuf.slice(cpLen(c));
+    if (c === 3 && keyTty) {
+      // Ctrl+C (§12.2): end as the signal would.
+      keyApply(false);
+      if (process.platform !== 'win32') process.kill(process.pid, 'SIGINT');
+      exit(130);
+    }
+    if (c === 0x0d) {
+      // Enter in a terminal sends "\r" alone, so only redirected input waits for a "\n".
+      if (keyCp(0, !keyTty) === 0x0a) inBuf = inBuf.slice(1);
+      return 'enter';
+    }
+    if (c === 0x7f) return 'backspace';
+    if (c >= 1 && c <= 26) return ctrlKey(c);
+    return isChar(c) ? String.fromCodePoint(c) : null;
+  }
+
   // ---- code points (§9.1) ----
   // cpView returns null when every UTF-16 unit is a code point, else an array of
   // code points. Long strings are cached so loops over $at stay O(1) per call.
@@ -489,9 +629,20 @@ const $rt = (function () {
   std.write = (v) => { write(1, text(v)); return null; };
   std.eprint = (v) => { write(2, text(v) + '\n'); return null; };
   std.readLine = () => {
+    keyApply(false);
     const line = readLine();
+    keyApply(true);
     if (line === null) throw stdFail('$readLine');
     return line;
+  };
+  std.readKey = () => {
+    keyStart();
+    keyApply(true);
+    for (;;) {
+      const key = nextKey();
+      if (key === undefined) throw stdFail('$readKey');
+      if (key !== null) return key;
+    }
   };
 
   std.readFile = (p) => {
@@ -547,8 +698,10 @@ const $rt = (function () {
       if (typeof a !== 'string') fail(`type error: $run expects an array of strings, got an element of type ${typeName(a)}`);
     }
     if (host.run) return host.run(program, args.slice());
+    keyApply(false);
     const r = process.getBuiltinModule('node:child_process')
       .spawnSync(program, args, { stdio: 'inherit', shell: false, windowsHide: true });
+    keyApply(true);
     if (r.error) throw stdFail('$run');
     if (r.status !== null) return r.status;
     return 128 + (process.getBuiltinModule('node:os').constants.signals[r.signal] ?? 0);
@@ -670,6 +823,77 @@ const $rt = (function () {
   std.fields = (r) => {
     if (!isRec(r)) fail(`type error: $fields expects a record, got ${typeName(r)}`);
     return Object.freeze(Object.keys(r).map((k) => k.slice(2)));
+  };
+
+  // ---- time and random numbers (§12.8) ----
+
+  std.time = () => Date.now();
+
+  // A generator is a mutable record { s0, s1, s2, s3 } of 32-bit words.
+  const RNG_KEYS = ['f_s0', 'f_s1', 'f_s2', 'f_s3'];
+  // MurmurHash3's finalizer.
+  function rngMix(z) {
+    z = (z ^ (z >>> 16)) >>> 0;
+    z = Math.imul(z, 0x85ebca6b) >>> 0;
+    z = (z ^ (z >>> 13)) >>> 0;
+    z = Math.imul(z, 0xc2b2ae35) >>> 0;
+    return (z ^ (z >>> 16)) >>> 0;
+  }
+  const rotl32 = (x, k) => ((x << k) | (x >>> (32 - k))) >>> 0;
+  std.newRandom = (seed) => {
+    anInt(seed, '$newRandom');
+    const a = Math.abs(seed);
+    const lo = a % 2 ** 32, hi = Math.floor(a / 2 ** 32) + (seed < 0 ? 2 ** 21 : 0);
+    const k = rngMix(hi);
+    const r = Object.create(null);
+    let c = lo;
+    for (const key of RNG_KEYS) {
+      c = (c + 0x9e3779b9) >>> 0;
+      r[key] = (rngMix(c) ^ k) >>> 0;
+    }
+    return rec(r, true);
+  };
+  // Panics unless rng is a mutable generator (§12.8).
+  function rngCheck(rng, fn) {
+    const ok = isRec(rng) && Object.keys(rng).length === 4
+      && RNG_KEYS.every((k) => Object.hasOwn(rng, k) && typeof rng[k] === 'number' && rng[k] >= 0 && rng[k] <= 0xffffffff)
+      && RNG_KEYS.some((k) => rng[k] !== 0);
+    if (!ok) fail(`${fn}: the argument is not a random generator`);
+    if (!SHIFTY.has(rng)) fail('random generator is frozen; hold it in a var or ref binding');
+  }
+  // The next word, by xoshiro128**.
+  function rngNext(r) {
+    let s0 = r.f_s0, s1 = r.f_s1, s2 = r.f_s2, s3 = r.f_s3;
+    const result = Math.imul(rotl32(Math.imul(s1, 5) >>> 0, 7), 9) >>> 0;
+    const t = (s1 << 9) >>> 0;
+    s2 = (s2 ^ s0) >>> 0;
+    s3 = (s3 ^ s1) >>> 0;
+    s1 = (s1 ^ s2) >>> 0;
+    s0 = (s0 ^ s3) >>> 0;
+    s2 = (s2 ^ t) >>> 0;
+    s3 = rotl32(s3, 11);
+    r.f_s0 = s0;
+    r.f_s1 = s1;
+    r.f_s2 = s2;
+    r.f_s3 = s3;
+    return result;
+  }
+  std.random = (rng, n) => {
+    rngCheck(rng, '$random');
+    anInt(n, '$random');
+    if (n < 1 || n > 2 ** 32) fail(`$random: n must be from 1 to 4294967296, got ${n}`);
+    if (n === 2 ** 32) return rngNext(rng);
+    // Rejecting the top partial range keeps every result equally likely.
+    const limit = 2 ** 32 - (2 ** 32 % n);
+    for (;;) {
+      const x = rngNext(rng);
+      if (x < limit) return x % n;
+    }
+  };
+  std.randomFloat = (rng) => {
+    rngCheck(rng, '$randomFloat');
+    const a = rngNext(rng) >>> 5, b = rngNext(rng) >>> 6;
+    return new F((a * 2 ** 26 + b) / 2 ** 53);
   };
 
   return {

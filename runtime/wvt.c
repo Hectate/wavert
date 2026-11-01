@@ -25,10 +25,14 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <termios.h>
+#include <time.h>
 #include <unistd.h>
 extern char **environ;
 #endif
@@ -78,9 +82,10 @@ static inline double nv(wv x) { return x.tag == T_INT ? (double)x.i : x.f; }
 
 static char *ar_p, *ar_end;
 static void rt_flush(void);
+static void term_restore(void);
 static void *xmalloc(size_t n) {
   void *p = malloc(n ? n : 1);
-  if (!p) { rt_flush(); fputs("out of memory\n", stderr); exit(1); } // output written before the failure still appears
+  if (!p) { rt_flush(); term_restore(); fputs("out of memory\n", stderr); exit(1); } // output written before the failure still appears
   return p;
 }
 static void *rt_alloc(size_t n) {
@@ -328,7 +333,7 @@ static void write_raw(int fd, const char *p, size_t n) {
     DWORD done;
     if (!WriteFile(h, p, n > 0x40000000 ? 0x40000000 : (DWORD)n, &done, NULL)) {
       DWORD e = GetLastError();
-      if (e == ERROR_NO_DATA || e == ERROR_BROKEN_PIPE) ExitProcess(BROKEN_PIPE);
+      if (e == ERROR_NO_DATA || e == ERROR_BROKEN_PIPE) { term_restore(); ExitProcess(BROKEN_PIPE); }
       return;
     }
     p += done;
@@ -342,7 +347,7 @@ static void write_raw(int fd, const char *p, size_t n) {
     ssize_t k = write(fd, p, n);
     if (k < 0) {
       if (errno == EINTR || errno == EAGAIN) continue;
-      if (errno == EPIPE) _exit(BROKEN_PIPE);
+      if (errno == EPIPE) { term_restore(); _exit(BROKEN_PIPE); }
       return;
     }
     p += k;
@@ -1160,6 +1165,7 @@ static _Noreturn void rt_panic(wv v) {
 
 static void rt_exit_code(int64_t code) {
   rt_flush();
+  term_restore();
 #ifdef _WIN32
   ExitProcess((UINT)code);
 #else
@@ -1310,9 +1316,389 @@ static wv print_to(int fd, wv v, int nl) {
 static wv std_print(wv v) { return print_to(1, v, 1); }
 static wv std_write(wv v) { return print_to(1, v, 0); }
 static wv std_eprint(wv v) { return print_to(2, v, 1); }
+
+// ---- the terminal and keys (§12.2) ----
+// The first $readKey on a terminal turns on key mode: no echo and no line
+// buffering. $readLine and $run turn it off while they run, and term_restore
+// turns it off however the program ends. On Windows, console output also gets
+// virtual terminal processing from startup, so escape sequences work.
+
+#ifdef _WIN32
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
+#define ENABLE_VIRTUAL_TERMINAL_INPUT 0x0200
+#endif
+static HANDLE key_in, vt_out[2];
+static DWORD key_saved, vt_saved[2];
+#else
+static struct termios key_saved;
+#endif
+static int key_started, key_tty, key_on, key_applied; // key_on: key mode is in use
+
+static void key_apply(int on) {
+  if (!key_on || key_applied == on) return;
+#ifdef _WIN32
+  DWORD raw = (key_saved & ~(DWORD)(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT)) | ENABLE_PROCESSED_INPUT;
+  SetConsoleMode(key_in, on ? raw : key_saved);
+#else
+  struct termios t = key_saved;
+  if (on) {
+    t.c_lflag &= ~(ECHO | ICANON | IEXTEN);
+    t.c_iflag &= ~(IXON | ICRNL);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+  }
+  tcsetattr(0, TCSANOW, &t);
+#endif
+  key_applied = on;
+}
+
+static void term_restore(void) {
+  key_apply(0);
+#ifdef _WIN32
+  for (int i = 1; i >= 0; i--) if (vt_out[i]) SetConsoleMode(vt_out[i], vt_saved[i]);
+#endif
+}
+
+#ifdef _WIN32
+static void vt_start(void) {
+  DWORD ids[2] = { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }, mode;
+  for (int i = 0; i < 2; i++) {
+    HANDLE h = GetStdHandle(ids[i]);
+    if (!GetConsoleMode(h, &mode)) continue;
+    vt_out[i] = h;
+    vt_saved[i] = mode;
+    SetConsoleMode(h, mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+  }
+}
+// Ctrl+C ends the program with 130 (§12.2); the console calls this on its own thread.
+static BOOL WINAPI key_ctrl(DWORD type) {
+  term_restore();
+  if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) ExitProcess(130);
+  return FALSE;
+}
+#else
+// A signal that ends the program: restore the terminal, then take the default action.
+static void key_signal(int sig) {
+  term_restore();
+  signal(sig, SIG_DFL);
+  raise(sig); // delivered when the handler returns
+}
+// Ctrl+Z: restore the terminal, stop, and turn key mode back on when resumed.
+static void key_stop(int sig) {
+  int was = key_applied;
+  term_restore();
+  signal(SIGTSTP, SIG_DFL);
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGTSTP);
+  pthread_sigmask(SIG_UNBLOCK, &s, NULL);
+  raise(SIGTSTP);
+  signal(SIGTSTP, key_stop);
+  if (was) key_apply(1);
+}
+static void key_catch(int sig, void (*handler)(int)) {
+  if (signal(sig, handler) == SIG_IGN) signal(sig, SIG_IGN); // a signal the parent ignored stays ignored
+}
+#endif
+
+static void key_start(void) {
+  if (key_started) return;
+  key_started = 1;
+#ifdef _WIN32
+  key_in = GetStdHandle(STD_INPUT_HANDLE);
+  key_tty = GetConsoleMode(key_in, &key_saved) != 0;
+  if (!key_tty) return;
+  SetConsoleCtrlHandler(key_ctrl, TRUE);
+#else
+  key_tty = isatty(0) && tcgetattr(0, &key_saved) == 0;
+  if (!key_tty) return;
+  int ends[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGPIPE };
+  for (int i = 0; i < 5; i++) key_catch(ends[i], key_signal);
+  key_catch(SIGTSTP, key_stop);
+#endif
+  key_on = 1;
+}
+
 static wv std_readLine(void) {
+  key_apply(0);
   wv line;
-  return read_line(&line) ? line : rt_std_fail("$readLine");
+  int ok = read_line(&line);
+  key_apply(1);
+  return ok ? line : rt_std_fail("$readLine");
+}
+
+// How long to wait for the bytes of a key: until they come, at most 50 ms in a
+// terminal, or not at all (only bytes already read).
+enum { K_WAIT, K_BRIEF, K_HAVE };
+
+// Byte i after in_pos, or -1 if it does not come.
+static int key_byte(size_t i, int mode) {
+  while (in_n - in_pos <= i) {
+    if (in_end || mode == K_HAVE) return -1;
+#ifndef _WIN32
+    if (mode == K_BRIEF && key_tty) {
+      struct pollfd p = { .fd = 0, .events = POLLIN };
+      if (poll(&p, 1, 50) <= 0) return -1;
+    }
+#endif
+    if (!read_more()) { in_end = 1; return -1; }
+  }
+  return (unsigned char)in_buf[in_pos + i];
+}
+
+// The code point that starts at byte i after in_pos, decoded by the
+// maximal-subpart rule (§12.1); *len is set to its length in bytes. -1 if there
+// is no byte at i. The rest of a character comes with its first byte, so mode
+// only decides whether to wait for the first.
+static int64_t key_cp(size_t i, int mode, int *len) {
+  int b = key_byte(i, mode);
+  if (b < 0) return -1;
+  *len = 1;
+  if (b < 0x80) return b;
+  int need = b >= 0xC2 && b <= 0xDF ? 1 : b >= 0xE0 && b <= 0xEF ? 2 : b >= 0xF0 && b <= 0xF4 ? 3 : 0;
+  if (!need) return 0xFFFD;
+  uint32_t cp = b & (need == 1 ? 0x1F : need == 2 ? 0x0F : 0x07);
+  int lo = b == 0xE0 ? 0xA0 : b == 0xF0 ? 0x90 : 0x80, hi = b == 0xED ? 0x9F : b == 0xF4 ? 0x8F : 0xBF;
+  for (int k = 1; k <= need; k++) {
+    int c = key_byte(i + k, mode == K_HAVE ? K_HAVE : K_WAIT);
+    if (c < lo || c > hi) return 0xFFFD;
+    cp = (cp << 6) | (c & 0x3F);
+    lo = 0x80;
+    hi = 0xBF;
+    *len = k + 1;
+  }
+  return cp;
+}
+
+// A code point that types a character: not a control character.
+static int is_char(int64_t c) { return c >= 0x20 && !(c >= 0x7F && c <= 0x9F); }
+
+static wv key_char(const char *prefix, uint32_t c) {
+  sb b = { 0 };
+  sb_puts(&b, prefix);
+  utf8_put(&b, c);
+  return sb_str(&b);
+}
+
+// Ctrl with a letter, c from 1 (Ctrl+A) to 26; 0 if it is discarded.
+static int ctrl_key(int c, wv *out) {
+  if (c == 3 || c == 26) return 0; // Ctrl+C and Ctrl+Z are signals, never keys
+  const char *name = c == 8 ? "backspace" : c == 9 ? "tab" : c == 10 || c == 13 ? "enter" : NULL;
+  *out = name ? rt_cstr(name) : key_char("ctrl+", 'a' + c - 1);
+  return 1;
+}
+
+static const char *const key_fs[] = { "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12" };
+
+// The key named by ESC [ params final, with no intermediate bytes; NULL if none.
+static const char *csi_key(const char *p, size_t n, int final) {
+  int num = -1; // the first parameter; -1 if it is empty
+  for (size_t k = 0; k < n && p[k] != ';'; k++) {
+    if (p[k] < '0' || p[k] > '9' || num > 1000) return NULL;
+    num = (num < 0 ? 0 : num * 10) + (p[k] - '0');
+  }
+  if (final == '~') {
+    switch (num) {
+      case 1: case 7: return "home";
+      case 2: return "insert";
+      case 3: return "delete";
+      case 4: case 8: return "end";
+      case 5: return "pageup";
+      case 6: return "pagedown";
+      case 23: return "f11";
+      case 24: return "f12";
+    }
+    if (num >= 11 && num <= 15) return key_fs[num - 11];
+    if (num >= 17 && num <= 21) return key_fs[num - 12];
+    return NULL;
+  }
+  if (num != -1 && num != 1) return NULL;
+  switch (final) {
+    case 'A': return "up";
+    case 'B': return "down";
+    case 'C': return "right";
+    case 'D': return "left";
+    case 'H': return "home";
+    case 'F': return "end";
+    case 'E': case 'G': return "clear";
+    case 'Z': return "tab";
+  }
+  return NULL;
+}
+// The key named by ESC O final.
+static const char *ss3_key(int final) {
+  switch (final) {
+    case 'A': return "up";
+    case 'B': return "down";
+    case 'C': return "right";
+    case 'D': return "left";
+    case 'H': return "home";
+    case 'F': return "end";
+    case 'E': return "clear";
+    case 'M': return "enter";
+    case 'P': return "f1";
+    case 'Q': return "f2";
+    case 'R': return "f3";
+    case 'S': return "f4";
+  }
+  return NULL;
+}
+
+// A key that starts with ESC: 1 with *out set, or 0 if it is discarded.
+static int esc_key(wv *out, int brief) {
+  int b1 = key_byte(1, brief);
+  if (b1 == '[' || b1 == 'O') {
+    int b2 = key_byte(2, brief);
+    if (b1 == 'O' || b2 == '[') {
+      // ESC O x, or the Linux console's ESC [[ x for F1 to F5
+      size_t at = b1 == 'O' ? 2 : 3;
+      int f = b1 == 'O' ? b2 : key_byte(3, brief);
+      if (f >= 0) {
+        in_pos += at + 1;
+        const char *name = b1 == 'O' ? ss3_key(f) : f >= 'A' && f <= 'E' ? key_fs[f - 'A'] : NULL;
+        if (!name) return 0;
+        *out = rt_cstr(name);
+        return 1;
+      }
+    } else {
+      // ESC [ parameter bytes, intermediate bytes, final byte
+      size_t i = 2, params;
+      int b = b2;
+      while (b >= 0x30 && b <= 0x3F) b = key_byte(++i, brief);
+      params = i;
+      while (b >= 0x20 && b <= 0x2F) b = key_byte(++i, brief);
+      if (b >= 0x40 && b <= 0x7E) {
+        const char *name = params == i ? csi_key(in_buf + in_pos + 2, params - 2, b) : NULL;
+        in_pos += i + 1;
+        if (!name) return 0;
+        *out = rt_cstr(name);
+        return 1;
+      }
+    }
+  } else if (b1 >= 0) {
+    int len;
+    int64_t c = key_cp(1, brief, &len);
+    if (is_char(c)) {
+      in_pos += 1 + len;
+      *out = key_char("alt+", (uint32_t)c);
+      return 1;
+    }
+  }
+  // Anything else: Escape, and what follows is read as the next keys.
+  in_pos += 1;
+  *out = rt_cstr("escape");
+  return 1;
+}
+
+// The next key from the bytes of stdin: 1 with *out set, 0 if it was
+// discarded, -1 at the end of input. wait is for a key's first byte, brief for
+// the rest of an escape sequence, and crlf for a "\n" after "\r".
+static int byte_key(wv *out, int wait, int brief, int crlf) {
+  int len;
+  int64_t c = key_cp(0, wait, &len);
+  if (c < 0) return -1;
+  if (c == 0x1B) return esc_key(out, brief);
+  in_pos += len;
+  if (c == '\r') {
+    if (key_byte(0, crlf) == '\n') in_pos++;
+    *out = rt_cstr("enter");
+    return 1;
+  }
+  if (c == 0x7F) { *out = rt_cstr("backspace"); return 1; }
+  if (c >= 1 && c <= 26) return ctrl_key((int)c, out);
+  if (!is_char(c)) return 0;
+  *out = key_char("", (uint32_t)c);
+  return 1;
+}
+
+#ifdef _WIN32
+// The next key from the console's key events, with the same results as byte_key.
+static wv key_repeat;
+static int key_repeats;
+static wchar_t key_high;
+static int console_key(wv *out) {
+  if (key_repeats > 0) {
+    key_repeats--;
+    *out = key_repeat;
+    return 1;
+  }
+  rt_flush();
+  INPUT_RECORD r;
+  DWORD got;
+  if (!ReadConsoleInputW(key_in, &r, 1, &got) || got == 0) return -1;
+  if (r.EventType != KEY_EVENT || !r.Event.KeyEvent.bKeyDown) return 0;
+  const KEY_EVENT_RECORD *k = &r.Event.KeyEvent;
+  int ctrl = (k->dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
+  int alt = (k->dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
+  WORD vk = k->wVirtualKeyCode;
+  uint32_t ch = k->uChar.UnicodeChar;
+  const char *name = NULL;
+  switch (vk) {
+    case VK_RETURN: name = "enter"; break;
+    case VK_TAB: name = "tab"; break;
+    case VK_BACK: name = "backspace"; break;
+    case VK_ESCAPE: name = "escape"; break;
+    case VK_UP: name = "up"; break;
+    case VK_DOWN: name = "down"; break;
+    case VK_LEFT: name = "left"; break;
+    case VK_RIGHT: name = "right"; break;
+    case VK_HOME: name = "home"; break;
+    case VK_END: name = "end"; break;
+    case VK_PRIOR: name = "pageup"; break;
+    case VK_NEXT: name = "pagedown"; break;
+    case VK_INSERT: name = "insert"; break;
+    case VK_DELETE: name = "delete"; break;
+    case VK_CLEAR: name = "clear"; break;
+  }
+  if (vk >= VK_F1 && vk <= VK_F12) name = key_fs[vk - VK_F1];
+  wv v;
+  if (name) {
+    v = rt_cstr(name);
+  } else if (ctrl && !alt && vk >= 'A' && vk <= 'Z') {
+    if (!ctrl_key(vk - 'A' + 1, &v)) return 0;
+  } else {
+    // A character outside the BMP comes as two events, one for each surrogate.
+    if (ch >= 0xD800 && ch <= 0xDBFF) { key_high = (wchar_t)ch; return 0; }
+    if (ch >= 0xDC00 && ch <= 0xDFFF) {
+      if (!key_high) return 0;
+      ch = 0x10000 + ((uint32_t)(key_high - 0xD800) << 10) + (ch - 0xDC00);
+      key_high = 0;
+    }
+    if (!is_char(ch)) return 0;
+    v = key_char(alt && !ctrl ? "alt+" : "", ch); // Ctrl+Alt is AltGr when it types a character
+  }
+  if (k->wRepeatCount > 1) {
+    key_repeat = v;
+    key_repeats = k->wRepeatCount - 1;
+  }
+  *out = v;
+  return 1;
+}
+#endif
+
+static wv std_readKey(void) {
+  key_start();
+  key_apply(1);
+  // Waiting: a terminal waits only briefly for the rest of an escape sequence,
+  // and does not wait for a "\n" after "\r", since Enter sends "\r" alone.
+  int wait = K_WAIT, brief = key_tty ? K_BRIEF : K_WAIT, crlf = key_tty ? K_HAVE : K_WAIT;
+#ifdef _WIN32
+  if (key_tty) wait = brief = crlf = K_HAVE; // only text left over from $readLine
+#endif
+  for (;;) {
+    wv k;
+    int r;
+#ifdef _WIN32
+    if (key_tty && in_pos == in_n) r = console_key(&k);
+    else
+#endif
+    r = byte_key(&k, wait, brief, crlf);
+    if (r < 0) return rt_std_fail("$readKey");
+    if (r > 0) return k;
+  }
 }
 
 // Reads a whole file; returns 0 on failure.
@@ -1554,7 +1940,7 @@ static wchar_t *find_program(const wchar_t *name) {
 #endif
 
 // Runs a program with this program's stdio and no shell; returns its exit code (§12.4).
-static wv std_run(wv program, wv args) {
+static wv run_program(wv program, wv args) {
   const wstr *prog = a_string(program, "$run");
   warr *a = an_array(args, "$run");
   for (int64_t i = 0; i < a->len; i++) {
@@ -1614,6 +2000,13 @@ static wv std_run(wv program, wv args) {
   if (WIFSIGNALED(status)) return rt_i(128 + WTERMSIG(status));
   return rt_i(WEXITSTATUS(status));
 #endif
+}
+// The program gets the terminal as it normally is (§12.2).
+static wv std_run(wv program, wv args) {
+  key_apply(0);
+  wv r = run_program(program, args);
+  key_apply(1);
+  return r;
 }
 
 static wv std_length(wv x) {
@@ -1850,6 +2243,118 @@ static wv std_fields(wv r) {
   return (wv){ .tag = T_ARR, .a = a };
 }
 
+// ---- time and random numbers (§12.8) ----
+
+static wv std_time(void) {
+#ifdef _WIN32
+  FILETIME ft;
+  GetSystemTimePreciseAsFileTime(&ft);
+  uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime; // 100 ns units since 1601
+  return rt_i((int64_t)(t / 10000) - 11644473600000LL);
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return rt_i((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+#endif
+}
+
+// A generator is a mutable record { s0, s1, s2, s3 } of 32-bit words. Its keys
+// are the program's own keys for those names, if it has them, so that rng.s0
+// and { s0: ... } work as for any record.
+static const wstr *rng_keys[4];
+static void rng_start(void) {
+  if (rng_keys[0]) return;
+  static const char *names[4] = { "s0", "s1", "s2", "s3" };
+  for (int i = 0; i < 4; i++) {
+    wstr probe = { 2, 2, 1, 0, names[i] };
+    const wstr *k = sym_find(&probe);
+    if (!k) {
+      wstr *s = (wstr *)str_new(names[i], 2);
+      s->sym = 1;
+      sym_add(s);
+      k = s;
+    }
+    rng_keys[i] = k;
+  }
+}
+
+// MurmurHash3's finalizer.
+static uint32_t rng_mix(uint32_t z) {
+  z ^= z >> 16;
+  z *= 0x85EBCA6Bu;
+  z ^= z >> 13;
+  z *= 0xC2B2AE35u;
+  z ^= z >> 16;
+  return z;
+}
+static inline uint32_t rotl32(uint32_t x, int k) { return (x << k) | (x >> (32 - k)); }
+
+static wv std_newRandom(wv seed) {
+  int64_t v = an_int(seed, "$newRandom");
+  uint64_t a = v < 0 ? (uint64_t)-v : (uint64_t)v;
+  uint32_t lo = (uint32_t)a, hi = (uint32_t)(a >> 32) | (v < 0 ? 1u << 21 : 0);
+  uint32_t k = rng_mix(hi), c = lo;
+  wv vals[4];
+  for (int i = 0; i < 4; i++) {
+    c += 0x9E3779B9u;
+    vals[i] = rt_i(rng_mix(c) ^ k);
+  }
+  rng_start();
+  return rt_rec(1, 4, rng_keys, vals);
+}
+
+// The four state words of a generator, in s0..s3 order; panics unless rng is one.
+static void rng_words(wv rng, const char *fn, wv **s) {
+  rng_start();
+  int ok = rng.tag == T_REC && rng.r->n == 4;
+  int64_t any = 0;
+  for (int i = 0; ok && i < 4; i++) {
+    s[i] = NULL;
+    for (int j = 0; j < 4; j++) if (rng.r->keys[j] == rng_keys[i]) s[i] = &rng.r->vals[j];
+    ok = s[i] && s[i]->tag == T_INT && s[i]->i >= 0 && s[i]->i <= 0xFFFFFFFFLL;
+    if (ok) any |= s[i]->i;
+  }
+  if (!ok || !any) rt_fail("%s: the argument is not a random generator", fn);
+  if (!rng.r->is_mut) rt_fail("random generator is frozen; hold it in a var or ref binding");
+}
+
+// The next word, by xoshiro128**.
+static uint32_t rng_next(wv **s) {
+  uint32_t s0 = (uint32_t)s[0]->i, s1 = (uint32_t)s[1]->i, s2 = (uint32_t)s[2]->i, s3 = (uint32_t)s[3]->i;
+  uint32_t result = rotl32(s1 * 5, 7) * 9, t = s1 << 9;
+  s2 ^= s0;
+  s3 ^= s1;
+  s1 ^= s2;
+  s0 ^= s3;
+  s2 ^= t;
+  s3 = rotl32(s3, 11);
+  *s[0] = rt_i(s0);
+  *s[1] = rt_i(s1);
+  *s[2] = rt_i(s2);
+  *s[3] = rt_i(s3);
+  return result;
+}
+
+static wv std_random(wv rng, wv n) {
+  wv *s[4];
+  rng_words(rng, "$random", s);
+  int64_t m = an_int(n, "$random");
+  if (m < 1 || m > 0x100000000LL) rt_fail("$random: n must be from 1 to 4294967296, got %lld", (long long)m);
+  if (m == 0x100000000LL) return rt_i(rng_next(s));
+  // Rejecting the top partial range keeps every result equally likely.
+  uint64_t limit = 0x100000000ULL - 0x100000000ULL % (uint64_t)m;
+  for (;;) {
+    uint32_t x = rng_next(s);
+    if (x < limit) return rt_i(x % (uint64_t)m);
+  }
+}
+static wv std_randomFloat(wv rng) {
+  wv *s[4];
+  rng_words(rng, "$randomFloat", s);
+  uint32_t a = rng_next(s) >> 5, b = rng_next(s) >> 6;
+  return rt_f(((double)a * 67108864.0 + b) / 9007199254740992.0); // (a * 2^26 + b) / 2^53, exactly
+}
+
 // ---- startup ----
 
 // The compiled program: library initialization, then the entry file's body.
@@ -1878,6 +2383,7 @@ int main(int argc, char **argv) {
   size_t stack = (size_t)1 << 30;
 #ifdef _WIN32
   SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+  vt_start();
   HANDLE t = CreateThread(NULL, stack, rt_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
   if (!t) { rt_thread(NULL); return 0; }
   WaitForSingleObject(t, INFINITE);

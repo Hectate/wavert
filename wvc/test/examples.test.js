@@ -9,6 +9,11 @@ import { exe, examples, noZig, root, runtimeC, runtimeJs, tempDir, wvc, zigBuild
 const skip = noZig;
 const lines = (...xs) => xs.map((x) => x + '\n').join('');
 
+// One turn of examples/walk.wvt: clear the screen, then the room (whose middle
+// two rows change), the gold and the message.
+const frame = (rows, gold, message) =>
+  '\x1b[2J\x1b[H' + lines('#########', ...rows, '#.......#', '#########', `gold: ${gold}`, message);
+
 const fizzbuzz = [];
 for (let i = 1; i <= 100; i++) fizzbuzz.push(i % 15 === 0 ? 'FizzBuzz' : i % 3 === 0 ? 'Fizz' : i % 5 === 0 ? 'Buzz' : String(i));
 
@@ -37,6 +42,17 @@ const expected = {
   },
   'examples/refs.wvt': {
     out: lines('total: 10', '4 -> 3 -> 2 -> 1', 'ref keeps it: true, var copies it: false', 'through the alias: 3'),
+  },
+  'examples/walk.wvt': {
+    input: 'h\x1b[Ahkxq',
+    out: [
+      frame(['#.$...$.#', '#..$@...#'], 0, ''),
+      frame(['#.$...$.#', '#..@....#'], 7, 'found 7 gold'),
+      frame(['#.$@..$.#', '#.......#'], 7, ''),
+      frame(['#.@...$.#', '#.......#'], 16, 'found 9 gold'),
+      frame(['#.@...$.#', '#.......#'], 16, 'bump'),
+      frame(['#.@...$.#', '#.......#'], 16, 'x does nothing'),
+    ].join('') + lines('Goodbye, with 16 gold.'),
   },
   'examples/tokenize.wvt': {
     args: [join(root, 'examples/hello.wvt')],

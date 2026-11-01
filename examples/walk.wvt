@@ -1,0 +1,96 @@
+// walk: move around a room with the keyboard, picking up gold.
+//
+// Reads keys with $readKey, and places the gold with a random generator. The
+// generator has a fixed seed, so the room is the same every time; start it
+// with ($time)($newRandom) for a different room each run. The room is a flat
+// array, read and written through getCell and setCell. Each turn clears the
+// screen with an ANSI escape sequence and draws the room again.
+//
+// Arrow keys or h, j, k, l move; q or Escape quits.
+//
+// Usage: wvc build examples/walk.wvt, then run it in a terminal.
+
+;const width is 9
+;const height is 5
+;var cells is []     // row by row: "#" a wall, "." floor, "$" gold
+;var rng is 42($newRandom)
+;var px is 4
+;var py is 2
+;var gold is 0
+;var message is ""   // what happened this turn, shown under the room
+
+;fn getCell(x, y) { cells[y * width + x] }
+;fn setCell(x, y, c) { ;set cells[y * width + x] to c }
+
+// Clears the screen and moves the cursor to the top left, then draws.
+;fn draw() {
+    ;"\u{1B}[2J\u{1B}[H"($write)
+    ;var y is 0
+    ;while (y < height) {
+        ;var line is []
+        ;var x is 0
+        ;while (x < width) {
+            ;(line, x == px && y == py ? "@" : (x, y)(getCell))($push)
+            ;set x += 1
+        }
+        ;(line, "")($join)($print)
+        ;set y += 1
+    }
+    ;"gold: {gold}"($print)
+    ;message($print)
+}
+
+;fn move(dx, dy) {
+    ;const cell is (px + dx, py + dy)(getCell)
+    ;if (cell == "#") {
+        ;set message to "bump"
+        ;return
+    }
+    ;set px += dx
+    ;set py += dy
+    ;if (cell == "$") {
+        ;const found is (rng, 10)($random) + 1
+        ;set gold += found
+        ;(px, py, ".")(setCell)
+        ;set message to "found {found} gold"
+    }
+}
+
+// ---- The room ----
+// Walls around the edge, and three piles of gold on empty floor.
+;var i is 0
+;while (i < width * height) {
+    ;const col is i % width
+    ;const row is (i / width)($floor)
+    ;(cells, col == 0 || row == 0 || col == width - 1 || row == height - 1 ? "#" : ".")($push)
+    ;set i += 1
+}
+;var piles is 0
+;while (piles < 3) {
+    ;const gx is (rng, width - 2)($random) + 1
+    ;const gy is (rng, height - 2)($random) + 1
+    ;if ((gx, gy)(getCell) == "." && !(gx == px && gy == py)) {
+        ;(gx, gy, "$")(setCell)
+        ;set piles += 1
+    }
+}
+
+// ---- Playing ----
+;var playing is true
+;while (playing) {
+    ;(draw)
+    ;set message to ""
+    // The end of input quits too.
+    ;const key is ($readKey)
+        onfail { "q" }
+    ;match (key) {
+        case "a", "left" { ;(-1, 0)(move) }
+        case "d", "right" { ;(1, 0)(move) }
+        case "w", "up" { ;(0, -1)(move) }
+        case "s", "down" { ;(0, 1)(move) }
+        case "q", "escape" { ;set playing to false }
+        else { ;set message to "{key} does nothing" }
+    }
+}
+;"Goodbye, with {gold} gold."($print)
+;exit

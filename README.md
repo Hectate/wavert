@@ -41,7 +41,7 @@ The language is specified in [docs/wavert-spec.md](docs/wavert-spec.md). The rea
 | [docs/](docs/) | The Wavert specification, and the design document that derived Wavert from Γ--. |
 | [wvc/](wvc/) | `wvc`, the Wavert compiler, written in Wavert, with its tests; `wvc/wvc.c` is the bootstrap seed. |
 | [runtime/](runtime/) | The runtimes that compiled programs inline: `wvt.c` for C, `wvt.js` for `--target js`. |
-| [examples/](examples/) | Hello World, echo, FizzBuzz, records, `match`, enums, modules, `ref` bindings, and a Wavert tokenizer written in Wavert. |
+| [examples/](examples/) | Hello World, echo, FizzBuzz, records, `match`, enums, modules, `ref` bindings, a Wavert tokenizer written in Wavert, and walking around a room with the keyboard. |
 | [src/](src/) | Programs, built by `build.ps1`. |
 | [build.ps1](build.ps1) | Builds every program in `src\` into `bin\` with `wvc` and Zig. |
 | [editors/vscode/](editors/vscode/) | VS Code syntax highlighting and snippets. |
