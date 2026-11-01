@@ -1,0 +1,15 @@
+// The terminal: $terminal and $terminalSize.
+//
+// $terminal tells whether stdin and stdout are terminals, or are redirected to
+// files or pipes. $terminalSize is the size of the terminal on stdout, and
+// fails when stdout is not a terminal.
+//
+// Usage: wvc build examples/terminal.wvt, then run it as terminal, and again
+// as terminal > out.txt and look in out.txt.
+
+;const t is ($terminal)
+;"input: {t.input}, output: {t.output}"($print)
+;const size is ($terminalSize)
+    onfail { ;"no size: stdout is not a terminal"($print) ;exit }
+;"{size.width} columns, {size.height} rows"($print)
+;exit

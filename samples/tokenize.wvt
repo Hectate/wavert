@@ -3,7 +3,7 @@
 // It uses the same subset of the language that the compiler is written in
 // (records and arrays, no maps).
 //
-// Usage: wvc build examples/tokenize.wvt, then: tokenize <file.wvt>
+// Usage: wvc build samples/tokenize.wvt, then: tokenize <file.wvt>
 // Prints one token per line as "<kind> <text>", then the token count.
 
 ;const keywords is ["fn", "return", "const", "var", "ref", "set", "if", "else", "while", "break",

@@ -1,0 +1,27 @@
+// Random numbers: $newRandom, $random and $randomFloat.
+//
+// A generator is a record, started from an int seed. The same seed gives the
+// same numbers on every platform, so a seeded program can be replayed. Start
+// one with ($time)($newRandom) for different numbers each run.
+//
+// Usage: wvc build examples/random.wvt
+
+;var rng is 12345($newRandom)
+
+// (rng, n)($random) is an int from 0 to n - 1. It advances rng, which must be
+// held in a var or ref binding.
+;var rolls is []
+;var i is 0
+;while (i < 5) {
+    ;(rolls, (rng, 6)($random) + 1)($push)
+    ;set i += 1
+}
+;"dice: {(rolls, " ")($join)}"($print)
+;"a float from 0.0 up to 1.0: {rng($randomFloat)}"($print)
+
+// Saving a generator is copying it; a copy gives the same numbers again.
+;const saved is rng
+;const next is (rng, 100)($random)
+;var replay is saved
+;"next: {next}, replayed: {(replay, 100)($random)}"($print)
+;exit

@@ -1,0 +1,18 @@
+// Keys: $readKey.
+//
+// ($readKey) waits for one key press, without echo and without waiting for
+// Enter, and gives it as a string: the character it types, such as "a" or "?",
+// or a name of two or more characters, such as "up", "enter" or "ctrl+s". It
+// fails at the end of input.
+//
+// Usage: wvc build examples/keys.wvt, then run it and press some keys; q quits.
+
+;"press keys; q quits"($print)
+;while (true) {
+    ;const key is ($readKey)
+        onfail { ;break }
+    ;if (key == "q") { ;break }
+    ;const kind is key($length) == 1 ? "a character" : "a named key"
+    ;"{key}: {kind}"($print)
+}
+;exit

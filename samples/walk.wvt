@@ -8,7 +8,7 @@
 //
 // Arrow keys or w, a, s, d move; q or Escape quits.
 //
-// Usage: wvc build examples/walk.wvt, then run it in a terminal.
+// Usage: wvc build samples/walk.wvt, then run it in a terminal.
 
 ;const width is 9
 ;const height is 5

@@ -1,0 +1,32 @@
+// Maps: values looked up by key.
+//
+// A map literal is [key: value, ...], and [:] is an empty map. Keys are ints,
+// strings, booleans or enum members. A map keeps its keys in the order they
+// were first added.
+//
+// Usage: wvc build examples/maps.wvt
+
+;var stock is ["apple": 3, "pear": 0]
+
+// Reading a missing key with [] panics; $get fails instead, and $has asks.
+;stock["apple"]($print)
+;const plums is (stock, "plum")($get)
+    onfail { 0 }
+;"plums: {plums}"($print)
+;(stock, "pear")($has)($print)
+
+// Setting a key adds it or changes its value; $remove takes one out.
+;set stock["plum"] to 5
+;set stock["apple"] += 1
+;(stock, "pear")($remove)
+
+// $keys and $values are arrays in the same order, so one index walks both.
+;const keys is stock($keys)
+;const counts is stock($values)
+;var i is 0
+;while (i < keys($length)) {
+    ;"{keys[i]}: {counts[i]}"($print)
+    ;set i += 1
+}
+;"{stock($length)} kinds"($print)
+;exit

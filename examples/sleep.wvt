@@ -1,0 +1,18 @@
+// Pausing: $sleep, and measuring time with $elapsed.
+//
+// ms($sleep) pauses for at least ms milliseconds. ($elapsed) is the time since
+// the program started, in milliseconds, so the difference of two readings is
+// the time between them.
+//
+// Usage: wvc build examples/sleep.wvt
+
+;const start is ($elapsed)
+;var n is 3
+;while (n > 0) {
+    ;"{n}..."($write)
+    ;300($sleep)
+    ;set n -= 1
+}
+;"go!"($print)
+;"took {($elapsed) - start} ms"($print)
+;exit

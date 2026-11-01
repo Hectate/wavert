@@ -1148,7 +1148,7 @@ A program is an **entry file** plus the **libraries** it imports, directly or in
 ;exit
 ```
 
-More examples are in [examples/](../examples/).
+More examples are in [examples/](../examples/), each showing one feature, and [samples/](../samples/) has larger programs that combine them.
 
 ---
 

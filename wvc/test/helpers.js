@@ -73,5 +73,7 @@ export function diagnostics(source, files = {}) {
   return wvc(['main.wvt', '-o', 'main.c', '--runtime', runtimeC], { cwd: dir }).err;
 }
 
-// Every example program, as repo-relative paths; libraries are in examples/modules.
-export const examples = () => readdirSync(join(root, 'examples')).filter((f) => f.endsWith('.wvt')).sort().map((f) => `examples/${f}`);
+// Every program in examples/ and samples/, as repo-relative paths, sorted;
+// libraries are in their modules/ folders.
+export const examples = () => ['examples', 'samples']
+  .flatMap((d) => readdirSync(join(root, d)).filter((f) => f.endsWith('.wvt')).map((f) => `${d}/${f}`)).sort();

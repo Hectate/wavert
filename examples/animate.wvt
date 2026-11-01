@@ -1,0 +1,27 @@
+// Animation: $waitKey, with a deadline from $elapsed.
+//
+// ms($waitKey) waits at most ms milliseconds for a key, and gives null if none
+// comes, so each null is a tick. Waiting until a deadline, rather than for a
+// fixed time, keeps the ticks steady however fast keys come.
+//
+// Usage: wvc build examples/animate.wvt, then run it, press some keys, and q
+// to quit.
+
+;const frames is ["|", "/", "-", "\\"]
+;var frame is 0
+;var last is "none"
+;var next is ($elapsed) + 100
+;while (true) {
+    ;"\r{frames[frame % 4]} last key: {last}      "($write)
+    ;const key is (next - ($elapsed))($waitKey)
+        onfail { "q" }
+    ;if (key == "q") { ;break }
+    ;if (key == null) {
+        ;set frame += 1
+        ;set next += 100
+    } else {
+        ;set last to key
+    }
+}
+;""($print)
+;exit

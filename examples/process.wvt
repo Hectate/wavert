@@ -1,0 +1,21 @@
+// The process: $args, $env, $programPath and $run.
+//
+// $args holds the program's arguments, and $env reads an environment variable.
+// $run starts another program and waits for its exit code. Here the program
+// runs itself, found through $programPath, with an argument that makes it act
+// as the child.
+//
+// Usage: wvc build examples/process.wvt, then run it, and again with the
+// variable WAVERT_NAME set.
+
+;if ($args($length) > 0 && $args[0] == "child") {
+    ;"child: given {$args($length)} arguments: {($args, ", ")($join)}"($print)
+    ;exit 3
+}
+
+;const name is "WAVERT_NAME"($env)
+    onfail { "stranger" }
+;"hello, {name}"($print)
+;const code is ($programPath, ["child", "two words"])($run)
+;"the child exited with {code}"($print)
+;exit

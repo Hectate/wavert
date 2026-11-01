@@ -1,0 +1,36 @@
+// Sorting: $sort, $sortBy and $reverse.
+//
+// Each returns a new array and leaves the original as it was. Sorting is
+// stable: items with equal keys keep their order.
+//
+// Usage: wvc build examples/sort.wvt
+
+;fn show(players) {
+    ;var parts is []
+    ;var i is 0
+    ;while (i < players($length)) {
+        ;(parts, "{players[i].name} {players[i].score}")($push)
+        ;set i += 1
+    }
+    ;(parts, ", ")($join)($print)
+}
+
+// $sort orders numbers, or strings by code point.
+;([3, 1, 2]($sort), " ")($join)($print)
+;(["pear", "apple", "fig"]($sort), " ")($join)($print)
+
+// $sortBy orders items by a field...
+;const players is [{ name: "Ada", score: 7 }, { name: "Bo", score: 9 }, { name: "Cy", score: 7 }]
+;(players, "score")($sortBy)(show)
+
+// ...or by an array of keys, one for each item. For highest first, negate the
+// scores: Ada stays before Cy. $reverse would put Cy before Ada.
+;var negated is []
+;var i is 0
+;while (i < players($length)) {
+    ;(negated, -players[i].score)($push)
+    ;set i += 1
+}
+;(players, negated)($sortBy)(show)
+;(players, "score")($sortBy)($reverse)(show)
+;exit

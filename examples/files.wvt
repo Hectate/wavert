@@ -1,0 +1,28 @@
+// Files: writing, appending, reading, listing and deleting.
+//
+// Paths are relative to the current directory. The functions that can go
+// wrong fail, so onfail can handle a missing file.
+//
+// Usage: wvc build examples/files.wvt
+
+;const path is "files-example.txt"
+;(path, "first line\n")($writeFile)
+;(path, "second line\n")($appendFile)
+;path($readFile)($write)
+
+// $listDir gives the names in a directory.
+;const names is "."($listDir)
+;var listed is false
+;var i is 0
+;while (i < names($length)) {
+    ;if (names[i] == path) { ;set listed to true }
+    ;set i += 1
+}
+;"listed: {listed}"($print)
+
+;path($deleteFile)
+;"exists: {path($fileExists)}"($print)
+;const text is path($readFile)
+    onfail { "cannot read it now" }
+;text($print)
+;exit
