@@ -44,7 +44,7 @@ const expected = {
     out: lines('total: 10', '4 -> 3 -> 2 -> 1', 'ref keeps it: true, var copies it: false', 'through the alias: 3'),
   },
   'examples/walk.wvt': {
-    input: 'h\x1b[Ahkxq',
+    input: 'a\x1b[Aawxq',
     out: [
       frame(['#.$...$.#', '#..$@...#'], 0, ''),
       frame(['#.$...$.#', '#..@....#'], 7, 'found 7 gold'),

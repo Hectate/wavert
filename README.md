@@ -22,6 +22,7 @@ The language is specified in [docs/wavert-spec.md](docs/wavert-spec.md). The rea
 | `;set i to i + 1` / `;set i += 1` / `;set xs[k] to v` / `;set rec.f to v` | assign |
 | `;x(f)` / `;(a, b)(f)` / `;(f)` | `f(x)` / `f(a, b)` / `f()`: calls are postfix and bind tightest |
 | `xs[i]`, `node.kind`, `items[i].tags[0]` | indexing and member access |
+| `["rat": 4, "bat": 2]` / `[:]` / `m["rat"]` | a map, an empty map, and a lookup |
 | `0`, `42`, `-7`, `0xFF`, `0b101`, `1.5`, `1e9` | numbers |
 | `true`, `false`, `null`, `nan`, `inf` | constants |
 | `;if (c) { } else if (d) { } else { }` / `;!if (c) { }` | if / unless |

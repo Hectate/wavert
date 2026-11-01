@@ -1,8 +1,10 @@
-# Wavert Language Specification (Draft 0.2)
+# Wavert Language Specification (Draft 0.3)
 
 > Draft 0.1 was the first Wavert specification. Wavert is derived from Γ-- ([wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). It changes Γ--'s syntax and names and keeps its semantics; [hybrid-syntax.md](hybrid-syntax.md) gives the reasons for each change. Section numbers follow the Γ-- specification, so a reference such as §10.4 means the same topic in both.
 >
 > Draft 0.2 adds key input (`$readKey`) and terminal output on Windows (§12.2), and the clock and random numbers (§12.8).
+>
+> Draft 0.3 adds maps (§10.11) and sorting (§10.6), and drops the lint on string-literal keys (§2.8), which are normal for maps.
 
 ## 1. Overview
 
@@ -121,7 +123,6 @@ So `;const end is 5`, `node.end` and `{ to: 1 }` are all valid.
 - `;;` warns: likely a habitual trailing `;` from C-style languages.
 - `${` inside a string: `Wavert interpolation is {x}, not ${x}`.
 - `$identifier` inside a string: `did you mean {identifier}?`.
-- A string-literal key in computed field access: `node["kind"]` suggests `node.kind` (§10.8).
 - An expression statement that calls nothing has no effect: `;n`, `;a + b`, `;node.kind`. Inside a block the hint says that a block's value is written without a leading `;` (§7.2).
   - A statement that contains any call, or is a conditional chain or a `match`, is not affected.
 - Inside a block, a `[` at the start of a line that indexes the expression before it (§7.2).
@@ -172,6 +173,7 @@ primary     = number | string | "true" | "false" | "null" | "nan" | "inf"
             | "(" expr ")"
             | "(" expr "," expr { "," expr } ")" call      (* a call with several arguments *)
             | "[" [ expr { "," expr } ] "]"
+            | "[" ":" "]" | "[" expr ":" expr { "," expr ":" expr } "]"   (* a map, §10.11 *)
             | "{" [ ident ":" expr { "," ident ":" expr } ] "}"
             | chain | match ;
 chain       = ( "if" | "!if" ) "(" expr ")" block
@@ -200,6 +202,7 @@ Notes on the grammar:
 | string | `"string"` | Immutable sequence of Unicode code points (§9). |
 | array | `"array"` | Heterogeneous, reference semantics (§10). |
 | record | `"record"` | Fixed set of named fields, reference semantics (§10.7). |
+| map | `"map"` | Keys and their values, in insertion order, reference semantics (§10.11). |
 | null | `"null"` | `null` equals only itself. `0 == null` is `false`. |
 | enum member | the enum's name | A named constant of an enumeration (§4.1). Equals only itself. |
 
@@ -482,7 +485,7 @@ Wavert has two error mechanisms: a **fail** is an expected failure that only the
 | null | `null` |
 | enum member | its name (`call`), §4.1 |
 
-Anything else (arrays, records) must be converted explicitly; interpolating one panics.
+Anything else (arrays, records, maps) must be converted explicitly; interpolating one panics.
 
 **Float text, exactly.** Every backend produces the same text:
 1. Take the **shortest** decimal digit string `d1…dk` (no trailing zeros) that converts back to exactly the same double. If several are equally short, take the one closest to the exact value.
@@ -530,7 +533,7 @@ The accepted text is exact: no surrounding whitespace, no leading `+`, and only 
 - `arr[i]` reads element `i`. Chains read left to right: `grid[i][j]`.
 - Negative indices count from the end: `arr[-1]` is the last element.
 - The valid range is `-len` to `len - 1`. Anything outside panics. An index must be an integer.
-- On a record, indexing is computed field access with a string key: `node[k]` (§10.8). The rules above apply to arrays only.
+- On a record, indexing is computed field access with a string key: `node[k]` (§10.8). On a map, it reads the value of a key: `m[k]` (§10.11). The rules above apply to arrays only.
 - Indexing a string is a type error; use `$at`.
 
 ### 10.3 Mutability
@@ -553,8 +556,8 @@ A copy happens **only when mutability changes**:
   - Passing a mutable array to a plain parameter copies it on **every** call. Hot paths should pass frozen arrays or use `var` or `ref` parameters.
 
 ### 10.5 Equality
-- `==` is reference equality for arrays and records.
-- `;(a, b)($same)` is deep structural equality; elements compare with `==`. It also recurses into records (§10.10).
+- `==` is reference equality for arrays, records and maps.
+- `;(a, b)($same)` is deep structural equality; elements compare with `==`. It also recurses into records (§10.10) and maps (§10.11).
 
 ### 10.6 Array stdlib
 ```
@@ -565,7 +568,22 @@ A copy happens **only when mutability changes**:
 ;arr($pop)                   // mutable arrays only; panics if empty
 ;(a, b)($same)
 ;(parts, ", ")($join)
+;scores($sort)               // a new frozen array, sorted
+;(monsters, "speed")($sortBy)    // records, sorted by a field
+;(monsters, dists)($sortBy)  // sorted by a parallel array of keys
+;arr($reverse)               // a new frozen array, reversed
 ```
+
+**Sorting**
+- `$sort`, `$sortBy` and `$reverse` return a new frozen array, as `$slice` does. The array they are given is not changed.
+- `;arr($sort)` sorts the elements by their own values. `;(arr, by)($sortBy)` sorts them by keys:
+  - when `by` is a string, the key of each element is its field named `by`, so every element must be a record with that field (§10.8);
+  - when `by` is an array, it holds one key for each element, in the same order. A length that differs panics: `$sortBy: there are 3 keys for 4 items`.
+- Keys are either all numbers or all strings. Anything else panics, and so does `nan`. All the keys are checked before any are compared, so the same misuse gives the same panic on every backend.
+  - Numbers sort by value: an int compared with a float is promoted (§11.2), so `1` and `1.0` are equal keys, and so are `0.0` and `-0.0`.
+  - Strings sort by code point, as `<` compares them (§9.2).
+- Sorting is ascending and **stable**: elements with equal keys keep their order. So every backend gives the same result, and sorting twice, by the second key and then the first, sorts by both.
+- For a stable descending order, sort by negated keys: `;(monsters, neg)($sortBy)`, where `neg[i]` is `-monsters[i].speed`. `$reverse` after an ascending sort is descending too, but it also reverses the order of equal elements.
 
 ### 10.7 Records
 - A record is a fixed set of named fields. Its literal sets its shape, and the shape never changes: fields cannot be added or removed.
@@ -596,8 +614,7 @@ A copy happens **only when mutability changes**:
   ```
 - **Computed access** reuses indexing: `node[k]` reads the field whose name is the value of `k`.
   - `k` must be a string, otherwise it panics. Negative indexing does not apply to records.
-  - A missing field panics. Computed keys reach only fields that already exist, for reads and writes alike; dynamic key sets need a map (§16).
-  - A string-literal key lints (§2.8): `node["kind"]` suggests `node.kind`.
+  - A missing field panics. Computed keys reach only fields that already exist, for reads and writes alike; dynamic key sets need a map (§10.11).
   - `$fields` and computed access together allow generic code over records: `;node[f]($print)` for each `f` in `node($fields)`.
 - When the left side is an enum (§4.1) or a module name (§13.1), `.` is resolved at compile time instead: `Kind.call` is an enum member, `lexer.keywords` is what the module `lexer` exports as `keywords`, and `shapes.Shape.circle` is a member of the enum `Shape` from the module `shapes`.
 - There are no methods: `.` is only member access, and calls stay postfix. `x.f(y)` parses as `y(x.f)`, a call of `y` with the field `x.f`, which is a compile error unless `y` is a function.
@@ -623,6 +640,71 @@ A copy happens **only when mutability changes**:
 - `;node($fields)` returns a frozen array of the field names, in literal order.
 - Array and string builtins (`$length`, `$at`, `$slice`, ...) panic on a record.
 
+### 10.11 Maps
+A map holds values under keys, and keys can be added and removed. A record's fields are fixed by its literal (§10.7); a map's keys are not.
+
+```
+;var monsters is [:]                           // an empty map
+;const names is [1: "rat", 2: "bat"]           // a literal
+;set monsters[id] to { name: "rat", hp: 4 }    // add a key, or replace its value
+;monsters[id].hp($print)                       // read; a missing key panics
+;const m is (monsters, id)($get)
+    onfail { null }                            // read; fails if the key is missing
+;(monsters, id)($has)                          // true or false
+;(monsters, id)($remove)                       // remove; returns the value
+;monsters($keys)                               // the keys, in insertion order
+;monsters($values)                             // the values, in the same order
+;monsters($length)
+```
+
+**Literals**
+- `[key: value, ...]` is a map literal, and `[:]` is an empty map. After `[` and its first expression, a `:` makes a map and a `,` or `]` makes an array. A ternary takes its own `:` first, so `[c ? a : b]` is an array and `[c ? a : b: v]` is a map.
+- Keys and values are full expressions, evaluated left to right.
+- A key that is a constant written twice in one literal (an int, a string without interpolation, or a boolean) is a compile error: `duplicate key in map literal`. A constant that cannot be a key, such as `1.5` or `null`, is a compile error too.
+- If two keys are equal at run time, the key keeps its first place and takes its last value.
+- Trailing commas are not allowed.
+- Map literals are frozen.
+
+**Keys**
+- A key is an int, a string, a boolean or an enum member. Any other key panics: `type error: a map key must be an int, a string, a boolean or an enum member, got float`.
+  - Floats are excluded, as they are from `match` (§7.5): float equality makes poor keys.
+  - Arrays, records, maps and `null` are excluded. Arrays and records compare by reference (§10.5), so two arrays built alike would be two different keys.
+  - For a grid position, use an int such as `y * width + x`.
+- Keys compare with `==`, so one map may hold keys of several types: `1`, `"1"` and `true` are three different keys.
+
+**Order**
+- A map keeps its keys in **insertion order**: the order in which they were first added.
+  - Setting the value of a key that is already there keeps its place.
+  - Removing a key keeps the order of the others. Adding it again puts it at the end.
+- The order is the same on every backend, so a program that goes through a map gives the same results everywhere, which matters for a program driven by a seeded random generator (§12.8).
+
+**Reading and writing**
+- `m[k]` reads the value of key `k`. A missing key panics: `no key "rat" in map`. Indexing cannot fail (§8.2), so use `$get` to supply a default.
+- `;set m[k] to v` adds `k`, or replaces its value. `;set m[k] += v` and the other compound forms need `k` to be there already; a missing key panics.
+- Writing needs a mutable map, as for arrays (§10.3): through a `const` binding it is a compile error, and through a `ref` binding it is checked at run time and panics: `cannot modify a frozen map`.
+- Maps follow the copy table (§10.4) with "map" in place of "array": a `var` binding holds a mutable map, and declaring one with a frozen map copies it. Copies are shallow.
+
+**Map stdlib**
+
+| Builtin | Call | Notes |
+|---|---|---|
+| `$get` | `;(m, k)($get)` | The value of `k`. Fails if `k` is missing. |
+| `$has` | `;(m, k)($has)` | `true` if `k` is there. |
+| `$remove` | `;(m, k)($remove)` | Removes `k` and returns its value. Fails if `k` is missing. Needs a mutable map. |
+| `$keys` | `;m($keys)` | A frozen array of the keys, in order. |
+| `$values` | `;m($values)` | A frozen array of the values, in the same order as `$keys`. |
+| `$length` | `;m($length)` | The number of keys. |
+
+- `$keys` and `$values` are snapshots: changing the map afterwards does not change them, so a loop over `m($keys)` may add and remove keys.
+- `($keys)[i]` and `($values)[i]` belong together, so one index walks both.
+- `$values` does not copy the values: a mutable record in a map is the same record in the array, so `;set all[0].hp -= 1` changes it in the map.
+- A key of the wrong type panics in `$get`, `$has` and `$remove`, as in `m[k]`.
+
+**Other operations**
+- `==` is reference equality. `;(a, b)($same)` is true when both have the same keys, in any order, and each pair of values is `$same`.
+- Ordering two maps panics. Maps have no interpolation conversion (§9.3), so `;m($print)` panics. A panic message shows a map as a literal: `[1: "a", 2: [:]]`.
+- `;m($typeOf)` is `"map"`. Array and record builtins other than `$length` (`$at`, `$push`, `$fields`, ...) panic on a map.
+
 ---
 
 ## 11. Operators and Numerics
@@ -634,7 +716,7 @@ Standard semantics throughout.
 - **Comparison:** `== != < > <= >=`
   - All six promote an int to float when it is compared with a float (§11.2).
   - Otherwise strict, with no coercion: any other comparison across types is `false` (`true == 1`, `"1" == 1`).
-  - Ordering (`< > <= >=`) two booleans, two arrays, two records, two enum members or two `null` values panics.
+  - Ordering (`< > <= >=`) two booleans, two arrays, two records, two maps, two enum members or two `null` values panics.
 - **Logical:** `&& || !`, booleans only, short-circuiting.
 - **Bitwise:** `& | ^ ~ << >>`, integers only, in the int32 range.
   - A shift amount outside 0–31 panics.
@@ -838,7 +920,7 @@ Paths are strings. A relative path is relative to the current directory. `/` wor
 ### 12.5 Reflection
 | Builtin | Call | Notes |
 |---|---|---|
-| `$typeOf` | `;x($typeOf)` | `"int"`, `"float"`, `"boolean"`, `"string"`, `"array"`, `"record"` or `"null"`; for an enum member, the enum's name (§4.1). |
+| `$typeOf` | `;x($typeOf)` | `"int"`, `"float"`, `"boolean"`, `"string"`, `"array"`, `"record"`, `"map"` or `"null"`; for an enum member, the enum's name (§4.1). |
 | `$fields` | `;node($fields)` | Frozen array of a record's field names, in literal order (§10.10). |
 
 ### 12.6 Summary
@@ -852,6 +934,8 @@ Paths are strings. A relative path is relative to the current directory. `/` wor
 | `$run` | 2 | | `$typeOf`, `$fields` | 1 |
 | `$args`, `$programPath` | constant | | `$time` | 0 |
 | `$newRandom`, `$randomFloat` | 1 | | `$random` | 2 |
+| `$sort`, `$reverse` | 1 | | `$sortBy` | 2 |
+| `$keys`, `$values` | 1 | | `$get`, `$has`, `$remove` | 2 |
 
 ### 12.7 Shell usage note
 - In shells, `$name` inside double quotes is expanded by the shell. Quote Wavert source with single quotes.
@@ -1025,6 +1109,8 @@ More examples are in [examples/](../examples/).
   - The C output needs a GNU C compiler (clang or gcc; `zig cc` works on every platform) for statement expressions, which carry conditionals and `match` used as values.
 - **C backend notes.**
   - Values are a 16-byte tagged struct. Strings are UTF-8. Enum members are pointers to static structs.
+  - A map is an array of entries in insertion order with a hash index of them. A removed entry is marked, and the entries are compacted when the array is full.
+  - Sorting is a merge sort, with insertion sort for runs of up to 16 elements. Any stable sort gives the same result, since the comparison is fixed (§10.6).
   - Memory comes from an arena that is never freed.
   - Functions are C functions. The bindings a nested function uses live in a frame struct on the C stack, reached through an `up` pointer; that is enough because a nested function never outlives the call that contains it (§16).
   - A fail sets a pending code and returns. After each call, the caller either handles it with `onfail` or turns it into a panic (the one-frame rule). A panic prints the function stack and ends the program; nothing unwinds.
@@ -1033,7 +1119,7 @@ More examples are in [examples/](../examples/).
 - **Key input (§12.2).**
   - On POSIX, key mode clears `ECHO`, `ICANON`, `IEXTEN`, `IXON` and `ICRNL`, and keeps `ISIG` and `OPOST`, so Ctrl+C and Ctrl+Z still raise signals and output keeps its newline handling. Handlers for `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT` and `SIGPIPE` restore the terminal and raise the signal again with its default action. The handler for `SIGTSTP` restores the terminal, stops the program with the default action, and reapplies key mode when the program resumes.
   - On Windows, key mode clears `ENABLE_ECHO_INPUT` and `ENABLE_LINE_INPUT` and keeps `ENABLE_PROCESSED_INPUT`. Keys come from `ReadConsoleInputW` key-down events and are mapped by virtual-key code and character.
-- **JavaScript backend notes.** Ints are JavaScript numbers and floats are wrapped, so `/`, `==` and interpolation follow §11.2. Frozen arrays and records use `Object.freeze`, mutable records `Object.seal`. Records are null-prototype objects with mangled field names. A fail is thrown and caught at each call that has `onfail`.
+- **JavaScript backend notes.** Ints are JavaScript numbers and floats are wrapped, so `/`, `==` and interpolation follow §11.2. Frozen arrays and records use `Object.freeze`, mutable records `Object.seal`. Records are null-prototype objects with mangled field names. Maps are JavaScript `Map`s, which keep insertion order; mutable ones are tracked in a `WeakSet`. Sorting uses `Array.prototype.sort`, which is stable. A fail is thrown and caught at each call that has `onfail`.
   - `$readKey` uses `process.stdin.setRawMode` and synchronous reads. Node's raw mode also turns off signals, so Ctrl+C ends the program only while `$readKey` is waiting, when the runtime reads it as U+0003, and Ctrl+Z is discarded. The escape-sequence wait is the bytes that arrive in the same read.
   - `$random` uses `Math.imul` and `>>> 0` for the 32-bit arithmetic.
 - **Editor support.** [editors/vscode/](../editors/vscode/) has syntax highlighting and snippets for VS Code.
@@ -1051,7 +1137,7 @@ More examples are in [examples/](../examples/).
 - Functions as values and closures. Today a nested function never outlives the call that contains it, so the native backend needs no heap-allocated closures. If functions become values, `(name)` at the start of an expression would become ambiguous (§6.2) and must be revisited.
 - Static types, written `;const x: int is 5`. They must decide the type of a computed field read `rec[k]` (§10.8).
 - Destructuring, written `;const [a, b] is pair`.
-- Maps: a separate type from records, with a literal syntax, key types, `map[key]` indexing, and builtins such as `$keys`, `$has` and `$remove`.
+- Composite map keys, such as a pair of ints, which would need structural equality for keys.
 - A pipeline operator `|>`. It is a syntax error today, so it can be added later without breaking code. Postfix calls already read as a pipeline; revisit after counting real inside-out chains.
 - A type test operator. It should not be spelled `is`, which is a contextual keyword in declarations (§2.5).
 - More terminal support: the terminal's size, whether stdin or stdout is a terminal, waiting for a key with a timeout, and mouse input. Today `$readKey` always blocks.

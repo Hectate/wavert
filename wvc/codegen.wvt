@@ -245,6 +245,7 @@
             ;const items is e.items(exprList)
             ;return mutable ? "[{items}]" : "\$rt.frozen([{items}])"
         }
+        ;if (e.k == "map") { ;return "\$rt.map([{e.items(exprList)}], {mutable(jsBool)})" }
         ;if (e.k == "rec") { ;return (e, mutable)(record) }
         ;if ((scalarKinds, e.k)(text.contains) || mode == "ref") { ;return e(expr) }
         "\$rt.bind({e(expr)}, {mutable(jsBool)})"
@@ -520,6 +521,7 @@
         ;if (kind == "name") { ;return e.name(id) }
         ;if (kind == "std") { ;return "\$std.{e.name}" }
         ;if (kind == "arr") { ;return "\$rt.frozen([{e.items(exprList)}])" }
+        ;if (kind == "map") { ;return "\$rt.map([{e.items(exprList)}], false)" }
         ;if (kind == "rec") { ;return (e, false)(record) }
         ;if (kind == "idx") { ;return "\$rt.idx({e.index(expr)}, {e.arr(expr)})" }
         ;if (kind == "mem") {

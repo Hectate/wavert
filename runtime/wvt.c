@@ -49,7 +49,7 @@ extern char **environ;
 
 // ---- values ----
 
-enum { T_UNSET, T_NULL, T_INT, T_FLOAT, T_BOOL, T_STR, T_ARR, T_REC, T_MEM };
+enum { T_UNSET, T_NULL, T_INT, T_FLOAT, T_BOOL, T_STR, T_ARR, T_REC, T_MEM, T_MAP };
 
 // A string. data holds bytes valid UTF-8 and is followed by a NUL.
 typedef struct wstr {
@@ -60,10 +60,15 @@ typedef struct wstr {
 typedef struct warr { int64_t len, cap; int is_mut; struct wv *items; } warr;
 typedef struct wrec { int64_t n; int is_mut; const wstr *const *keys; struct wv *vals; } wrec;
 typedef struct wmem { const wstr *enum_name, *name; } wmem;
+struct wmap;
 typedef struct wv {
   uint32_t tag;
-  union { int64_t i; double f; int b; const wstr *s; warr *a; wrec *r; const wmem *m; };
+  union { int64_t i; double f; int b; const wstr *s; warr *a; wrec *r; const wmem *m; struct wmap *mp; };
 } wv;
+// A map (§10.11): entries in insertion order, some of them removed (live 0),
+// and a hash index of entry numbers (-1 for an empty slot), icap a power of two.
+typedef struct wment { wv key, val; int live; } wment;
+typedef struct wmap { int64_t n, len, cap, icap; int is_mut; wment *e; int64_t *idx; } wmap;
 
 #define RT_MAX 9007199254740991LL
 static const wv RT_NULL = { .tag = T_NULL };
@@ -423,6 +428,7 @@ static const char *type_name(wv x) {
     case T_ARR: return "array";
     case T_REC: return "record";
     case T_MEM: return x.m->enum_name->data;
+    case T_MAP: return "map";
   }
   return "unknown";
 }
@@ -684,6 +690,20 @@ static void show_to(sb *b, wv v) {
       }
       sb_putc(b, '}');
       return;
+    case T_MAP: {
+      sb_putc(b, '[');
+      int first = 1;
+      for (int64_t i = 0; i < v.mp->len; i++) {
+        if (!v.mp->e[i].live) continue;
+        if (!first) sb_puts(b, ", ");
+        first = 0;
+        show_to(b, v.mp->e[i].key);
+        sb_puts(b, ": ");
+        show_to(b, v.mp->e[i].val);
+      }
+      sb_puts(b, first ? ":]" : "]");
+      return;
+    }
   }
   if (!text_to(b, v)) sb_puts(b, "unknown");
 }
@@ -946,6 +966,7 @@ static int eq(wv a, wv b) {
     case T_ARR: return a.a == b.a;
     case T_REC: return a.r == b.r;
     case T_MEM: return a.m == b.m;
+    case T_MAP: return a.mp == b.mp;
   }
   return 0;
 }
@@ -1028,16 +1049,18 @@ static wv arr_copy(const warr *src, int64_t from, int64_t to, int is_mut) {
 }
 
 static wv rec_copy(const wrec *src, int is_mut);
-// Copy happens only when mutability changes (§10.4, §10.9).
+static wv map_copy(const wmap *src, int is_mut);
+// Copy happens only when mutability changes (§10.4, §10.9, §10.11).
 static wv rt_bind(wv v, int is_mut) {
   if (v.tag == T_ARR) return v.a->is_mut == is_mut ? v : arr_copy(v.a, 0, v.a->len, is_mut);
   if (v.tag == T_REC) return v.r->is_mut == is_mut ? v : rec_copy(v.r, is_mut);
+  if (v.tag == T_MAP) return v.mp->is_mut == is_mut ? v : map_copy(v.mp, is_mut);
   return v;
 }
 
 static int64_t slot(wv i, wv arr) {
   if (arr.tag != T_ARR) {
-    rt_fail("type error: indexing needs an array or a record, got %s%s", type_name(arr),
+    rt_fail("type error: indexing needs an array, a map or a record, got %s%s", type_name(arr),
       arr.tag == T_STR ? " (use $at for a string)" : "");
   }
   if (i.tag != T_INT) rt_fail("type error: an index must be an int, got %s", type_name(i));
@@ -1092,13 +1115,129 @@ static wv *computed(wv k, wv r) {
   return field(sym_find(name), name, r);
 }
 
+// ---- maps (§10.11) ----
+
+static void key_ok(wv k) {
+  if (k.tag != T_INT && k.tag != T_STR && k.tag != T_BOOL && k.tag != T_MEM) {
+    rt_fail("type error: a map key must be an int, a string, a boolean or an enum member, got %s", type_name(k));
+  }
+}
+static uint64_t key_hash(wv k) {
+  uint64_t h;
+  switch (k.tag) {
+    case T_STR: return hash_bytes(k.s->data, k.s->bytes);
+    case T_INT: h = (uint64_t)k.i; break;
+    case T_BOOL: h = (uint64_t)k.b + 0x51ED27; break;
+    default: h = (uint64_t)(uintptr_t)k.m; break;
+  }
+  h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ULL; // splitmix64's finalizer
+  h ^= h >> 27; h *= 0x94D049BB133111EBULL;
+  return h ^ (h >> 31);
+}
+static int key_eq(wv a, wv b) {
+  if (a.tag != b.tag) return 0;
+  switch (a.tag) {
+    case T_INT: return a.i == b.i;
+    case T_STR: return str_eq(a.s, b.s);
+    case T_BOOL: return a.b == b.b;
+    default: return a.m == b.m;
+  }
+}
+
+static wmap *map_new(int is_mut) {
+  wmap *m = rt_alloc(sizeof(wmap));
+  *m = (wmap){ 0, 0, 0, 0, is_mut, NULL, NULL };
+  return m;
+}
+// The entry holding key k, or -1.
+static int64_t map_find(const wmap *m, wv k) {
+  if (!m->icap) return -1;
+  uint64_t h = key_hash(k);
+  for (int64_t j = h & (m->icap - 1);; j = (j + 1) & (m->icap - 1)) {
+    int64_t e = m->idx[j];
+    if (e < 0) return -1;
+    if (m->e[e].live && key_eq(m->e[e].key, k)) return e;
+  }
+}
+// Drops removed entries and makes room for at least cap entries.
+static void map_rehash(wmap *m, int64_t cap) {
+  if (cap < 8) cap = 8;
+  wment *e = rt_alloc(sizeof(wment) * cap);
+  int64_t len = 0;
+  for (int64_t i = 0; i < m->len; i++) if (m->e[i].live) e[len++] = m->e[i];
+  int64_t icap = 16;
+  while (icap < cap * 2) icap *= 2;
+  int64_t *idx = rt_alloc(sizeof(int64_t) * icap);
+  memset(idx, 0xFF, sizeof(int64_t) * icap);
+  for (int64_t i = 0; i < len; i++) {
+    int64_t j = key_hash(e[i].key) & (icap - 1);
+    while (idx[j] >= 0) j = (j + 1) & (icap - 1);
+    idx[j] = i;
+  }
+  *m = (wmap){ len, len, cap, icap, m->is_mut, e, idx };
+}
+// Sets key k to v, adding it at the end if it is new.
+static void map_put(wmap *m, wv k, wv v) {
+  int64_t at = map_find(m, k);
+  if (at >= 0) { m->e[at].val = v; return; }
+  if (m->len == m->cap) map_rehash(m, m->n * 2 > m->cap ? m->cap * 2 : m->cap);
+  int64_t j = key_hash(k) & (m->icap - 1);
+  while (m->idx[j] >= 0) j = (j + 1) & (m->icap - 1);
+  m->idx[j] = m->len;
+  m->e[m->len++] = (wment){ k, v, 1 };
+  m->n++;
+}
+// A map literal: n keys and values in turn, frozen unless mutable (var). A key
+// given twice keeps its first place and its last value.
+static wv rt_map(int64_t n, const wv *kv, int is_mut) {
+  wmap *m = map_new(is_mut);
+  if (n) map_rehash(m, n);
+  for (int64_t i = 0; i < n; i++) {
+    key_ok(kv[2 * i]);
+    map_put(m, kv[2 * i], kv[2 * i + 1]);
+  }
+  return (wv){ .tag = T_MAP, .mp = m };
+}
+static wv map_copy(const wmap *src, int is_mut) {
+  wmap *m = map_new(is_mut);
+  m->e = src->e;
+  m->len = src->len;
+  m->n = src->n;
+  map_rehash(m, src->n); // copies the live entries into new storage
+  return (wv){ .tag = T_MAP, .mp = m };
+}
+static void map_writable(const wmap *m, const char *what) {
+  if (!m->is_mut) rt_fail("cannot modify a frozen map%s%s", what ? " with " : "", what ? what : "");
+}
+static _Noreturn void no_key(wv k) {
+  sb b = { 0 };
+  sb_puts(&b, "no key ");
+  show_to(&b, k);
+  sb_puts(&b, " in map");
+  rt_fail_sb(&b);
+}
+// The entry holding k, which must be there.
+static wment *map_entry(wv k, wv m) {
+  key_ok(k);
+  int64_t at = map_find(m.mp, k);
+  if (at < 0) no_key(k);
+  return &m.mp->e[at];
+}
+
 // Indexing a record is computed field access with a string key (§10.8).
 static wv rt_idx(wv i, wv arr) {
+  if (arr.tag == T_MAP) return map_entry(i, arr)->val;
   if (arr.tag == T_REC) return *computed(i, arr);
   int64_t k = slot(i, arr); // checks arr before it is read
   return arr.a->items[k];
 }
 static void rt_set_idx(wv v, wv i, wv arr) {
+  if (arr.tag == T_MAP) {
+    key_ok(i);
+    map_writable(arr.mp, NULL);
+    map_put(arr.mp, i, v);
+    return;
+  }
   if (arr.tag == T_REC) {
     wv *p = computed(i, arr);
     writable(arr);
@@ -1110,6 +1249,12 @@ static void rt_set_idx(wv v, wv i, wv arr) {
   arr.a->items[k] = v;
 }
 static void rt_upd_idx(wv v, wv i, wv arr, wv (*op)(wv, wv)) {
+  if (arr.tag == T_MAP) {
+    wment *e = map_entry(i, arr);
+    map_writable(arr.mp, NULL);
+    e->val = op(e->val, v);
+    return;
+  }
   if (arr.tag == T_REC) {
     wv *p = computed(i, arr);
     writable(arr);
@@ -2012,7 +2157,8 @@ static wv std_run(wv program, wv args) {
 static wv std_length(wv x) {
   if (x.tag == T_STR) return rt_i(x.s->cps);
   if (x.tag == T_ARR) return rt_i(x.a->len);
-  rt_fail("type error: $length expects a string or an array, got %s", type_name(x));
+  if (x.tag == T_MAP) return rt_i(x.mp->n);
+  rt_fail("type error: $length expects a string, an array or a map, got %s", type_name(x));
 }
 static int64_t cp_index(wv i, int64_t n, const char *fn) {
   int64_t k = an_int(i, fn);
@@ -2232,6 +2378,16 @@ static int same(wv a, wv b) {
     }
     return 1;
   }
+  if (a.tag == T_MAP && b.tag == T_MAP) {
+    // The same keys, in any order, with the same values.
+    if (a.mp->n != b.mp->n) return 0;
+    for (int64_t i = 0; i < a.mp->len; i++) {
+      if (!a.mp->e[i].live) continue;
+      int64_t j = map_find(b.mp, a.mp->e[i].key);
+      if (j < 0 || !same(a.mp->e[i].val, b.mp->e[j].val)) return 0;
+    }
+    return 1;
+  }
   return eq(a, b);
 }
 static wv std_same(wv a, wv b) { return rt_b(same(a, b)); }
@@ -2241,6 +2397,120 @@ static wv std_fields(wv r) {
   warr *a = arr_new(r.r->n, 0);
   for (int64_t i = 0; i < r.r->n; i++) a->items[i] = rt_s(r.r->keys[i]);
   return (wv){ .tag = T_ARR, .a = a };
+}
+
+// ---- map stdlib (§10.11) ----
+
+static wmap *a_map(wv x, const char *fn) {
+  if (x.tag != T_MAP) rt_fail("type error: %s expects a map, got %s", fn, type_name(x));
+  return x.mp;
+}
+static wv std_get(wv m, wv k) {
+  a_map(m, "$get");
+  key_ok(k);
+  int64_t at = map_find(m.mp, k);
+  return at < 0 ? rt_std_fail("$get") : m.mp->e[at].val;
+}
+static wv std_has(wv m, wv k) {
+  a_map(m, "$has");
+  key_ok(k);
+  return rt_b(map_find(m.mp, k) >= 0);
+}
+static wv std_remove(wv m, wv k) {
+  wmap *p = a_map(m, "$remove");
+  key_ok(k);
+  map_writable(p, "$remove");
+  int64_t at = map_find(p, k);
+  if (at < 0) return rt_std_fail("$remove");
+  p->e[at].live = 0;
+  p->n--;
+  return p->e[at].val;
+}
+// The keys (which 1) or values (0) of a map, in insertion order.
+static wv map_column(wv m, int which, const char *fn) {
+  wmap *p = a_map(m, fn);
+  warr *a = arr_new(p->n, 0);
+  for (int64_t i = 0, k = 0; i < p->len; i++) if (p->e[i].live) a->items[k++] = which ? p->e[i].key : p->e[i].val;
+  return (wv){ .tag = T_ARR, .a = a };
+}
+static wv std_keys(wv m) { return map_column(m, 1, "$keys"); }
+static wv std_values(wv m) { return map_column(m, 0, "$values"); }
+
+// ---- sorting (§10.6) ----
+// A stable merge sort of positions by their keys, so that every backend gives
+// the same order. The keys are checked before sorting, so that the same key
+// panics whatever order the sort compares them in.
+
+static int key_cmp(wv a, wv b) {
+  if (a.tag == T_INT && b.tag == T_INT) return a.i < b.i ? -1 : a.i > b.i;
+  if (a.tag == T_STR) return str_cmp(a.s, b.s);
+  double x = nv(a), y = nv(b);
+  return x < y ? -1 : x > y;
+}
+static void merge_sort(int64_t *ix, int64_t *tmp, int64_t n, const wv *keys) {
+  if (n <= 16) {
+    for (int64_t i = 1; i < n; i++) {
+      int64_t x = ix[i], j = i;
+      for (; j > 0 && key_cmp(keys[ix[j - 1]], keys[x]) > 0; j--) ix[j] = ix[j - 1];
+      ix[j] = x;
+    }
+    return;
+  }
+  int64_t h = n / 2;
+  merge_sort(ix, tmp, h, keys);
+  merge_sort(ix + h, tmp, n - h, keys);
+  if (key_cmp(keys[ix[h - 1]], keys[ix[h]]) <= 0) return;
+  memcpy(tmp, ix, sizeof(int64_t) * h);
+  int64_t i = 0, j = h, o = 0;
+  while (i < h && j < n) ix[o++] = key_cmp(keys[ix[j]], keys[tmp[i]]) < 0 ? ix[j++] : tmp[i++];
+  while (i < h) ix[o++] = tmp[i++];
+}
+// The items of a in the order of their keys, as a new frozen array.
+static wv sort_by_keys(const warr *a, const wv *keys, const char *fn) {
+  int64_t n = a->len;
+  for (int64_t i = 0; i < n; i++) {
+    wv k = keys[i];
+    if (!isnum(k) && k.tag != T_STR) rt_fail("type error: %s can sort only numbers and strings, got %s", fn, type_name(k));
+    if (i > 0 && (k.tag == T_STR) != (keys[0].tag == T_STR)) {
+      rt_fail("type error: %s cannot compare %s with %s", fn, type_name(keys[0]), type_name(k));
+    }
+    if (k.tag == T_FLOAT && isnan(k.f)) rt_fail("%s cannot sort nan", fn);
+  }
+  int64_t *ix = xmalloc(sizeof(int64_t) * (n ? n : 1)), *tmp = xmalloc(sizeof(int64_t) * (n / 2 + 1));
+  for (int64_t i = 0; i < n; i++) ix[i] = i;
+  merge_sort(ix, tmp, n, keys);
+  warr *out = arr_new(n, 0);
+  for (int64_t i = 0; i < n; i++) out->items[i] = a->items[ix[i]];
+  free(ix);
+  free(tmp);
+  return (wv){ .tag = T_ARR, .a = out };
+}
+static wv std_sort(wv arr) {
+  warr *a = an_array(arr, "$sort");
+  return sort_by_keys(a, a->items, "$sort");
+}
+// by: the name of a field of every item, or an array with one key for each item.
+static wv std_sortBy(wv arr, wv by) {
+  warr *a = an_array(arr, "$sortBy");
+  if (by.tag == T_ARR) {
+    if (by.a->len != a->len) {
+      rt_fail("$sortBy: there are %lld keys for %lld items", (long long)by.a->len, (long long)a->len);
+    }
+    return sort_by_keys(a, by.a->items, "$sortBy");
+  }
+  if (by.tag != T_STR) rt_fail("type error: $sortBy expects a field name or an array of keys, got %s", type_name(by));
+  const wstr *key = sym_find(by.s);
+  wv *keys = xmalloc(sizeof(wv) * (a->len ? a->len : 1));
+  for (int64_t i = 0; i < a->len; i++) keys[i] = *field(key, by.s, a->items[i]);
+  wv r = sort_by_keys(a, keys, "$sortBy");
+  free(keys);
+  return r;
+}
+static wv std_reverse(wv arr) {
+  warr *a = an_array(arr, "$reverse");
+  warr *out = arr_new(a->len, 0);
+  for (int64_t i = 0; i < a->len; i++) out->items[i] = a->items[a->len - 1 - i];
+  return (wv){ .tag = T_ARR, .a = out };
 }
 
 // ---- time and random numbers (§12.8) ----

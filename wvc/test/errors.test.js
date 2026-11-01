@@ -61,7 +61,14 @@ const cases = [
   [';enum E (a)\n;E.b($print)\n;exit\n', "2:4: error: no member 'b' in enum 'E' | its members are a"],
   [';fn f(x) { match (x) { case 1.5 { 1 } else { 2 } } }\n;exit\n', '1:29: error: floats cannot be case values | float equality makes a poor match; compare with if instead'],
   // members and indexing
-  [';const r is { a: 1 }\n;r["a"]($print)\n;exit\n', '2:4: warning: string-literal field key: write record.a instead of record["a"]'],
+  // map literals
+  [';const m is ["a": 1, "a": 2]\n;exit\n', '1:22: error: duplicate key in map literal'],
+  [';const m is [1: 1, -1: 2, 1: 3]\n;exit\n', '1:27: error: duplicate key in map literal'],
+  [';const m is [1.5: 1]\n;exit\n', '1:14: error: a map key must be an int, a string, a boolean or an enum member'],
+  [';const m is [null: 1]\n;exit\n', '1:14: error: a map key must be an int, a string, a boolean or an enum member'],
+  [';const m is [1: 2, 3]\n;exit\n', "1:21: error: expected ':' after a key in the map literal, found ']' | map literals are written [key: value, ...]"],
+  [';const m is [1: 2,]\n;exit\n', '1:18: error: trailing comma in map literal'],
+  [';const m is [:1]\n;exit\n', "1:15: error: expected ']' after '[:', found '1' | an empty map is written [:]"],
   [';const x is a.if\n;exit\n', "1:15: error: 'if' is a keyword and cannot be a field name | member access is written record.field, e.g. node.kind"],
   // modules
   [';export fn f() { 1 }\n;exit\n', "1:2: error: 'export' is only allowed in a library, which ends with ;end"],

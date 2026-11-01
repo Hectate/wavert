@@ -7,8 +7,9 @@
 //
 // The syntax tree has the shape of wahc's (the Γ-- compiler this one was
 // forked from), with Wavert names:
-// Expression nodes (k): int float str bool null nan inf name std arr rec idx mem
+// Expression nodes (k): int float str bool null nan inf name std arr map rec idx mem
 //   un bin tern call failWith chain match. Each has pos and paren (true when parenthesized).
+//   map holds its keys and values in turn in items: k, v, k, v.
 //   failWith is `;fail c` with a computed code; chain is an if/!if/else chain.
 // Statement nodes (k): empty fn enum import end return panic break continue
 //   while fail exit expr decl set. Each has pos, end and handler: null, or the statement's
@@ -41,17 +42,6 @@
     0
 }
 
-;fn isIdent(s) {
-    ;const cs is (s, "")($split)
-    ;if (cs($length) == 0 || !cs[0](text.isIdStart)) { ;return false }
-    ;var k is 1
-    ;while (k < cs($length)) {
-        ;if (!cs[k](text.isIdChar)) { ;return false }
-        ;set k += 1
-    }
-    true
-}
-
 ;fn describe(tk) {
     ;if (tk.t == "eof") { ;return "end of input" }
     ;if (tk.t == "id") { ;return "'{tk.v}'" }
@@ -82,7 +72,7 @@
         }
         ;return false
     }
-    ;if (kind == "arr") {
+    ;if (kind == "arr" || kind == "map") {
         ;var i is 0
         ;while (i < e.items($length)) {
             ;if (e.items[i](hasEffect)) { ;return true }
@@ -528,13 +518,6 @@
                 }
                 ;const index is (expr)
                 ;("]", "expected ']' to close the index", null)(expect)
-                ;if (index.k == "str" && !index.paren && index.parts($length) == 1 && index.parts[0]($typeOf) == "string") {
-                    ;const key is index.parts[0]
-                    ;if (key(isIdent) && !(lexer.keywords, key)(text.contains)) {
-                        ;(diag.warnings, (index.pos, "string-literal field key: write record.{key} instead of record[\"{key}\"]",
-                            null)(diag.warn))($push)
-                    }
-                }
                 ;set e to { k: "idx", index: index, arr: e, pos: open.pos, paren: false }
             } else if ("."(at)) {
                 ;(next)
@@ -626,8 +609,15 @@
         }
         ;if (kind == "[") {
             ;var items is []
+            // [:] is an empty map, and a ':' after the first element makes a map literal (§10.11).
+            ;if (":"(at)) {
+                ;(next)
+                ;("]", "expected ']' after '[:'", "an empty map is written [:]")(expect)
+                ;return { k: "map", items: [], pos: at0, paren: false }
+            }
             ;if (!"]"(at)) {
                 ;(items, (expr))($push)
+                ;if (":"(at)) { ;return (tk, items[0])(mapLiteral) }
                 ;while (","(at)) {
                     ;const comma is (next)
                     ;if ("]"(at)) { ;(comma, "trailing comma in array literal")(failAt) }
@@ -677,6 +667,44 @@
         }
         ;("}}", "expected ',' or '}}' in record literal", null)(expect)
         { k: "rec", fields: fields, pos: open.pos, paren: false }
+    }
+
+    // The constant a map key is, as text that tells constants apart, or null if
+    // it is not a constant. A constant that cannot be a key is an error (§10.11).
+    ;fn constantKey(e) {
+        ;if (e.k == "int") { ;return "i{e.v}" }
+        ;if (e.k == "bool") { ;return "b{e.v}" }
+        ;if (e.k == "str" && e.parts($length) <= 1 && (e.parts($length) == 0 || e.parts[0]($typeOf) == "string")) {
+            ;return "s" + (e.parts($length) == 0 ? "" : e.parts[0])
+        }
+        ;if (e.k == "float" || e.k == "nan" || e.k == "inf" || e.k == "null") {
+            ;(e.pos, "a map key must be an int, a string, a boolean or an enum member", null)(diag.failHint)
+        }
+        null
+    }
+
+    // Map literal [k: v, ...] (§10.11); '[' and the first key are already read.
+    // items holds the keys and values in turn: k, v, k, v.
+    ;fn mapLiteral(open, first) {
+        ;var items is []
+        ;var seen is []
+        ;var key is first
+        ;while (true) {
+            ;const c is key(constantKey)
+            ;if (c != null) {
+                ;if ((seen, c)(text.contains)) { ;(key.pos, "duplicate key in map literal", null)(diag.failHint) }
+                ;(seen, c)($push)
+            }
+            ;(":", "expected ':' after a key in the map literal", "map literals are written [key: value, ...]")(expect)
+            ;(items, key)($push)
+            ;(items, (expr))($push)
+            ;if (!","(at)) { ;break }
+            ;const comma is (next)
+            ;if ("]"(at)) { ;(comma, "trailing comma in map literal")(failAt) }
+            ;set key to (expr)
+        }
+        ;("]", "expected ',' or ']' in the map literal", null)(expect)
+        { k: "map", items: items, pos: open.pos, paren: false }
     }
 
     // match (subject) { case v, v { ... } ... else { ... } } (§7.5).

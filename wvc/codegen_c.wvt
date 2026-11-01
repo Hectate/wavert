@@ -17,7 +17,7 @@
 // Node kinds that evaluate without calling anything.
 ;const plainKinds is ["int", "float", "bool", "null", "nan", "inf", "name", "std"]
 // Stdlib functions that can fail (§12.1).
-;const signalers is ["readLine", "readKey", "readFile", "writeFile", "appendFile", "listDir", "deleteFile", "env", "run", "toInt", "toFloat"]
+;const signalers is ["readLine", "readKey", "get", "remove", "readFile", "writeFile", "appendFile", "listDir", "deleteFile", "env", "run", "toInt", "toFloat"]
 
 // How an expression's evaluation interacts with others (see seq).
 ;const constK is 0 // a constant: nothing can change it
@@ -286,7 +286,7 @@
             }
         } else if (kind == "name") {
             ;(e, scope, f)(use)
-        } else if (kind == "arr") {
+        } else if (kind == "arr" || kind == "map") {
             ;var k is 0
             ;while (k < e.items($length)) { ;(e.items[k], scope, f)(aexpr) ;set k += 1 }
         } else if (kind == "rec") {
@@ -633,6 +633,7 @@
     ;fn bindRhs(e, mode) {
         ;const mutable is mode == "var"
         ;if (e.k == "arr") { ;return (e, mutable)(array).c }
+        ;if (e.k == "map") { ;return (e, mutable)(mapLit).c }
         ;if (e.k == "rec") { ;return (e, mutable)(record).c }
         ;if ((scalarKinds, e.k)(text.contains) || mode == "ref") { ;return e(expr).c }
         "rt_bind({e(expr).c}, {mutable ? 1 : 0})"
@@ -691,6 +692,12 @@
     ;fn array(e, mutable) {
         ;const sq is e.items(exprs)(seq)
         (sq, "rt_arr({sq.cs($length)}, {sq.cs(values)}, {mutable ? 1 : 0})")(wrap)
+    }
+
+    // A map literal: its keys and values in turn (§10.11).
+    ;fn mapLit(e, mutable) {
+        ;const sq is e.items(exprs)(seq)
+        (sq, "rt_map({(sq.cs($length) / 2)($floor)}, {sq.cs(values)}, {mutable ? 1 : 0})")(wrap)
     }
 
     // Records of one literal share their keys: a static shape K<n>.
@@ -974,6 +981,7 @@
         ;if (kind == "name") { ;return curSlot[e.pos](read) }
         ;if (kind == "std") { ;return { c: "std_{e.name}()", k: constK } }
         ;if (kind == "arr") { ;return (e, false)(array) }
+        ;if (kind == "map") { ;return (e, false)(mapLit) }
         ;if (kind == "rec") { ;return (e, false)(record) }
         ;if (kind == "idx") {
             ;const sq is [e.index(expr), e.arr(expr)](seq)

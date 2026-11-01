@@ -239,7 +239,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.wavert",
-          "match": "\\$(?:print|write|eprint|readLine|readKey|readFile|writeFile|appendFile|fileExists|listDir|deleteFile|env|run|length|at|slice|code|fromCode|split|join|toString|toInt|toFloat|push|pop|same|typeOf|fields|floor|ceil|round|trunc|toUint32|isNan|time|newRandom|randomFloat|random)\\b"
+          "match": "\\$(?:print|write|eprint|readLine|readKey|readFile|writeFile|appendFile|fileExists|listDir|deleteFile|env|run|length|at|slice|code|fromCode|split|join|toString|toInt|toFloat|push|pop|same|sortBy|sort|reverse|get|has|remove|keys|values|typeOf|fields|floor|ceil|round|trunc|toUint32|isNan|time|newRandom|randomFloat|random)\\b"
         },
         {
           "name": "support.constant.builtin.wavert",

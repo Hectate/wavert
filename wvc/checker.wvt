@@ -28,6 +28,9 @@
     { name: "join", arity: 2 }, { name: "toString", arity: 1 },
     { name: "toInt", arity: 1 }, { name: "toFloat", arity: 1 },
     { name: "push", arity: 2 }, { name: "pop", arity: 1 }, { name: "same", arity: 2 },
+    { name: "sort", arity: 1 }, { name: "sortBy", arity: 2 }, { name: "reverse", arity: 1 },
+    { name: "get", arity: 2 }, { name: "has", arity: 2 }, { name: "remove", arity: 2 },
+    { name: "keys", arity: 1 }, { name: "values", arity: 1 },
     { name: "typeOf", arity: 1 },
     { name: "fields", arity: 1 },
     { name: "floor", arity: 1 }, { name: "ceil", arity: 1 }, { name: "round", arity: 1 },
@@ -644,7 +647,7 @@
             }
             ;return
         }
-        ;if (kind == "arr") {
+        ;if (kind == "arr" || kind == "map") {
             ;var k is 0
             ;while (k < e.items($length)) {
                 ;(e.items[k], scope, ctx)(expr)

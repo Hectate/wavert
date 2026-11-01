@@ -57,6 +57,7 @@ const $rt = (function () {
     if (x === null) return 'null';
     if (Array.isArray(x)) return 'array';
     if (isRec(x)) return 'record';
+    if (x instanceof Map) return 'map';
     if (x instanceof Member) return x.enumName;
     return 'unknown';
   }
@@ -247,6 +248,7 @@ const $rt = (function () {
     if (typeof v === 'string') return JSON.stringify(v);
     if (Array.isArray(v)) return `[${v.map(show).join(', ')}]`;
     if (isRec(v)) return `{${Object.keys(v).map((k) => `${k.slice(2)}: ${show(v[k])}`).join(', ')}}`;
+    if (v instanceof Map) return v.size ? `[${[...v].map(([k, x]) => `${show(k)}: ${show(x)}`).join(', ')}]` : '[:]';
     if (isNum(v) || v === null || typeof v === 'boolean' || v instanceof Member) return text(v);
     return String(v);
   }
@@ -265,7 +267,7 @@ const $rt = (function () {
 
   function slot(i, arr) {
     if (!Array.isArray(arr)) {
-      fail(`type error: indexing needs an array or a record, got ${typeName(arr)}${typeof arr === 'string' ? ' (use $at for a string)' : ''}`);
+      fail(`type error: indexing needs an array, a map or a record, got ${typeName(arr)}${typeof arr === 'string' ? ' (use $at for a string)' : ''}`);
     }
     if (typeof i !== 'number') fail(`type error: an index must be an int, got ${typeName(i)}`);
     const n = arr.length;
@@ -273,17 +275,32 @@ const $rt = (function () {
     return i < 0 ? i + n : i;
   }
   // Indexing a record is computed field access with a string key (§10.8).
-  const idx = (i, arr) => (isRec(arr) ? get(recKey(i), arr) : arr[slot(i, arr)]);
+  function idx(i, arr) {
+    if (arr instanceof Map) return mapEntry(i, arr);
+    return isRec(arr) ? get(recKey(i), arr) : arr[slot(i, arr)];
+  }
   function mutable(arr, what) {
     if (Object.isFrozen(arr)) fail(`cannot modify a frozen array${what ? ` with ${what}` : ''}`);
   }
   function setIdx(v, i, arr) {
+    if (arr instanceof Map) {
+      keyOk(i);
+      mapWritable(arr);
+      arr.set(i, v);
+      return;
+    }
     if (isRec(arr)) return setMem(v, recKey(i), arr);
     const k = slot(i, arr);
     mutable(arr);
     arr[k] = v;
   }
   function updIdx(v, i, arr, op) {
+    if (arr instanceof Map) {
+      const old = mapEntry(i, arr);
+      mapWritable(arr);
+      arr.set(i, op(old, v));
+      return;
+    }
     if (isRec(arr)) return updMem(v, recKey(i), arr, op);
     const k = slot(i, arr);
     mutable(arr);
@@ -292,6 +309,7 @@ const $rt = (function () {
   const frozen = (a) => Object.freeze(a);
   // Copy happens only when mutability changes (§10.4, §10.9).
   function bind(v, isMut) {
+    if (v instanceof Map) return MUTABLE_MAPS.has(v) === isMut ? v : map([...v].flat(), isMut);
     if (isRec(v)) {
       const sh = SHIFTY.has(v);
       if (isMut) return sh ? v : rec(Object.assign(Object.create(null), v), true);
@@ -338,6 +356,37 @@ const $rt = (function () {
     field(key, r);
     writable(r);
     r[key] = op(r[key], v);
+  }
+
+  // ---- maps (§10.11) ----
+  // A map is a JS Map, which keeps insertion order. Wavert ints, strings,
+  // booleans and enum members are all distinct as Map keys. Mutable maps are
+  // tracked in MUTABLE_MAPS, as mutable records are in SHIFTY.
+
+  const MUTABLE_MAPS = new WeakSet();
+  function keyOk(k) {
+    if (typeof k !== 'number' && typeof k !== 'string' && typeof k !== 'boolean' && !(k instanceof Member)) {
+      fail(`type error: a map key must be an int, a string, a boolean or an enum member, got ${typeName(k)}`);
+    }
+  }
+  // A map literal: keys and values in turn. A key given twice keeps its first
+  // place and its last value.
+  function map(kv, isMut) {
+    const m = new Map();
+    for (let i = 0; i < kv.length; i += 2) {
+      keyOk(kv[i]);
+      m.set(kv[i], kv[i + 1]);
+    }
+    if (isMut) MUTABLE_MAPS.add(m);
+    return m;
+  }
+  function mapWritable(m, what) {
+    if (!MUTABLE_MAPS.has(m)) fail(`cannot modify a frozen map${what ? ` with ${what}` : ''}`);
+  }
+  function mapEntry(k, m) {
+    keyOk(k);
+    if (!m.has(k)) fail(`no key ${show(k)} in map`);
+    return m.get(k);
   }
 
   // ---- fails, panics, exit (§8, §13) ----
@@ -710,7 +759,8 @@ const $rt = (function () {
   std.length = (x) => {
     if (typeof x === 'string') return cpLength(x);
     if (Array.isArray(x)) return x.length;
-    return fail(`type error: $length expects a string or an array, got ${typeName(x)}`);
+    if (x instanceof Map) return x.size;
+    return fail(`type error: $length expects a string, an array or a map, got ${typeName(x)}`);
   };
   function cpIndex(i, n, fn) {
     anInt(i, fn);
@@ -816,6 +866,9 @@ const $rt = (function () {
       const ks = Object.keys(a);
       return ks.length === Object.keys(b).length && ks.every((k) => Object.hasOwn(b, k) && same(a[k], b[k]));
     }
+    if (a instanceof Map && b instanceof Map) {
+      return a.size === b.size && [...a].every(([k, v]) => b.has(k) && same(v, b.get(k)));
+    }
     return eq(a, b);
   }
   std.same = same;
@@ -824,6 +877,64 @@ const $rt = (function () {
     if (!isRec(r)) fail(`type error: $fields expects a record, got ${typeName(r)}`);
     return Object.freeze(Object.keys(r).map((k) => k.slice(2)));
   };
+
+  // ---- map stdlib (§10.11) ----
+
+  const aMap = (x, fn) => (x instanceof Map ? x : fail(`type error: ${fn} expects a map, got ${typeName(x)}`));
+  std.get = (m, k) => {
+    aMap(m, '$get');
+    keyOk(k);
+    if (!m.has(k)) throw stdFail('$get');
+    return m.get(k);
+  };
+  std.has = (m, k) => {
+    aMap(m, '$has');
+    keyOk(k);
+    return m.has(k);
+  };
+  std.remove = (m, k) => {
+    aMap(m, '$remove');
+    keyOk(k);
+    mapWritable(m, '$remove');
+    if (!m.has(k)) throw stdFail('$remove');
+    const v = m.get(k);
+    m.delete(k);
+    return v;
+  };
+  std.keys = (m) => Object.freeze([...aMap(m, '$keys').keys()]);
+  std.values = (m) => Object.freeze([...aMap(m, '$values').values()]);
+
+  // ---- sorting (§10.6) ----
+  // Array.prototype.sort is stable, so with the same comparison it gives the
+  // same order as the C runtime's merge sort. The keys are checked first, as there.
+
+  function keyCmp(a, b) {
+    if (typeof a === 'string') return cmpStr(a, b);
+    const x = nv(a), y = nv(b);
+    return x < y ? -1 : x > y ? 1 : 0;
+  }
+  function sortByKeys(arr, keys, fn) {
+    keys.forEach((k, i) => {
+      if (!isNum(k) && typeof k !== 'string') fail(`type error: ${fn} can sort only numbers and strings, got ${typeName(k)}`);
+      if (i > 0 && (typeof k === 'string') !== (typeof keys[0] === 'string')) {
+        fail(`type error: ${fn} cannot compare ${typeName(keys[0])} with ${typeName(k)}`);
+      }
+      if (k instanceof F && Number.isNaN(k.v)) fail(`${fn} cannot sort nan`);
+    });
+    const ix = arr.map((_, i) => i).sort((i, j) => keyCmp(keys[i], keys[j]));
+    return Object.freeze(ix.map((i) => arr[i]));
+  }
+  std.sort = (arr) => sortByKeys(anArray(arr, '$sort'), arr, '$sort');
+  std.sortBy = (arr, by) => {
+    anArray(arr, '$sortBy');
+    if (Array.isArray(by)) {
+      if (by.length !== arr.length) fail(`$sortBy: there are ${by.length} keys for ${arr.length} items`);
+      return sortByKeys(arr, by, '$sortBy');
+    }
+    if (typeof by !== 'string') fail(`type error: $sortBy expects a field name or an array of keys, got ${typeName(by)}`);
+    return sortByKeys(arr, arr.map((x) => get('f_' + by, x)), '$sortBy');
+  };
+  std.reverse = (arr) => Object.freeze(anArray(arr, '$reverse').slice().reverse());
 
   // ---- time and random numbers (§12.8) ----
 
@@ -900,7 +1011,7 @@ const $rt = (function () {
     F, Fail, Panic, NAN, INF, f,
     add, sub, mul, div, mod, pow, neg, eq, ne, lt, le, gt, ge,
     band, bor, bxor, bnot, shl, shr, bool, not, cond, text, makeEnum, noCase,
-    idx, setIdx, updIdx, frozen, bind, rec, get, setMem, updMem, failWith, leave, panic, exit, main, std,
+    idx, setIdx, updIdx, frozen, bind, rec, map, get, setMem, updMem, failWith, leave, panic, exit, main, std,
   };
 })();
 const $std = $rt.std;
