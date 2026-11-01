@@ -16,6 +16,7 @@ wvc/wvc.exe --ast examples/hello.wvt
 
 - With a file, `wvc` writes C to `<file>.c`, or to `-o`, inlining the runtime [../runtime/wvt.c](../runtime/wvt.c). Pass `--runtime` to use another runtime file.
 - A default runtime path is tried from the current directory, then from where `wvc` is: next to it, then one directory up. So a `wvc` in `wvc/` or `.wvt/` finds the repository's `runtime/`.
+- Imports that start with `$lib/` come from the standard library, [../lib](../lib). `wvc` looks for a `lib/` folder next to itself, then one directory up, but not in the current directory, so a program's own `lib/` never stands in for it. Pass `--lib` to use another folder.
 - `build` compiles to C, writes it beside the program as `<program>.c`, and runs a C compiler. The program defaults to the input without `.wvt`, with `.exe` on Windows. The compiler is `--cc`, else the `ZIG` variable, else `zig` on `PATH`. Zig is called as `zig cc`; other compilers get the flags directly. See [Getting Zig](../wah/README.md#getting-zig).
 - A program that imports libraries is compiled whole: libraries are found through their import paths.
 - `--tokens` and `--ast` show the given file alone, without the libraries it imports.
@@ -66,5 +67,6 @@ Run `npm test` here (Node ≥ 22.3). The tests need [Zig](https://ziglang.org), 
 | `stdlib.test.js` | The standard library of Drafts 0.2 to 0.5: `$readKey` and `$waitKey` on redirected input and open pipes, `$terminal` and `$terminalSize` on pipes, `$time`, `$elapsed` and `$sleep`, random generators against the specification's test vectors, maps and sorting. |
 | `gc.test.js` | The native runtime's garbage collector: memory stays flat in a long loop, and collecting on every allocation (`WVT_GC_STRESS=1`) changes no output. |
 | `spec.test.js` | The complete programs in [../docs/wavert-spec.md](../docs/wavert-spec.md) compile, and its §14 example runs. |
+| `lib.test.js` | The standard library in [../lib](../lib), and the `$lib/` prefix: importing from anywhere, its errors, and finding `lib/` from where `wvc` is rather than the current directory. |
 | `grammar.test.js` | The VS Code grammar ([../editors/vscode](../editors/vscode)) agrees with the lexer's keywords, the stdlib table and the number syntax. |
 | `convert.test.js` | `tools/wah2wvt.wah`, built with `wahc` from `../wah`: the Γ-- examples convert to Wavert that has the same syntax tree and compiles to the same C. |

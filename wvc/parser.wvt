@@ -320,6 +320,14 @@
         ;if (!(path($length) >= 4 && (path, -4, path($length))($slice) == ".wvt")) {
             ;(e, "an import path includes the .wvt extension")(failAt)
         }
+        // '$' starts a reserved prefix; '$lib/' is the standard library, lib/ (§13.1).
+        ;if ((path, 0)($at) == "$") {
+            ;if (path($length) < 5 || (path, 0, 5)($slice) != "\$lib/") {
+                ;(e, "an import path that starts with '$' must start with '\$lib/', the standard library",
+                    "a file of your own is imported by a relative path, such as \"lib.wvt\"")(failAtHint)
+            }
+            ;if (((path, "/")($split), "..")(text.contains)) { ;(e, "a '\$lib/' path cannot leave lib/ with '..'")(failAt) }
+        }
         { k: "import", path: path, pathPos: e.pos, name: name.v, namePos: name.pos, pos: null, end: null, handler: null }
     }
 

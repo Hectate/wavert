@@ -301,6 +301,9 @@
         ;var parts is []
         ;var buf is ""
         ;var rawDollar is -1
+        // An import's path is never interpolated, so a '$' in it is the reserved
+        // prefix '$lib/' (§13.1), not a slip for {x}.
+        ;const importPath is toks($length) >= 3 && toks[-1].t == "id" && toks[-1].v == "from" && toks[-3].t == "import"
         ;var k is start + 1
         ;while (true) {
             ;const c is k(ch)
@@ -358,7 +361,7 @@
             }
             ;if (c == "$") {
                 ;set rawDollar to k
-                ;if ((k + 1)(ch)(text.isIdStart)) {
+                ;if (!importPath && (k + 1)(ch)(text.isIdStart)) {
                     ;var j is k + 1
                     ;while (j(ch)(text.isIdChar)) { ;set j += 1 }
                     ;const name is (k + 1, j)(cut)

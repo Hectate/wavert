@@ -55,9 +55,21 @@
 
 // Loads the entry file and every library it imports, directly or indirectly.
 // Returns the modules in initialization order: libraries depth first, in import
-// order, each before any file that imports it; the entry file last.
-;export fn loadProgram(entryFile, ref entryChars) {
+// order, each before any file that imports it; the entry file last. libDir is
+// the standard library's folder, with a trailing '/', for '$lib/' paths, or
+// null if it was not found; searched lists where it was looked for.
+;export fn loadProgram(entryFile, ref entryChars, libDir, searched) {
     ;var modules is []
+
+    // The normalized path of the file that import s names, from the file at path.
+    // The parser has checked that a '$' path starts with '$lib/' (§13.1).
+    ;fn target(s, file, chars, path) {
+        ;if ((s.path, 0)($at) != "$") { ;return (path(dirOf) + s.path)(normalize) }
+        ;if (libDir == null) {
+            ;(file, chars, s.pathPos, "cannot find the standard library: no lib/ folder in {(searched, " or ")($join)}")(failIn)
+        }
+        (libDir + (s.path, 5, s.path($length))($slice))(normalize)
+    }
 
     ;fn loaded(path) {
         ;var k is 0
@@ -79,7 +91,7 @@
             ;const s is program.stmts[k]
             ;set k += 1
             ;if (s.k != "import") { ;continue }
-            ;const libPath is (path(dirOf) + s.path)(normalize)
+            ;const libPath is (s, file, chars, path)(target)
             ;var at is 0
             ;while (at < chain($length) && chain[at] != libPath) { ;set at += 1 }
             ;if (at < chain($length)) {
@@ -88,8 +100,9 @@
             }
             ;var lib is libPath(loaded)
             ;if (lib == null) {
+                ;const missing is (s.path, 0)($at) == "$" ? "the standard library has no '{(s.path, 5, s.path($length))($slice)}' ({libPath})" : "cannot read '{libPath}'"
                 ;const text is libPath($readFile)
-                    onfail { ;(file, chars, s.pathPos, "cannot read '{libPath}'")(failIn) null }
+                    onfail { ;(file, chars, s.pathPos, missing)(failIn) null }
                 ;const cs is (text, "")($split)
                 ;const bom is cs($length) > 0 && cs[0] == "\u{FEFF}" ? 1 : 0
                 ;set lib to (libPath, (cs, bom, cs($length))($slice), libPath, (chain, libPath)(with))(visit)

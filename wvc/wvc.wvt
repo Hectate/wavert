@@ -9,8 +9,8 @@
 // Section numbers (§) in the comments refer to the Wavert specification,
 // docs/wavert-spec.md.
 //
-// Usage: wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>]
-//        wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]
+// Usage: wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>] [--lib <dir>]
+//        wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>] [--lib <dir>]
 //        wvc (--tokens | --ast) <file.wvt>
 
 ;import txt from "text.wvt"
@@ -25,8 +25,8 @@
 // ---- Command line ----
 
 ;const usage is "usage:\n" +
-    "  wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>]\n" +
-    "  wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>]\n" +
+    "  wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>] [--lib <dir>]\n" +
+    "  wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>] [--lib <dir>]\n" +
     "  wvc --tokens <file.wvt>\n" +
     "  wvc --ast <file.wvt>"
 
@@ -48,9 +48,10 @@
 ;var mode is ""
 ;var input is ""
 ;var output is ""
-// The runtime path and the C compiler, "" until given.
+// The runtime path, the C compiler and the standard library folder, "" until given.
 ;var runtimePath is ""
 ;var cc is ""
+;var libGiven is ""
 ;var arg is 0
 ;while (arg < argv($length)) {
     ;const a is argv[arg]
@@ -58,13 +59,15 @@
         ;set mode to a
     } else if (a == "--tokens" || a == "--ast") {
         ;set mode to a
-    } else if (a == "-o" || a == "--runtime" || a == "--cc") {
+    } else if (a == "-o" || a == "--runtime" || a == "--cc" || a == "--lib") {
         ;set arg += 1
         ;if (arg >= argv($length)) { ;(die) }
         ;if (a == "-o") {
             ;set output to argv[arg]
         } else if (a == "--runtime") {
             ;set runtimePath to argv[arg]
+        } else if (a == "--lib") {
+            ;set libGiven to argv[arg]
         } else {
             ;set cc to argv[arg]
         }
@@ -76,7 +79,7 @@
     ;set arg += 1
 }
 ;const inspect is mode == "--tokens" || mode == "--ast"
-;if (input == "" || inspect && (output != "" || runtimePath != "") || mode != "build" && cc != "") { ;(die) }
+;if (input == "" || inspect && (output != "" || runtimePath != "" || libGiven != "") || mode != "build" && cc != "") { ;(die) }
 
 ;fn onWindows() {
     ;const os is "OS"($env)
@@ -122,6 +125,27 @@
     here != null ? here : (dir + "../" + runtimePath)(tryRead)
 }
 
+// The standard library folder for '$lib/' imports (§13.1), with a trailing
+// '/': the one given, else lib/ next to wvc, then one level up. Not the
+// current directory, whose own lib/ must not stand in for it. null if none
+// is found; searched lists where it was looked for.
+;var searched is []
+;fn findLib() {
+    ;const dir is ((programDir), "\\")($split)
+    ;const slashed is (dir, "/")($join)
+    ;const candidates is libGiven != "" ? [((libGiven, "\\")($split), "/")($join)] : [slashed + "lib", slashed + "../lib"]
+    ;var k is 0
+    ;while (k < candidates($length)) {
+        ;const c is candidates[k]
+        ;(searched, c)($push)
+        ;const names is c($listDir)
+            onfail { null }
+        ;if (names != null) { ;return (c, -1, c($length))($slice) == "/" ? c : c + "/" }
+        ;set k += 1
+    }
+    null
+}
+
 ;input(load)
 // --tokens and --ast show the input file alone, without the libraries it imports.
 ;if (mode == "--tokens") {
@@ -136,7 +160,8 @@
     ;(program, "")(dump.dumpValue)($print)
     ;exit
 }
-;const modules is (diag.srcFile, diag.srcChars)(loader.loadProgram)
+;const libDir is (findLib)
+;const modules is (diag.srcFile, diag.srcChars, libDir, searched)(loader.loadProgram)
 ;const problems is (modules, true)(checker.check)
 ;if (problems($length) > 0) {
     ;(diag.flushWarnings)

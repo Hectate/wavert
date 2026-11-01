@@ -1,4 +1,4 @@
-# Wavert Language Specification (Draft 0.6)
+# Wavert Language Specification (Draft 0.7)
 
 > Draft 0.1 was the first Wavert specification. Wavert is derived from Γ-- ([wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). It changes Γ--'s syntax and names and keeps its semantics; [hybrid-syntax.md](hybrid-syntax.md) gives the reasons for each change. Section numbers follow the Γ-- specification, so a reference such as §10.4 means the same topic in both.
 >
@@ -11,6 +11,8 @@
 > Draft 0.5 adds waiting for a key with a timeout (`$waitKey`, §12.2), a monotonic clock (`$elapsed`) and `$sleep` (§12.8), so a program can animate between key presses.
 >
 > Draft 0.6 allows records as map keys, compared by their contents (§10.11), and documents telling kinds of record apart with an enum field (§10.10).
+>
+> Draft 0.7 adds the standard library written in Wavert, imported from any program with the reserved prefix `$lib/` (§13.1).
 
 ## 1. Overview
 
@@ -128,7 +130,7 @@ So `;const end is 5`, `node.end` and `{ to: 1 }` are all valid.
 - `!if (a != b)` is a double negative; it suggests `if (a == b)`.
 - `;;` warns: likely a habitual trailing `;` from C-style languages.
 - `${` inside a string: `Wavert interpolation is {x}, not ${x}`.
-- `$identifier` inside a string: `did you mean {identifier}?`.
+- `$identifier` inside a string: `did you mean {identifier}?`. An import's path is exempt, since it is never interpolated and may start with `$lib/` (§13.1).
 - An expression statement that calls nothing has no effect: `;n`, `;a + b`, `;node.kind`. Inside a block the hint says that a block's value is written without a leading `;` (§7.2).
   - A statement that contains any call, or is a conditional chain or a `match`, is not affected.
 - Inside a block, a `[` at the start of a line that indexes the expression before it (§7.2).
@@ -1115,6 +1117,10 @@ A program is an **entry file** plus the **libraries** it imports, directly or in
 
 **Importing**
 - `;import name from "path"` imports a library and gives it the module name `name` in this file. The path is a plain string literal (no interpolation). It is relative to the directory of the file containing the `import`, uses `/` as its separator, and includes the `.wvt` extension.
+- A path that starts with `$lib/` names a file in the **standard library**, the libraries written in Wavert that come with the compiler ([lib/](../lib/)): `;import grid from "$lib/grid.wvt"`.
+  - `$` is reserved, as it is for names (§2.9): any other path that starts with `$` is a compile error, and so is a `$lib/` path with a `..` segment.
+  - The compiler decides where the standard library is (§15). A program's own files are never found through `$lib/`, and the standard library's files import each other with relative paths.
+  - An import's path is not interpolated, so the `$` in it gets no warning (§2.8).
 - `import` statements may appear only at the top level, before every other statement. Comments and empty statements may come before them.
 - The module name is the only name an `import` declares. It is visible throughout the file and behaves like a function name for the no-shadowing rule (§5.1).
 - What the library exports is reached through the module name, with member access (§10.8):
@@ -1186,6 +1192,7 @@ More examples are in [examples/](../examples/), each showing one feature, and [s
 ## 15. Implementation
 
 - **Compiler.** `wvc` ([wvc/](../wvc/)) is written in Wavert and compiles itself. [wvc/wvc.c](../wvc/wvc.c) is `wvc` compiled to C, the bootstrap seed: a C compiler is enough to build it, and the built `wvc` compiles its own sources back to the same file (the fixed point). It was bootstrapped from Γ--; see [hybrid-syntax.md](hybrid-syntax.md#bootstrap-status).
+- **Standard library.** `wvc` looks for `$lib/` files in a `lib/` folder next to itself, then one level up, so `wvc` built into `wvc/` or `.wvt/` uses the repository's [lib/](../lib/). `--lib <dir>` names another folder. The current directory is not searched, so that a program's own `lib/` folder never stands in for the standard library.
 - **Backend.** `wvc` compiles to C. Where this specification says every backend behaves the same, it binds any future backend to the C backend's behaviour.
   - The output is a single file with its runtime, [runtime/wvt.c](../runtime/wvt.c), inlined.
   - The C output needs a GNU C compiler (clang or gcc; `zig cc` works on every platform) for statement expressions, which carry conditionals and `match` used as values.

@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { exe, examples, noZig, root, runtimeC, tempDir, wvc, zigBuild } from './helpers.js';
+import { exe, examples, libDir, noZig, root, runtimeC, tempDir, wvc, zigBuild } from './helpers.js';
 
 const skip = noZig;
 const lines = (...xs) => xs.map((x) => x + '\n').join('');
@@ -93,7 +93,7 @@ for (const file of examples()) {
     const { input = '', args = [], out } = expected[file] ?? {};
     const dir = tempDir();
     const code = join(dir, 'out.c');
-    const c = wvc([file, '-o', code, '--runtime', runtimeC]);
+    const c = wvc([file, '-o', code, '--runtime', runtimeC, '--lib', libDir]);
     assert.deepEqual({ err: c.err, code: c.code }, { err: '', code: 0 });
     const env = { ...process.env };
     delete env.WAVERT_NAME; // examples/process.wvt reads it

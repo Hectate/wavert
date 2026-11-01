@@ -42,6 +42,7 @@ The language is specified in [docs/wavert-spec.md](docs/wavert-spec.md). The rea
 | [docs/](docs/) | The Wavert specification, and the design document that derived Wavert from Γ--. |
 | [wvc/](wvc/) | `wvc`, the Wavert compiler, written in Wavert, with its tests; `wvc/wvc.c` is the bootstrap seed. |
 | [runtime/](runtime/) | `wvt.c`, the runtime that compiled programs inline. |
+| [lib/](lib/) | The standard library written in Wavert: general helpers that any program imports with `;import grid from "$lib/grid.wvt"`. |
 | [examples/](examples/) | Short programs, each showing one feature: Hello World, echo, FizzBuzz, records, `match`, enums, modules, `ref` bindings, maps, records as map keys, telling kinds of record apart, sorting, files, processes, keys, random numbers, the terminal, pausing, and animating between key presses. |
 | [samples/](samples/) | Larger programs that combine features: a Wavert tokenizer written in Wavert, and walking around a room with the keyboard. |
 | [src/](src/) | Programs, built by `build.ps1`. |

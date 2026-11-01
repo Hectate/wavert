@@ -12,6 +12,9 @@ export const zig = process.env.ZIG || 'zig';
 export const noZig = spawnSync(zig, ['version']).status === 0 ? false : 'Zig not found (set ZIG to its path)';
 export const exe = process.platform === 'win32' ? '.exe' : '';
 export const runtimeC = join(root, 'runtime/wvt.c');
+// The standard library: wvc is built into a temporary directory, where it
+// would not find lib/ by itself, so the tests name it.
+export const libDir = join(root, 'lib');
 export const readRepo = (path) => readFileSync(join(root, path), 'utf8');
 
 // A fresh temporary directory.
@@ -47,12 +50,17 @@ export function writeFiles(files) {
   return dir;
 }
 
+// wvc's arguments for compiling main.wvt in dir to C, with lib (a folder in
+// dir) as the standard library, or the repository's lib/ if it is null.
+const compileArgs = (dir, lib) => ['main.wvt', '-o', 'main.c', '--runtime', runtimeC, '--lib', lib ? join(dir, lib) : libDir];
+
 // Compiles source (the entry file main.wvt, with libraries in files) to C,
 // builds it and runs it with input (a string or a Buffer): { out, err, code },
-// or the compile error as { err, code: 2, compileError: true }.
-export function run(source, { files = {}, input = '', args = [] } = {}) {
+// or the compile error as { err, code: 2, compileError: true }. lib names a
+// folder in files to use as the standard library.
+export function run(source, { files = {}, input = '', args = [], lib = null } = {}) {
   const dir = writeFiles({ ...files, 'main.wvt': source });
-  const c = wvc(['main.wvt', '-o', 'main.c', '--runtime', runtimeC], { cwd: dir });
+  const c = wvc(compileArgs(dir, lib), { cwd: dir });
   if (c.code !== 0) return { out: '', err: c.err, code: c.code, compileError: true };
   const program = zigBuild(join(dir, 'main.c'), join(dir, `main${exe}`));
   const r = spawnSync(program, args, { encoding: 'utf8', input });
@@ -62,15 +70,15 @@ export function run(source, { files = {}, input = '', args = [] } = {}) {
 // Builds source, which must compile cleanly; returns the program's path.
 export function buildProgram(source) {
   const dir = writeFiles({ 'main.wvt': source });
-  const c = wvc(['main.wvt', '-o', 'main.c', '--runtime', runtimeC], { cwd: dir });
+  const c = wvc(compileArgs(dir, null), { cwd: dir });
   if (c.code !== 0 || c.err !== '') throw new Error(`wvc failed:\n${c.err}`);
   return zigBuild(join(dir, 'main.c'), join(dir, `main${exe}`));
 }
 
 // The diagnostics wvc gives for source, or '' if it compiles.
-export function diagnostics(source, files = {}) {
+export function diagnostics(source, files = {}, { lib = null } = {}) {
   const dir = writeFiles({ ...files, 'main.wvt': source });
-  return wvc(['main.wvt', '-o', 'main.c', '--runtime', runtimeC], { cwd: dir }).err;
+  return wvc(compileArgs(dir, lib), { cwd: dir }).err;
 }
 
 // Every program in examples/ and samples/, as repo-relative paths, sorted;
