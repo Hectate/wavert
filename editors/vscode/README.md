@@ -17,7 +17,7 @@ To install it permanently, package a `.vsix`:
 ```
 cd editors/vscode
 npx @vscode/vsce package --skip-license --allow-missing-repository
-code --install-extension wavert-language-0.1.0.vsix
+code --install-extension wavert-language-0.2.0.vsix
 ```
 
 After changing the grammar, reload the window (**Developer: Reload Window**). An installed copy must be repackaged and reinstalled.

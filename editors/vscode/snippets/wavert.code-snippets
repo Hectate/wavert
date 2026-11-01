@@ -99,5 +99,65 @@
     "body": [
       "{ ${1:kind}: ${2:value} }"
     ]
+  },
+  "Match on kind": {
+    "prefix": "match-kind",
+    "description": "Match on a record's kind field, an enum member (§10.10)",
+    "body": [
+      ";match (${1:thing}.kind) {",
+      "\tcase ${2:Kind}.${3:a} {",
+      "\t\t$0",
+      "\t}",
+      "}"
+    ]
+  },
+  "Map": {
+    "prefix": "map",
+    "description": "Map literal; [:] is an empty map (§10.11)",
+    "body": [
+      "[${1:key}: ${2:value}]"
+    ]
+  },
+  "Loop over a map": {
+    "prefix": "while-map",
+    "description": "while loop over a map's keys and values, in insertion order (§10.11)",
+    "body": [
+      ";const ${1:keys} is ${2:m}(\\$keys)",
+      ";var ${3:i} is 0",
+      ";while (${3:i} < ${1:keys}(\\$length)) {",
+      "\t;const ${4:value} is ${2:m}[${1:keys}[${3:i}]]",
+      "\t$0",
+      "\t;set ${3:i} += 1",
+      "}"
+    ]
+  },
+  "Read keys": {
+    "prefix": "readkey",
+    "description": "Read key presses until q or the end of input (§12.2)",
+    "body": [
+      ";while (true) {",
+      "\t;const ${1:key} is (\\$readKey)",
+      "\t\tonfail { ;break }",
+      "\t;if (${1:key} == \"q\") { ;break }",
+      "\t$0",
+      "}"
+    ]
+  },
+  "Animation loop": {
+    "prefix": "tick",
+    "description": "Tick at a steady rate between key presses, with $waitKey and a deadline from $elapsed (§12.2)",
+    "body": [
+      ";var ${1:next} is (\\$elapsed) + ${2:100}",
+      ";while (true) {",
+      "\t;const ${3:key} is (${1:next} - (\\$elapsed))(\\$waitKey)",
+      "\t\tonfail { ;break }",
+      "\t;if (${3:key} == null) {",
+      "\t\t;set ${1:next} += ${2:100}",
+      "\t\t$0",
+      "\t} else if (${3:key} == \"q\") {",
+      "\t\t;break",
+      "\t}",
+      "}"
+    ]
   }
 }
