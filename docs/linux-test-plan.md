@@ -132,18 +132,18 @@ EOF
 sleep 2 | /tmp/wvt-linux/wait
 ```
 
-`sleep 2 |` keeps stdin open with nothing in it, so `$waitKey` times out. Expected: the sleeps take 100 to about 115 ms, and the wait 250 to about 260 ms with `null: true`. Record both lines.
+`sleep 2 |` keeps stdin open with nothing in it, so `$waitKey` times out. Expected: the wait takes 250 to about 260 ms with `null: true`, and the sleeps 100 to about 140 ms. The specification lets each sleep end up to a millisecond or two late (§12.8), and twenty sleeps add that up; a virtual machine's timer is typically at the slow end. More than 140 ms is a failure. Record both lines.
 
 ### A7. Signals while in key mode
 
-In a pseudo-terminal, send Ctrl+C (byte 3) while `samples/walk` waits for a key:
+In a pseudo-terminal, send Ctrl+C (byte 3) while `samples/walk` waits for a key. The pauses matter: bytes sent before `walk` is reading keys reach the terminal first, which raises the signal itself, and that would not test `walk`'s own handling in key mode.
 
 ```
 .wvt/wvc build samples/walk.wvt
-printf 'a\003' | script -qec "samples/walk" /dev/null > /tmp/wvt-linux/walk.out; echo "exit $?"
+(sleep 1; printf 'a'; sleep 0.5; printf '\003'; sleep 1) | script -qec "samples/walk" /dev/null > /tmp/wvt-linux/walk.out; echo "exit $?"
 ```
 
-Expected: the exit status reports SIGINT, normally 130. Record it. Whether the terminal is restored can only be seen in Part B.
+Expected: the exit status reports SIGINT, normally 130, and `/tmp/wvt-linux/walk.out` holds the first frame (`gold: 0`) and the frame after the move (`found 7 gold`). Record both. Whether the terminal is restored can only be seen in Part B.
 
 ## Part B: by hand, in a real terminal
 
@@ -162,7 +162,8 @@ These need a person. Use the terminal you normally use, and note it (GNOME Termi
 | B9 | `samples/crates samples/crates-puzzles` | Grey walls, yellow targets that shimmer, yellow `$` crates that turn green `*` on a target, a cyan `@`, the puzzle centred |
 | B10 | In `crates`, solve puzzle 1 (one move right) and wait a few seconds | `Solved in 1 move!` stays on screen while the targets keep shimmering |
 | B11 | In `crates`, resize the window while it runs | The puzzle re-centres on the next frame (within a quarter of a second) |
-| B12 | In `crates`, try u, r, n, p, h/j/k/l, and an arrow key held down | Undo, restart and moving between puzzles work; holding a key does not speed up the shimmer |
+| B12 | In `crates`, try u, r, n, p, h/j/k/l, and an arrow key held down | Undo, restart and moving between puzzles work; holding a key neither speeds up nor stops the shimmer |
+| B14 | Play `crates` for a while, then quit and scroll up in the terminal | Nothing from the game above where it started: frames are drawn in place, without scrolling |
 | B13 | In `crates`, press Escape alone, then run it again and press q | Both quit, and the shell prompt works normally afterwards |
 
 ## Results

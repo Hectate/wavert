@@ -6,8 +6,9 @@
 // - The board is a grid of terrain (lib/grid.wvt), with the crates in a map
 //   keyed by position (§10.11).
 // - It is drawn in layers with lib/view.wvt: in colour in a terminal, with
-//   targets that shimmer while the game waits for a key ($waitKey), and as
-//   plain text when the output is not a terminal ($terminal).
+//   targets that shimmer, on a clock that keys do not disturb ($elapsed and
+//   $waitKey), and as plain text when the output is not a terminal
+//   ($terminal).
 // - Undo keeps the earlier states in an array.
 //
 // Arrow keys, h j k l or w a s d move; u undoes, r restarts, n and p go to the
@@ -239,7 +240,9 @@
     ;if (tty) {
         ;const size is ($terminalSize)
             onfail { { width: 80, height: 24 } }
-        ;const window is (player, size.width, (size.height - 5, 3)(math.max), terrain)(view.follow)
+        // Five lines of text around the board, and one line spare: the newline
+        // after a frame's last line would otherwise scroll the screen.
+        ;const window is (player, size.width, (size.height - 6, 3)(math.max), terrain)(view.follow)
         ;set rows to (layers, window, null, null, [:], null, tick)(view.colorRows)
         ;"\u{1B}[H"($write)
     } else {
@@ -259,18 +262,25 @@
 }
 
 ;if (tty) { ;"\u{1B}[2J"($write) }
+// The targets shimmer: the tick advances every quarter of a second, at
+// deadlines on the clock, so that keys, even a key held down, neither delay
+// it nor speed it up.
+;const tickMs is 250
 ;var tick is 0
+;var next is ($elapsed) + tickMs
 ;var playing is true
 ;while (playing) {
-    ;tick(draw)
-    // Wait a quarter of a second for a key, so that the targets shimmer; the
-    // end of input quits.
-    ;const key is 250($waitKey)
-        onfail { "q" }
-    ;if (key == null) {
+    ;const now is ($elapsed)
+    ;if (now >= next) {
         ;set tick += 1
-        ;continue
+        // After a long pause, the next tick is a full tick away.
+        ;set next to next + tickMs > now ? next + tickMs : now + tickMs
     }
+    ;tick(draw)
+    // Wait for a key until the next tick; the end of input quits.
+    ;const key is (next - now)($waitKey)
+        onfail { "q" }
+    ;if (key == null) { ;continue }
     // A message stays until the next key, however many ticks that takes.
     ;set message to ""
     ;if (solved && key != "q" && key != "escape") {

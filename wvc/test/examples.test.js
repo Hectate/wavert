@@ -185,3 +185,26 @@ test('samples/crates.wvt: a message stays on screen while the game ticks', { ski
   assert.ok(frames.length >= 3, `only ${frames.length} frames after the move`);
   for (const f of frames) assert.match(f, /Solved in 1 move!/);
 });
+
+test('samples/crates.wvt: a key held down does not stop the ticks', { skip, timeout: 30000 }, async () => {
+  const dir = tempDir();
+  const c = wvc(['samples/crates.wvt', '-o', join(dir, 'crates.c'), '--runtime', runtimeC, '--lib', libDir]);
+  assert.deepEqual({ err: c.err, code: c.code }, { err: '', code: 0 });
+  const program = zigBuild(join(dir, 'crates.c'), join(dir, `crates${exe}`));
+  const child = spawn(program, [join(root, 'samples/crates-puzzles')], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let out = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { out += chunk; });
+  // A key every 50 ms for 1.5 s, as key repeat sends them: one that does
+  // nothing, so that each draws a frame.
+  let keys = 0;
+  const timer = setInterval(() => { child.stdin.write('x'); keys++; }, 50);
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  clearInterval(timer);
+  child.stdin.end();
+  await new Promise((resolve) => child.on('close', resolve));
+  // A frame for the start, one per key, and one per tick: about 6 ticks in
+  // 1.5 s, and at least 3 however slow the machine.
+  const frames = out.split('crates: puzzle').length - 1;
+  assert.ok(frames >= 1 + keys + 3, `${frames} frames for ${keys} keys: the ticks stopped while keys came`);
+});
