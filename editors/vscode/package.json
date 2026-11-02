@@ -2,7 +2,7 @@
   "name": "wavert-language",
   "displayName": "Wavert",
   "description": "Syntax highlighting, brackets, snippets, and documentation on hover and in completions for Wavert (.wvt)",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "wavert",
   "private": true,
   "license": "MIT",

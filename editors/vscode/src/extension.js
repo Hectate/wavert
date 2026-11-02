@@ -118,16 +118,31 @@ function completions(document, position) {
       return item;
     });
   }
+  const names = docs.qualifierBefore(before);
+  if (!names || names.length > 2) return null;
+  const file = document.uri.fsPath;
+  const text = document.getText();
+  const mod = moduleOf(file, text, names[0]);
   // module.: what the module exports.
-  const dotted = /([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]*)$/.exec(before);
-  if (!dotted) return null;
-  const mod = moduleOf(document.uri.fsPath, document.getText(), dotted[1]);
-  if (!mod) return null;
-  const kinds = { fn: vscode.CompletionItemKind.Function, enum: vscode.CompletionItemKind.Enum };
-  return docs.declarations(mod.text).filter((d) => d.exported).map((d) => {
-    const item = new vscode.CompletionItem(d.name, kinds[d.kind] ?? vscode.CompletionItemKind.Variable);
-    item.detail = d.signature;
-    item.documentation = describe(d, mod.label);
+  if (names.length === 1 && mod) {
+    const kinds = { fn: vscode.CompletionItemKind.Function, enum: vscode.CompletionItemKind.Enum };
+    return docs.declarations(mod.text).filter((d) => d.exported).map((d) => {
+      const item = new vscode.CompletionItem(d.name, kinds[d.kind] ?? vscode.CompletionItemKind.Variable);
+      item.detail = d.signature;
+      item.documentation = describe(d, mod.label);
+      return item;
+    });
+  }
+  // Enum. for an enum of this file, or module.Enum. for one the module
+  // exports: the enum's members.
+  const decl = names.length === 1
+    ? docs.declarations(text).find((d) => d.kind === 'enum' && d.name === names[0])
+    : mod && docs.declarations(mod.text).find((d) => d.exported && d.kind === 'enum' && d.name === names[1]);
+  if (!decl) return null;
+  return docs.enumMembers(decl).map((m) => {
+    const item = new vscode.CompletionItem(m, vscode.CompletionItemKind.EnumMember);
+    item.detail = decl.signature;
+    item.documentation = describe(decl, names.length === 2 ? mod.label : null);
     return item;
   });
 }

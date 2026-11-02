@@ -114,4 +114,19 @@ function nameAt(line, col) {
   return null;
 }
 
-module.exports = { declarations, header, imports, resolveImport, findLib, nameAt };
+// The names before the last dot of the dotted name that text ends with, as
+// text up to the cursor: ['world', 'Terrain'] for 'x(world.Terrain.de', and
+// ['grid'] for ';grid.'. null if text does not end in a name and a dot,
+// perhaps followed by the start of another name.
+function qualifierBefore(text) {
+  const m = /(?<![A-Za-z0-9_$])((?:[A-Za-z_][A-Za-z0-9_]*\.)+)[A-Za-z0-9_]*$/.exec(text);
+  return m ? m[1].slice(0, -1).split('.') : null;
+}
+
+// The members of an enum declaration, in order: ['orc', 'rat'] for
+// enum Kind (orc, rat).
+function enumMembers(decl) {
+  return (decl.params ?? '').split(',').map((s) => s.trim()).filter((s) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s));
+}
+
+module.exports = { declarations, header, imports, resolveImport, findLib, nameAt, qualifierBefore, enumMembers };

@@ -87,6 +87,19 @@ test('finding the name under the cursor', () => {
   assert.equal(docs.nameAt(';(1, 2)', 3), null);
 });
 
+test('completing after a dot: the qualifier, and an enum\'s members', () => {
+  assert.deepEqual(docs.qualifierBefore(';grid.'), ['grid']);
+  assert.deepEqual(docs.qualifierBefore(';x(grid.ci'), ['grid']);
+  assert.deepEqual(docs.qualifierBefore(';set t to world.Terrain.'), ['world', 'Terrain']);
+  assert.deepEqual(docs.qualifierBefore('    Kind.o'), ['Kind']);
+  assert.equal(docs.qualifierBefore(';const x is grid'), null);
+  assert.equal(docs.qualifierBefore(';const x is 1.'), null);
+  assert.equal(docs.qualifierBefore(';xs[0].'), null);
+  const kind = docs.declarations(';enum Kind (orc,\r\n    rat, bat)').find((d) => d.name === 'Kind');
+  assert.deepEqual(docs.enumMembers(kind), ['orc', 'rat', 'bat']);
+  assert.deepEqual(docs.enumMembers(docs.declarations(';fn f() { 1 }')[0]), []);
+});
+
 test('imports lead to files, and $lib/ to the standard library', () => {
   const lib = join(root, 'lib');
   assert.equal(docs.resolveImport(join(root, 'examples/stdlib.wvt'), '$lib/math.wvt', lib), join(lib, 'math.wvt'));
