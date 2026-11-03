@@ -138,8 +138,9 @@ Import with `;import name from "$lib/name.wvt"`; see [lib/README.md](../lib/READ
 |---|---|
 | `math` | `abs min max clamp div isqrt gcd lcm sum minOf maxOf lerp` |
 | `text` | `repeat padLeft padRight center trim startsWith endsWith indexOf contains replace toUpper toLower wrap` |
-| `arrays` | `indexOf contains count range filled concat removeAt insertAt` |
-| `maps` | `getOr add pushTo` |
+| `arrays` | `indexOf contains count range filled concat removeAt insertAt toString` |
+| `maps` | `getOr add pushTo toString` |
+| `records` | `get getOr toMap copyFields toString` |
 | `grid` | Grids of cells, positions (`pos`), areas (`rect circle ...`) and combining them. One cell off the grid fails; areas use the part on the grid |
 | `dice` | Rolling, dice notation (`"2d6+1"`), exact odds and `percent` |
 | `view` | Drawing layers to rows of text or colour, a window that follows the player, the player's memory of the map, animation |

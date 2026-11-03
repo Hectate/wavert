@@ -436,6 +436,27 @@ test('arrays: removeAt and insertAt', { skip }, () => {
   assert.equal(panicOf(arraysProgram(';const xs is [1, 2]\n;fn f(ref a) { ;(a, 0)(arrays.removeAt) }\n;xs(f)')), 'cannot modify a frozen array');
 });
 
+test('arrays: toString, nested, with records and maps, failing on a cycle', { skip }, () => {
+  assert.equal(out(arraysProgram(`
+;enum Kind (orc, rat)
+;[1, 2, 3](arrays.toString)($print)
+;[](arrays.toString)($print)
+;[1, 2.0, "a b", "q\\"\\\\\\n\\t{{x}}", true, null, Kind.rat, [], [[1], [2, [3]]]](arrays.toString)($print)
+;const shared is [1]
+;[shared, shared, { x: 1, at: { y: [2] } }, ["k": 1, 2: "two", { x: 3 }: Kind.orc], [:]](arrays.toString)($print)
+;var grown is [1]
+;(grown, 2)($push)
+;grown(arrays.toString)($print)
+;var loop is [1]
+;var holder is { kind: Kind.orc, items: loop }
+;(loop, holder)($push)
+;const c is loop(arrays.toString)
+    onfail { "cycle fails" }
+;c($print)`)),
+  lines('[1, 2, 3]', '[]', '[1, 2.0, "a b", "q\\"\\\\\\n\\t{x}", true, null, rat, [], [[1], [2, [3]]]]',
+    '[[1], [1], { x: 1, at: { y: [2] } }, ["k": 1, 2: "two", { x: 3 }: orc], [:]]', '[1, 2]', 'cycle fails'));
+});
+
 // ---- maps.wvt ----
 
 test('maps: getOr, add and pushTo', { skip }, () => {
@@ -457,6 +478,48 @@ test('maps: getOr, add and pushTo', { skip }, () => {
 ;(piles, "a", "y")(maps.pushTo)
 ;"{(piles["a"], ",")($join)} {(before, ",")($join)}"($print)`),
   lines('3 -1 0 orc,rat', 'coin,gem rock 2', 'x,y x'));
+});
+
+test('maps: toString', { skip }, () => {
+  assert.equal(out(`;import maps from "$lib/maps.wvt"
+;enum Kind (orc, rat)
+;[Kind.orc: [1, 2], "name": "Grak", { x: 3 }: { hp: 5 }](maps.toString)($print)
+;[:](maps.toString)($print)
+;var loop is [:]
+;set loop["self"] to [loop]
+;const c is loop(maps.toString)
+    onfail { "cycle fails" }
+;c($print)`),
+  lines('[orc: [1, 2], "name": "Grak", { x: 3 }: { hp: 5 }]', '[:]', 'cycle fails'));
+});
+
+// ---- records.wvt ----
+
+test('records: get, getOr, toMap, copyFields and toString', { skip }, () => {
+  assert.equal(out(`;import records from "$lib/records.wvt"
+;import maps from "$lib/maps.wvt"
+;enum Kind (orc, rat)
+;const orc is { kind: Kind.orc, hp: 5, at: [3, 4] }
+;const mana is (orc, "mana")(records.get)
+    onfail { "none" }
+;"{(orc, "hp")(records.get)} {mana} {(orc, "hp", 0)(records.getOr)} {(orc, "mana", 0)(records.getOr)}"($print)
+;var m is orc(records.toMap)
+;set m["extra"] to "x"
+;"{m(maps.toString)} {orc(records.toString)}"($print)
+;var target is { kind: Kind.rat, hp: 1, name: "Rat" }
+;const n is (target, orc)(records.copyFields)
+;"{n} {target(records.toString)} {({ a: 1 }, { b: 2 })(records.copyFields)}"($print)
+;var loop is { self: null }
+;set loop.self to [loop]
+;const c is loop(records.toString)
+    onfail { "cycle fails" }
+;c($print)`),
+  lines('5 none 5 0', '["kind": orc, "hp": 5, "at": [3, 4], "extra": "x"] { kind: orc, hp: 5, at: [3, 4] }',
+    '2 { kind: orc, hp: 5, name: "Rat" } 0', 'cycle fails'));
+  assert.equal(panicOf(`;import records from "$lib/records.wvt"
+;const frozen is { hp: 1 }
+;fn f(ref r) { ;(r, { hp: 2 })(records.copyFields) }
+;frozen(f)`), 'cannot modify a field of a frozen record');
 });
 
 // ---- view.wvt ----

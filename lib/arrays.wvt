@@ -5,6 +5,7 @@
 // ;(["orc", "rat", "orc"], "orc")(arrays.count)   // 2
 // ;var pack is ["sword", "rope", "lamp"]
 // ;const dropped is (pack, 1)(arrays.removeAt)    // "rope"; pack is ["sword", "lamp"]
+// ;[1, ["a", { x: 2 }]](arrays.toString)           // [1, ["a", { x: 2 }]]
 //
 // Elements compare with $same (§10.5), so arrays and records in an array are
 // found by their contents. An index may be negative, counting from the end,
@@ -117,6 +118,91 @@
         ;set j -= 1
     }
     ;set xs[k] to x
+}
+
+// s in double quotes, with backslashes, quotes, newlines and tabs escaped.
+;fn quoted(s) {
+    ;var parts is ["\""]
+    ;var i is 0
+    ;while (i < s($length)) {
+        ;const c is (s, i)($at)
+        ;match (c) {
+            case "\\" { ;(parts, "\\\\")($push) }
+            case "\"" { ;(parts, "\\\"")($push) }
+            case "\n" { ;(parts, "\\n")($push) }
+            case "\t" { ;(parts, "\\t")($push) }
+            else { ;(parts, c)($push) }
+        }
+        ;set i += 1
+    }
+    ;(parts, "\"")($push)
+    (parts, "")($join)
+}
+
+// The text of v, as for toString. seen holds the arrays, records and maps
+// being written, outside v; v being one of them fails.
+;fn text(ref v, ref seen) {
+    ;const t is v($typeOf)
+    ;if (t == "string") { ;return v(quoted) }
+    ;!if (t == "array" || t == "record" || t == "map") { ;return v($toString) }
+    ;var i is 0
+    ;while (i < seen($length)) {
+        ;if (seen[i] == v) { ;fail }
+        ;set i += 1
+    }
+    ;(seen, v)($push)
+    ;var parts is []
+    ;match (t) {
+        case "array" {
+            ;set i to 0
+            ;while (i < v($length)) {
+                ;const item is (v[i], seen)(text)
+                    onfail { ;fail }
+                ;(parts, item)($push)
+                ;set i += 1
+            }
+        }
+        case "record" {
+            ;const names is v($fields)
+            ;set i to 0
+            ;while (i < names($length)) {
+                ;const field is (v[names[i]], seen)(text)
+                    onfail { ;fail }
+                ;(parts, "{names[i]}: {field}")($push)
+                ;set i += 1
+            }
+        }
+        else {
+            ;const keys is v($keys)
+            ;set i to 0
+            ;while (i < keys($length)) {
+                ;const key is (keys[i], seen)(text)
+                    onfail { ;fail }
+                ;const value is (v[keys[i]], seen)(text)
+                    onfail { ;fail }
+                ;(parts, "{key}: {value}")($push)
+                ;set i += 1
+            }
+        }
+    }
+    ;seen($pop)
+    ;const inside is (parts, ", ")($join)
+    ;if (t == "array") { ;return "[{inside}]" }
+    ;if (t == "map") { ;return parts($length) == 0 ? "[:]" : "[{inside}]" }
+    parts($length) == 0 ? "{{}}" : "{{ {inside} }}"
+}
+
+// The text of xs in the form of a literal, such as
+// [1, 2.5, "rope", [true, null], { x: 1 }, ["a": 1]]. Strings are quoted, with
+// backslashes, quotes, newlines and tabs escaped; arrays, records and maps
+// inside xs are written out the same way; numbers, booleans, null and enum
+// members appear as interpolation gives them (§9.3). Fails if xs contains
+// itself, at any depth.
+;export fn toString(ref xs) {
+    ;var seen is []
+    ;const out is (xs, seen)(text)
+        onfail { ;fail }
+    out
 }
 
 ;end

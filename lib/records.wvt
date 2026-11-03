@@ -1,0 +1,71 @@
+// records: record helpers. For maps, see maps.wvt.
+//
+// ;import records from "$lib/records.wvt"
+// ;const orc is { kind: Kind.orc, hp: 5 }
+// ;(orc, "hp", 0)(records.getOr)               // 5
+// ;(orc, "mana", 0)(records.getOr)             // 0, as orc has no field mana
+// ;orc(records.toMap)                          // ["kind": orc, "hp": 5]
+//
+// A record's fields are fixed by its literal (§10.7), so these read the fields
+// a record has and never add any. Reading a missing field with r[name] panics;
+// get and getOr are for fields a record may not have.
+
+;import arrays from "arrays.wvt"
+
+// The value of field name of r. Fails if r has no field name.
+;export fn get(ref r, name) {
+    ;const names is r($fields)
+    ;var i is 0
+    ;while (i < names($length)) {
+        ;if (names[i] == name) { ;return r[name] }
+        ;set i += 1
+    }
+    ;fail
+}
+
+// The value of field name of r, or otherwise if r has no field name.
+;export fn getOr(ref r, name, otherwise) {
+    ;const v is (r, name)(get)
+        onfail { otherwise }
+    v
+}
+
+// A new mutable map from each field name of r to its value, in field order.
+;export fn toMap(ref r) {
+    ;const names is r($fields)
+    ;var m is [:]
+    ;var i is 0
+    ;while (i < names($length)) {
+        ;set m[names[i]] to r[names[i]]
+        ;set i += 1
+    }
+    m
+}
+
+// Sets each field of to, a mutable record, that from also has to from's value,
+// as for applying a template or a saved state. Fields only one of them has are
+// left alone. Returns the number of fields set. The copy is shallow: an array
+// in a field of from is then shared by both.
+;export fn copyFields(ref to, ref from) {
+    ;const names is to($fields)
+    ;var n is 0
+    ;var i is 0
+    ;while (i < names($length)) {
+        ;const v is (from, names[i])(get)
+            onfail { ;set i += 1 ;continue }
+        ;set to[names[i]] to v
+        ;set n += 1
+        ;set i += 1
+    }
+    n
+}
+
+// The text of r in the form of a literal, such as { kind: orc, at: [3, 4] },
+// written as arrays.toString writes it. Fails if r contains itself.
+;export fn toString(ref r) {
+    ;const out is r(arrays.toString)
+        onfail { ;fail }
+    out
+}
+
+;end

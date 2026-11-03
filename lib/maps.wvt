@@ -9,6 +9,8 @@
 //
 // The maps these change are mutable: hold them in var bindings (§10.11).
 
+;import arrays from "arrays.wvt"
+
 // The value of key k in m, or otherwise if m has no key k.
 ;export fn getOr(ref m, k, otherwise) {
     ;const v is (m, k)($get)
@@ -31,6 +33,14 @@
         onfail { [] }
     ;(list, x)($push)
     ;set m[k] to list
+}
+
+// The text of m in the form of a literal, such as ["orc": 2, "rat": [1, 2]],
+// written as arrays.toString writes it. Fails if m contains itself.
+;export fn toString(ref m) {
+    ;const out is m(arrays.toString)
+        onfail { ;fail }
+    out
 }
 
 ;end
