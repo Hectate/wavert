@@ -15,10 +15,5 @@
 ;(monsters, { x: 0, y: 0 })($has)($print)
 
 // The keys are records, so their fields are there to read.
-;const keys is monsters($keys)
-;var i is 0
-;while (i < keys($length)) {
-    ;"{monsters[keys[i]]} at {keys[i].x},{keys[i].y}"($print)
-    ;set i += 1
-}
+;for (p, name in monsters) { ;"{name} at {p.x},{p.y}"($print) }
 ;exit

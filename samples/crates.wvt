@@ -44,15 +44,12 @@
     ;var title is ""
     ;var lines is []
     ;const all is (((content, "\r\n")($split), "\n")($join), "\n")($split)
-    ;var i is 0
-    ;while (i < all($length)) {
-        ;const line is all[i]
+    ;for (line in all) {
         ;if ((line, "; title:")(text.startsWith)) {
             ;set title to (line, 8, line($length))($slice)(text.trim)
         } else if (!(line, ";")(text.startsWith)) {
             ;(lines, line)($push)
         }
-        ;set i += 1
     }
     ;while (lines($length) > 0 && lines[-1](text.trim) == "") { ;lines($pop) }
     ;if (lines($length) == 0) {
@@ -60,22 +57,16 @@
         ;fail
     }
     ;var width is 0
-    ;set i to 0
-    ;while (i < lines($length)) {
-        ;if (lines[i]($length) > width) { ;set width to lines[i]($length) }
-        ;set i += 1
+    ;for (line in lines) {
+        ;if (line($length) > width) { ;set width to line($length) }
     }
     ;var terrain is (width, lines($length), Terrain.floor)(grid.new)
     ;var crates is [:]
     ;var player is null
     ;var targets is 0
-    ;var y is 0
-    ;while (y < lines($length)) {
-        ;const cs is (lines[y], "")($split)
-        ;var x is 0
-        ;while (x < cs($length)) {
+    ;for (y, line in lines) {
+        ;for (x, c in (line, "")($split)) {
             ;const p is (x, y)(grid.pos)
-            ;const c is cs[x]
             ;if (c == "#") { ;(terrain, p, Terrain.wall)(grid.putAt) }
             ;if (c == "." || c == "*" || c == "+") {
                 ;(terrain, p, Terrain.target)(grid.putAt)
@@ -93,9 +84,7 @@
                 ;set problem to "row {y + 1} has '{c}', which is not part of a puzzle"
                 ;fail
             }
-            ;set x += 1
         }
-        ;set y += 1
     }
     ;if (player == null) {
         ;set problem to "there is no player (@ or +)"
@@ -124,10 +113,7 @@
 ;const names is dir($listDir)
     onfail { ;"crates: cannot read the puzzle folder {dir}"($eprint) ;exit 2 }
 ;var puzzles is []
-;var n is 0
-;while (n < names($length)) {
-    ;const name is names[n]
-    ;set n += 1
+;for (name in names) {
     ;if (!(name, ".txt")(text.endsWith)) { ;continue }
     ;const content is (dir + "/" + name)($readFile)
         onfail { ;"crates: cannot read {name}"($eprint) ;continue }
@@ -200,11 +186,8 @@
 
 // Whether every crate is on a target.
 ;fn allPlaced() {
-    ;const ps is crates($keys)
-    ;var i is 0
-    ;while (i < ps($length)) {
-        ;if ((terrain, ps[i])(grid.at) != Terrain.target) { ;return false }
-        ;set i += 1
+    ;for (p in crates) {
+        ;if ((terrain, p)(grid.at) != Terrain.target) { ;return false }
     }
     true
 }
@@ -227,11 +210,8 @@
 
 ;fn draw(tick) {
     ;var shown is [:]
-    ;const ps is crates($keys)
-    ;var i is 0
-    ;while (i < ps($length)) {
-        ;set shown[ps[i]] to (terrain, ps[i])(grid.at) == Terrain.target ? placedCrate : looseCrate
-        ;set i += 1
+    ;for (p in crates) {
+        ;set shown[p] to (terrain, p)(grid.at) == Terrain.target ? placedCrate : looseCrate
     }
     ;var here is [:]
     ;set here[player] to me
@@ -251,11 +231,7 @@
     ;const title is puzzles[index].title
     ;"crates: puzzle {index + 1} of {puzzles($length)}{title == "" ? "" : ": " + title}"(say)
     ;""(say)
-    ;set i to 0
-    ;while (i < rows($length)) {
-        ;rows[i](say)
-        ;set i += 1
-    }
+    ;for (row in rows) { ;row(say) }
     ;""(say)
     ;"moves {moves}    u undo  r restart  n/p puzzle  q quit"(say)
     ;message(say)

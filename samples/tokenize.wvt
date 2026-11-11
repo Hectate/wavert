@@ -16,10 +16,8 @@
   "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="]
 
 ;fn contains(xs, x) {
-    ;var k is 0
-    ;while (k < xs($length)) {
-        ;if (xs[k] == x) { ;return true }
-        ;set k += 1
+    ;for (y in xs) {
+        ;if (y == x) { ;return true }
     }
     false
 }
@@ -41,10 +39,8 @@
 
 // Length of the operator or punctuation at i.
 ;fn opLength(cs, i) {
-    ;var k is 0
-    ;while (k < longOps($length)) {
-        ;if ((cs, i, longOps[k])(lookingAt)) { ;return longOps[k]($length) }
-        ;set k += 1
+    ;for (op in longOps) {
+        ;if ((cs, i, op)(lookingAt)) { ;return op($length) }
     }
     1
 }
@@ -120,11 +116,6 @@
     onfail { ;"cannot read {$args[0]}"($eprint) ;exit 2 }
 
 ;const tokens is src(tokenize)
-;var t is 0
-;while (t < tokens($length)) {
-    ;const tok is tokens[t]
-    ;"{tok.kind} {tok.text}"($print)
-    ;set t += 1
-}
+;for (tok in tokens) { ;"{tok.kind} {tok.text}"($print) }
 ;"{tokens($length)} tokens"($print)
 ;exit

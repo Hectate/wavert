@@ -7,11 +7,7 @@
 
 ;fn show(players) {
     ;var parts is []
-    ;var i is 0
-    ;while (i < players($length)) {
-        ;(parts, "{players[i].name} {players[i].score}")($push)
-        ;set i += 1
-    }
+    ;for (p in players) { ;(parts, "{p.name} {p.score}")($push) }
     ;(parts, ", ")($join)($print)
 }
 
@@ -26,11 +22,7 @@
 // ...or by an array of keys, one for each item. For highest first, negate the
 // scores: Ada stays before Cy. $reverse would put Cy before Ada.
 ;var negated is []
-;var i is 0
-;while (i < players($length)) {
-    ;(negated, -players[i].score)($push)
-    ;set i += 1
-}
+;for (p in players) { ;(negated, -p.score)($push) }
 ;(players, negated)($sortBy)(show)
 ;(players, "score")($sortBy)($reverse)(show)
 ;exit

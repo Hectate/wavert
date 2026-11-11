@@ -10,11 +10,7 @@
 // Each step rebinds the head of the list to a new frozen record. A var
 // binding would copy every record to make it mutable; a ref one does not.
 ;ref list is null
-;var i is 1
-;while (i <= 4) {
-    ;set list to { value: i, next: list }
-    ;set i += 1
-}
+;for (i in 1, 5) { ;set list to { value: i, next: list } }
 
 // ---- Walking ----
 // A ref parameter takes the argument as it is and can be rebound, so the

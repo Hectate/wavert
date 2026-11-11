@@ -25,16 +25,12 @@
 // Clears the screen and moves the cursor to the top left, then draws.
 ;fn draw() {
     ;"\u{1B}[2J\u{1B}[H"($write)
-    ;var y is 0
-    ;while (y < height) {
+    ;for (y in 0, height) {
         ;var line is []
-        ;var x is 0
-        ;while (x < width) {
+        ;for (x in 0, width) {
             ;(line, x == px && y == py ? "@" : (x, y)(getCell))($push)
-            ;set x += 1
         }
         ;(line, "")($join)($print)
-        ;set y += 1
     }
     ;"gold: {gold}"($print)
     ;message($print)
@@ -58,12 +54,10 @@
 
 // ---- The room ----
 // Walls around the edge, and three piles of gold on empty floor.
-;var i is 0
-;while (i < width * height) {
-    ;const col is i % width
-    ;const row is (i / width)($floor)
-    ;(cells, col == 0 || row == 0 || col == width - 1 || row == height - 1 ? "#" : ".")($push)
-    ;set i += 1
+;for (row in 0, height) {
+    ;for (col in 0, width) {
+        ;(cells, col == 0 || row == 0 || col == width - 1 || row == height - 1 ? "#" : ".")($push)
+    }
 }
 ;var piles is 0
 ;while (piles < 3) {

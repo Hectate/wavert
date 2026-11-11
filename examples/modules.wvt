@@ -21,11 +21,9 @@
 // called as (module.name).
 ;const all is [shapes.Shape.circle, shapes.Shape.triangle, shapes.Shape.square]
 ;var total is 0
-;var i is 0
-;while (i < all($length)) {
-    ;all[i](shapes.describe)($print)
-    ;set total to total + all[i](shapes.corners)
-    ;set i += 1
+;for (shape in all) {
+    ;shape(shapes.describe)($print)
+    ;set total to total + shape(shapes.corners)
 }
 ;const summary is (total, "corner")(text.count)
 ;"{summary} in all"($print)

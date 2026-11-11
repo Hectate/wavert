@@ -11,11 +11,7 @@
 // (rng, n)($random) is an int from 0 to n - 1. It advances rng, which must be
 // held in a var or ref binding.
 ;var rolls is []
-;var i is 0
-;while (i < 5) {
-    ;(rolls, (rng, 6)($random) + 1)($push)
-    ;set i += 1
-}
+;for (i in 0, 5) { ;(rolls, (rng, 6)($random) + 1)($push) }
 ;"dice: {(rolls, " ")($join)}"($print)
 ;"a float from 0.0 up to 1.0: {rng($randomFloat)}"($print)
 

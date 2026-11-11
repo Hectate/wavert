@@ -25,11 +25,7 @@
 ;export fn dice(ref rng, count, sides) {
     ;if (count < 0) { ;panic "dice.dice: the count of dice is negative, got {count}" }
     ;var total is 0
-    ;var i is 0
-    ;while (i < count) {
-        ;set total += (rng, sides)(roll)
-        ;set i += 1
-    }
+    ;for (i in 0, count) { ;set total += (rng, sides)(roll) }
     total
 }
 
@@ -52,13 +48,11 @@
 // A copy of xs in random order, every order equally likely (Fisher-Yates).
 ;export fn shuffled(ref rng, xs) {
     ;var out is xs
-    ;var i is out($length) - 1
-    ;while (i > 0) {
+    ;for (i in 1, out($length) reversed) {
         ;const j is (rng, i + 1)($random)
         ;const t is out[i]
         ;set out[i] to out[j]
         ;set out[j] to t
-        ;set i -= 1
     }
     out
 }
@@ -68,25 +62,21 @@
 // with only ints the choice is exact. Panics if they add up to 0.
 ;export fn weighted(ref rng, ref weights) {
     ;var total is 0
-    ;var i is 0
-    ;while (i < weights($length)) {
-        ;if (weights[i] < 0) { ;panic "dice.weighted: weight {i} is negative, got {weights[i]}" }
-        ;set total += weights[i]
-        ;set i += 1
+    ;for (i, w in weights) {
+        ;if (w < 0) { ;panic "dice.weighted: weight {i} is negative, got {w}" }
+        ;set total += w
     }
     ;if (total <= 0) { ;panic "dice.weighted: the weights add up to {total}" }
     ;var r is total($typeOf) == "int" ? (rng, total)($random) : rng($randomFloat) * total
-    ;set i to 0
     // The last index with a weight above 0 catches a float r that rounding
     // pushed to total.
     ;var last is 0
-    ;while (i < weights($length)) {
-        ;if (weights[i] > 0) {
-            ;if (r < weights[i]) { ;return i }
-            ;set r -= weights[i]
+    ;for (i, w in weights) {
+        ;if (w > 0) {
+            ;if (r < w) { ;return i }
+            ;set r -= w
             ;set last to i
         }
-        ;set i += 1
     }
     last
 }
@@ -149,26 +139,14 @@
     ;if (count < 0 || sides < 1) { ;panic "dice.odds: cannot roll {count}d{sides}" }
     // One die at a time: each total so far spreads evenly over the next die's faces.
     ;var dist is [1.0]
-    ;var n is 0
-    ;while (n < count) {
+    ;for (n in 0, count) {
         ;var next is []
-        ;var t is 0
-        ;while (t < dist($length) + sides) {
-            ;(next, 0.0)($push)
-            ;set t += 1
-        }
-        ;set t to 0
-        ;while (t < dist($length)) {
-            ;const share is dist[t] / sides
-            ;var face is 1
-            ;while (face <= sides) {
-                ;set next[t + face] += share
-                ;set face += 1
-            }
-            ;set t += 1
+        ;for (t in 0, dist($length) + sides) { ;(next, 0.0)($push) }
+        ;for (t, p in dist) {
+            ;const share is p / sides
+            ;for (face in 1, sides + 1) { ;set next[t + face] += share }
         }
         ;set dist to next
-        ;set n += 1
     }
     dist
 }

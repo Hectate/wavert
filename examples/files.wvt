@@ -13,10 +13,8 @@
 // $listDir gives the names in a directory.
 ;const names is "."($listDir)
 ;var listed is false
-;var i is 0
-;while (i < names($length)) {
-    ;if (names[i] == path) { ;set listed to true }
-    ;set i += 1
+;for (name in names) {
+    ;if (name == path) { ;set listed to true }
 }
 ;"listed: {listed}"($print)
 

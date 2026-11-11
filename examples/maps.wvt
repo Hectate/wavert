@@ -23,10 +23,6 @@
 // $keys and $values are arrays in the same order, so one index walks both.
 ;const keys is stock($keys)
 ;const counts is stock($values)
-;var i is 0
-;while (i < keys($length)) {
-    ;"{keys[i]}: {counts[i]}"($print)
-    ;set i += 1
-}
+;for (i, key in keys) { ;"{key}: {counts[i]}"($print) }
 ;"{stock($length)} kinds"($print)
 ;exit

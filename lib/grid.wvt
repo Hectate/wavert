@@ -94,11 +94,7 @@
 ;export fn new(width, height, value) {
     ;if (width < 0 || height < 0) { ;panic "grid.new: the size {width} x {height} is negative" }
     ;var cells is []
-    ;var i is 0
-    ;while (i < width * height) {
-        ;(cells, value)($push)
-        ;set i += 1
-    }
+    ;for (i in 0, width * height) { ;(cells, value)($push) }
     ;const frozen is cells
     { width: width, height: height, cells: frozen }
 }
@@ -159,10 +155,8 @@
 // cell is converted as interpolation converts it (§9.3).
 ;export fn rows(ref g) {
     ;var out is []
-    ;var y is 0
-    ;while (y < g.height) {
+    ;for (y in 0, g.height) {
         ;(out, ((g.cells, y * g.width, y * g.width + g.width)($slice), "")($join))($push)
-        ;set y += 1
     }
     out
 }
@@ -174,14 +168,8 @@
     ;const x0 is (a.x, b.x)(math.min)
     ;const x1 is (a.x, b.x)(math.max)
     ;var out is []
-    ;var y is (a.y, b.y)(math.min)
-    ;while (y <= (a.y, b.y)(math.max)) {
-        ;var x is x0
-        ;while (x <= x1) {
-            ;(out, (x, y)(pos))($push)
-            ;set x += 1
-        }
-        ;set y += 1
+    ;for (y in (a.y, b.y)(math.min), (a.y, b.y)(math.max) + 1) {
+        ;for (x in x0, x1 + 1) { ;(out, (x, y)(pos))($push) }
     }
     out
 }
@@ -197,10 +185,8 @@
 ;export fn ring(center, r) {
     ;var out is []
     ;const all is (center, r)(square)
-    ;var i is 0
-    ;while (i < all($length)) {
-        ;if ((center, all[i])(chebyshev) == r) { ;(out, all[i])($push) }
-        ;set i += 1
+    ;for (p in all) {
+        ;if ((center, p)(chebyshev) == r) { ;(out, p)($push) }
     }
     out
 }
@@ -209,10 +195,8 @@
 ;export fn diamond(center, r) {
     ;var out is []
     ;const all is (center, r)(square)
-    ;var i is 0
-    ;while (i < all($length)) {
-        ;if ((center, all[i])(manhattan) <= r) { ;(out, all[i])($push) }
-        ;set i += 1
+    ;for (p in all) {
+        ;if ((center, p)(manhattan) <= r) { ;(out, p)($push) }
     }
     out
 }
@@ -221,13 +205,11 @@
 ;export fn circle(center, r) {
     ;var out is []
     ;const all is (center, r)(square)
-    ;var i is 0
-    ;while (i < all($length)) {
-        ;const dx is all[i].x - center.x
-        ;const dy is all[i].y - center.y
+    ;for (p in all) {
+        ;const dx is p.x - center.x
+        ;const dy is p.y - center.y
         // dx² + dy² < (r + 1/2)², in ints.
-        ;if (dx * dx + dy * dy <= r * r + r) { ;(out, all[i])($push) }
-        ;set i += 1
+        ;if (dx * dx + dy * dy <= r * r + r) { ;(out, p)($push) }
     }
     out
 }
@@ -235,10 +217,8 @@
 // The positions of area that are on g, in order.
 ;export fn within(ref g, ref area) {
     ;var out is []
-    ;var i is 0
-    ;while (i < area($length)) {
-        ;if ((g, area[i].x, area[i].y)(inside)) { ;(out, area[i])($push) }
-        ;set i += 1
+    ;for (p in area) {
+        ;if ((g, p.x, p.y)(inside)) { ;(out, p)($push) }
     }
     out
 }
@@ -247,10 +227,8 @@
 // for asking what is in an area. To act on each cell where it is, use cellsAt.
 ;export fn valuesAt(ref g, ref area) {
     ;var out is []
-    ;var i is 0
-    ;while (i < area($length)) {
-        ;if ((g, area[i].x, area[i].y)(inside)) { ;(out, g.cells[area[i].y * g.width + area[i].x])($push) }
-        ;set i += 1
+    ;for (p in area) {
+        ;if ((g, p.x, p.y)(inside)) { ;(out, g.cells[p.y * g.width + p.x])($push) }
     }
     out
 }
@@ -260,11 +238,8 @@
 // what is in an area, use valuesAt.
 ;export fn cellsAt(ref g, ref area) {
     ;var out is []
-    ;var i is 0
-    ;while (i < area($length)) {
-        ;const p is area[i]
+    ;for (p in area) {
         ;if ((g, p.x, p.y)(inside)) { ;(out, { pos: p, value: g.cells[p.y * g.width + p.x] })($push) }
-        ;set i += 1
     }
     out
 }
@@ -272,10 +247,8 @@
 // Sets the cells of g at the positions of area that are on g to v.
 ;export fn fill(ref g, ref area, v) {
     ;var cells is g.cells
-    ;var i is 0
-    ;while (i < area($length)) {
-        ;if ((g, area[i].x, area[i].y)(inside)) { ;set cells[area[i].y * g.width + area[i].x] to v }
-        ;set i += 1
+    ;for (p in area) {
+        ;if ((g, p.x, p.y)(inside)) { ;set cells[p.y * g.width + p.x] to v }
     }
     ;set g.cells to cells
 }
@@ -287,25 +260,18 @@
 // The positions of area as the keys of a map.
 ;fn keys(ref area) {
     ;var m is [:]
-    ;var i is 0
-    ;while (i < area($length)) {
-        ;set m[area[i]] to true
-        ;set i += 1
-    }
+    ;for (p in area) { ;set m[p] to true }
     m
 }
 
 // Adds to out the positions of area not yet in seen that are in other, or not
 // in other, as inOther says.
 ;fn collect(ref area, ref other, inOther, ref seen, ref out) {
-    ;var i is 0
-    ;while (i < area($length)) {
-        ;const p is area[i]
+    ;for (p in area) {
         ;if ((other, p)($has) == inOther && !(seen, p)($has)) {
             ;set seen[p] to true
             ;(out, p)($push)
         }
-        ;set i += 1
     }
 }
 

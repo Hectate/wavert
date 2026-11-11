@@ -70,11 +70,7 @@
 // The sum of an array of numbers; 0 for an empty array.
 ;export fn sum(ref xs) {
     ;var total is 0
-    ;var i is 0
-    ;while (i < xs($length)) {
-        ;set total += xs[i]
-        ;set i += 1
-    }
+    ;for (x in xs) { ;set total += x }
     total
 }
 
@@ -83,10 +79,8 @@
 ;export fn minOf(ref xs) {
     ;if (xs($length) == 0) { ;fail }
     ;var best is xs[0]
-    ;var i is 1
-    ;while (i < xs($length)) {
-        ;if (xs[i] < best) { ;set best to xs[i] }
-        ;set i += 1
+    ;for (x in xs) {
+        ;if (x < best) { ;set best to x }
     }
     best
 }
@@ -96,10 +90,8 @@
 ;export fn maxOf(ref xs) {
     ;if (xs($length) == 0) { ;fail }
     ;var best is xs[0]
-    ;var i is 1
-    ;while (i < xs($length)) {
-        ;if (xs[i] > best) { ;set best to xs[i] }
-        ;set i += 1
+    ;for (x in xs) {
+        ;if (x > best) { ;set best to x }
     }
     best
 }

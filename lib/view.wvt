@@ -142,9 +142,9 @@
     ;var glyph is null
     ;var fg is null
     ;var bg is null
-    ;var i is layers($length) - 1
-    ;while (i >= 0 && (glyph == null || bg == null)) {
-        ;const s is ((layers[i], p)(valueAt), layers[i].glyphs, tick)(styleOf)
+    ;for (layer in layers reversed) {
+        ;if (glyph != null && bg != null) { ;break }
+        ;const s is ((layer, p)(valueAt), layer.glyphs, tick)(styleOf)
         ;if (s != null) {
             ;if (glyph == null) {
                 ;if (fg == null) { ;set fg to s.fg }
@@ -155,7 +155,6 @@
             }
             ;if (bg == null) { ;set bg to s.bg }
         }
-        ;set i -= 1
     }
     (glyph == null ? " " : glyph, fg == null ? Color.default : fg, bg == null ? Color.default : bg)(style)
 }
@@ -216,11 +215,7 @@
     ;var seen is null
     ;if (visible != null) {
         ;set seen to [:]
-        ;var i is 0
-        ;while (i < visible($length)) {
-            ;set seen[visible[i]] to true
-            ;set i += 1
-        }
+        ;for (p in visible) { ;set seen[p] to true }
     }
     // The style of the cell at p: from the layers if it is visible, else
     // from memory.
@@ -238,13 +233,11 @@
         (s.glyph, s.fg == null ? Color.default : s.fg, s.bg == null ? Color.default : s.bg)(style)(readable)
     }
     ;var out is []
-    ;var y is window.y
-    ;while (y < window.y + window.height) {
+    ;for (y in window.y, window.y + window.height) {
         ;var line is []
         ;var fg is Color.default
         ;var bg is Color.default
-        ;var x is window.x
-        ;while (x < window.x + window.width) {
+        ;for (x in window.x, window.x + window.width) {
             ;const s is (x, y)(grid.pos)(cell)
             ;if (colored && (s.fg != fg || s.bg != bg)) {
                 ;(line, "\u{1B}[{(s.fg, false)(sgr)};{(s.bg, true)(sgr)}m")($push)
@@ -252,11 +245,9 @@
                 ;set bg to s.bg
             }
             ;(line, s.glyph)($push)
-            ;set x += 1
         }
         ;if (fg != Color.default || bg != Color.default) { ;(line, "\u{1B}[0m")($push) }
         ;(out, (line, "")($join))($push)
-        ;set y += 1
     }
     out
 }
@@ -288,13 +279,11 @@
 // Remembers the value of grid source at each position of area that is on both
 // grids, with an age of 0: what the player sees now, such as the terrain.
 ;export fn remember(ref memory, ref source, ref area) {
-    ;var i is 0
-    ;while (i < area($length)) {
-        ;if ((source, area[i].x, area[i].y)(grid.inside)) {
-            ;(memory, area[i], { value: (source, area[i])(grid.at), age: 0 })(grid.putAt)
+    ;for (p in area) {
+        ;if ((source, p.x, p.y)(grid.inside)) {
+            ;(memory, p, { value: (source, p)(grid.at), age: 0 })(grid.putAt)
                 onfail { null }
         }
-        ;set i += 1
     }
 }
 
@@ -345,14 +334,11 @@
 // nothing remembered, are skipped.
 ;export fn setAgeArea(ref memory, ref area, age) {
     ;var cells is memory.cells
-    ;var i is 0
-    ;while (i < area($length)) {
-        ;const p is area[i]
+    ;for (p in area) {
         ;if ((memory, p.x, p.y)(grid.inside)) {
             ;const k is p.y * memory.width + p.x
             ;if (cells[k] != null) { ;set cells[k] to { value: cells[k].value, age: age } }
         }
-        ;set i += 1
     }
     ;set memory.cells to cells
 }
@@ -372,11 +358,7 @@
 // ages outright, use setAge or setAgeArea.
 ;export fn fade(ref memory, amount, limit) {
     ;var cells is memory.cells
-    ;var i is 0
-    ;while (i < cells($length)) {
-        ;(cells, i, amount, limit)(ageCell)
-        ;set i += 1
-    }
+    ;for (i in 0, cells($length)) { ;(cells, i, amount, limit)(ageCell) }
     ;set memory.cells to cells
 }
 
@@ -386,11 +368,8 @@
 // position listed twice is aged twice.
 ;export fn fadeArea(ref memory, ref area, amount, limit) {
     ;var cells is memory.cells
-    ;var i is 0
-    ;while (i < area($length)) {
-        ;const p is area[i]
+    ;for (p in area) {
         ;if ((memory, p.x, p.y)(grid.inside)) { ;(cells, p.y * memory.width + p.x, amount, limit)(ageCell) }
-        ;set i += 1
     }
     ;set memory.cells to cells
 }

@@ -7,11 +7,9 @@
 // Usage: wvc build examples/sleep.wvt
 
 ;const start is ($elapsed)
-;var n is 3
-;while (n > 0) {
+;for (n in 1, 4 reversed) {
     ;"{n}..."($write)
     ;300($sleep)
-    ;set n -= 1
 }
 ;"go!"($print)
 ;"took {($elapsed) - start} ms"($print)

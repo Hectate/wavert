@@ -35,11 +35,7 @@
 
 // Records inside arrays.
 ;const players is [{ name: "Ada", coins: 50 }, { name: "Grace", coins: 3 }]
-;var i is 0
-;while (i < players($length)) {
-    ;"{players[i].name}: {players[i].coins}"($print)
-    ;set i += 1
-}
+;for (p in players) { ;"{p.name}: {p.coins}"($print) }
 
 // ---- Mutation ----
 // Only mutable (var) records can change, and only fields that already exist.
@@ -57,13 +53,7 @@
 // record[key] reads or writes the field named by a string.
 ;const stat is "wins"
 ;set me[stat] += 1
-;const keys is me($fields)
-;var k is 0
-;while (k < keys($length)) {
-    ;const key is keys[k]
-    ;"{key} = {me[key]}"($print)
-    ;set k += 1
-}
+;for (key in me($fields)) { ;"{key} = {me[key]}"($print) }
 
 // ---- Equality ----
 // == compares references; $same compares fields and values.

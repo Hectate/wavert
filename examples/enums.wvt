@@ -29,12 +29,9 @@
 ;"{names} are each a {hands[0]($typeOf)}"($print)
 
 ;const rounds is [[Hand.rock, Hand.scissors], [Hand.scissors, Hand.paper], [Hand.rock, Hand.paper], [Hand.paper, Hand.paper]]
-;var r is 0
-;while (r < rounds($length)) {
-    ;const round is rounds[r]
+;for (round in rounds) {
     ;const result is (round[0], round[1])(winner)
     ;"{round[0]} vs {round[1]}: {result}"($print)
-    ;set r += 1
 }
 
 // ---- A state machine ----
@@ -43,7 +40,7 @@
 
 ;var light is Light.red
 ;var seen is []
-;while (seen($length) < 5) {
+;for (step in 0, 5) {
     ;(seen, light)($push)
     ;match (light) {
         case Light.red { ;set light to Light.green }

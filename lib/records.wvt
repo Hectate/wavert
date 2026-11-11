@@ -14,11 +14,8 @@
 
 // The value of field name of r. Fails if r has no field name.
 ;export fn get(ref r, name) {
-    ;const names is r($fields)
-    ;var i is 0
-    ;while (i < names($length)) {
-        ;if (names[i] == name) { ;return r[name] }
-        ;set i += 1
+    ;for (field in r($fields)) {
+        ;if (field == name) { ;return r[name] }
     }
     ;fail
 }
@@ -32,13 +29,8 @@
 
 // A new mutable map from each field name of r to its value, in field order.
 ;export fn toMap(ref r) {
-    ;const names is r($fields)
     ;var m is [:]
-    ;var i is 0
-    ;while (i < names($length)) {
-        ;set m[names[i]] to r[names[i]]
-        ;set i += 1
-    }
+    ;for (name in r($fields)) { ;set m[name] to r[name] }
     m
 }
 
@@ -47,15 +39,12 @@
 // left alone. Returns the number of fields set. The copy is shallow: an array
 // in a field of from is then shared by both.
 ;export fn copyFields(ref to, ref from) {
-    ;const names is to($fields)
     ;var n is 0
-    ;var i is 0
-    ;while (i < names($length)) {
-        ;const v is (from, names[i])(get)
-            onfail { ;set i += 1 ;continue }
-        ;set to[names[i]] to v
+    ;for (name in to($fields)) {
+        ;const v is (from, name)(get)
+            onfail { ;continue }
+        ;set to[name] to v
         ;set n += 1
-        ;set i += 1
     }
     n
 }

@@ -14,10 +14,8 @@
 // The index of the first element of xs that is the same as x. Fails if there
 // is none.
 ;export fn indexOf(ref xs, x) {
-    ;var i is 0
-    ;while (i < xs($length)) {
-        ;if ((xs[i], x)($same)) { ;return i }
-        ;set i += 1
+    ;for (i, y in xs) {
+        ;if ((y, x)($same)) { ;return i }
     }
     ;fail
 }
@@ -32,10 +30,8 @@
 // The number of elements of xs that are the same as x.
 ;export fn count(ref xs, x) {
     ;var n is 0
-    ;var i is 0
-    ;while (i < xs($length)) {
-        ;if ((xs[i], x)($same)) { ;set n += 1 }
-        ;set i += 1
+    ;for (y in xs) {
+        ;if ((y, x)($same)) { ;set n += 1 }
     }
     n
 }
@@ -43,12 +39,11 @@
 // The ints from a up to b, not including b, in either direction: (0, 3) is
 // [0, 1, 2], and (3, 0) is [3, 2, 1]. [] if a and b are equal.
 ;export fn range(a, b) {
-    ;const step is a < b ? 1 : -1
     ;var out is []
-    ;var i is a
-    ;while (i != b) {
-        ;(out, i)($push)
-        ;set i += step
+    ;if (a < b) {
+        ;for (i in a, b) { ;(out, i)($push) }
+    } else {
+        ;for (i in b + 1, a + 1 reversed) { ;(out, i)($push) }
     }
     out
 }
@@ -57,27 +52,15 @@
 // element, so for a mutable array in each, push a new one each time instead.
 ;export fn filled(n, v) {
     ;var out is []
-    ;var i is 0
-    ;while (i < n) {
-        ;(out, v)($push)
-        ;set i += 1
-    }
+    ;for (i in 0, n) { ;(out, v)($push) }
     out
 }
 
 // A new array of the elements of a, then those of b.
 ;export fn concat(ref a, ref b) {
     ;var out is []
-    ;var i is 0
-    ;while (i < a($length)) {
-        ;(out, a[i])($push)
-        ;set i += 1
-    }
-    ;set i to 0
-    ;while (i < b($length)) {
-        ;(out, b[i])($push)
-        ;set i += 1
-    }
+    ;for (x in a) { ;(out, x)($push) }
+    ;for (x in b) { ;(out, x)($push) }
     out
 }
 
@@ -94,11 +77,7 @@
     ;const k is (xs, i)(position)
     ;if (k < 0) { ;fail }
     ;const removed is xs[k]
-    ;var j is k
-    ;while (j < xs($length) - 1) {
-        ;set xs[j] to xs[j + 1]
-        ;set j += 1
-    }
+    ;for (j in k, xs($length) - 1) { ;set xs[j] to xs[j + 1] }
     ;xs($pop)
     removed
 }
@@ -112,19 +91,14 @@
     ;const k is i < 0 ? n + i : i
     ;if (k < 0 || k > n) { ;fail }
     ;(xs, x)($push)
-    ;var j is n
-    ;while (j > k) {
-        ;set xs[j] to xs[j - 1]
-        ;set j -= 1
-    }
+    ;for (j in k + 1, n + 1 reversed) { ;set xs[j] to xs[j - 1] }
     ;set xs[k] to x
 }
 
 // s in double quotes, with backslashes, quotes, newlines and tabs escaped.
 ;fn quoted(s) {
     ;var parts is ["\""]
-    ;var i is 0
-    ;while (i < s($length)) {
+    ;for (i in 0, s($length)) {
         ;const c is (s, i)($at)
         ;match (c) {
             case "\\" { ;(parts, "\\\\")($push) }
@@ -133,7 +107,6 @@
             case "\t" { ;(parts, "\\t")($push) }
             else { ;(parts, c)($push) }
         }
-        ;set i += 1
     }
     ;(parts, "\"")($push)
     (parts, "")($join)
@@ -145,43 +118,33 @@
     ;const t is v($typeOf)
     ;if (t == "string") { ;return v(quoted) }
     ;!if (t == "array" || t == "record" || t == "map") { ;return v($toString) }
-    ;var i is 0
-    ;while (i < seen($length)) {
-        ;if (seen[i] == v) { ;fail }
-        ;set i += 1
+    ;for (outer in seen) {
+        ;if (outer == v) { ;fail }
     }
     ;(seen, v)($push)
     ;var parts is []
     ;match (t) {
         case "array" {
-            ;set i to 0
-            ;while (i < v($length)) {
-                ;const item is (v[i], seen)(text)
+            ;for (x in v) {
+                ;const item is (x, seen)(text)
                     onfail { ;fail }
                 ;(parts, item)($push)
-                ;set i += 1
             }
         }
         case "record" {
-            ;const names is v($fields)
-            ;set i to 0
-            ;while (i < names($length)) {
-                ;const field is (v[names[i]], seen)(text)
+            ;for (name in v($fields)) {
+                ;const field is (v[name], seen)(text)
                     onfail { ;fail }
-                ;(parts, "{names[i]}: {field}")($push)
-                ;set i += 1
+                ;(parts, "{name}: {field}")($push)
             }
         }
         else {
-            ;const keys is v($keys)
-            ;set i to 0
-            ;while (i < keys($length)) {
-                ;const key is (keys[i], seen)(text)
+            ;for (k, x in v) {
+                ;const key is (k, seen)(text)
                     onfail { ;fail }
-                ;const value is (v[keys[i]], seen)(text)
+                ;const value is (x, seen)(text)
                     onfail { ;fail }
                 ;(parts, "{key}: {value}")($push)
-                ;set i += 1
             }
         }
     }

@@ -1,8 +1,7 @@
 // FizzBuzz, with a function that returns a value and one that can fail.
 
 ;fn fizzbuzz(n) {
-    ;var i is 1
-    ;while (i <= n) {
+    ;for (i in 1, n + 1) {
         ;if (i % 15 == 0) {
             ;"FizzBuzz"($print)
         } else if (i % 3 == 0) {
@@ -12,7 +11,6 @@
         } else {
             ;i($print)
         }
-        ;set i += 1
     }
 }
 

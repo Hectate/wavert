@@ -20,9 +20,5 @@
     { kind: Kind.monster, name: "an orc", hp: 5 },
     { kind: Kind.item, name: "a ring", value: 30 }
 ]
-;var i is 0
-;while (i < things($length)) {
-    ;things[i](describe)($print)
-    ;set i += 1
-}
+;for (thing in things) { ;thing(describe)($print) }
 ;exit
