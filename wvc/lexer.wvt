@@ -13,7 +13,7 @@
 ;import text from "text.wvt"
 ;import diag from "diag.wvt"
 
-;export const keywords is ["fn", "return", "const", "var", "ref", "set", "if", "else", "while", "break", "continue",
+;export const keywords is ["fn", "return", "const", "var", "ref", "set", "if", "else", "while", "for", "break", "continue",
   "match", "case", "enum", "import", "export", "true", "false", "null", "nan", "inf",
   "exit", "fail", "onfail", "panic"]
 ;const reserved is [

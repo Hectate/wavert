@@ -2891,6 +2891,69 @@ static wv map_column(wv m, int which, const char *fn) {
 static wv std_keys(wv m) { return map_column(m, 1, "$keys"); }
 static wv std_values(wv m) { return map_column(m, 0, "$values"); }
 
+// ---- for loops (§7.4) ----
+// A loop over an array or a map. src is the collection, evaluated once; a map
+// is walked through snapshots of its keys and values, so the body may change it.
+// Pass k reads position k, or n - 1 - k when reversed. Loops over ranges and
+// enums need no state beyond their pass number.
+typedef struct wfor { wv src, keys, vals; int64_t n; int map, rev; } wfor;
+
+// The number of passes over the ints from lo up to hi, not including hi, by st.
+static int64_t rt_for_range(wv lo, wv hi, wv st) {
+  if (lo.tag != T_INT || hi.tag != T_INT) {
+    rt_fail("type error: a for loop's range needs ints, got %s and %s", type_name(lo), type_name(hi));
+  }
+  if (st.tag != T_INT) rt_fail("type error: a for loop's step must be an int, got %s", type_name(st));
+  if (st.i < 1) rt_fail("a for loop's step must be greater than 0, got %lld", (long long)st.i);
+  return hi.i <= lo.i ? 0 : (hi.i - lo.i + st.i - 1) / st.i;
+}
+static void rt_for_start(wfor *f, wv c, int rev) {
+  *f = (wfor){ .src = c, .keys = RT_NULL, .vals = RT_NULL, .rev = rev };
+  if (c.tag == T_ARR) {
+    f->n = c.a->len;
+  } else if (c.tag == T_MAP) {
+    f->map = 1;
+    f->keys = std_keys(c);
+    f->vals = std_values(c);
+    f->n = f->keys.a->len;
+  } else {
+    rt_fail("type error: a for loop goes through an array, a map, an enum or a range of ints, got %s%s", type_name(c),
+      c.tag == T_STR ? " (for its characters, loop over (s, \"\")($split))"
+      : c.tag == T_REC ? " (for its field names, loop over r($fields))" : "");
+  }
+}
+// Before each pass, and after the last: is there another? An array's length must not change.
+static int rt_for_more(wfor *f, int64_t k) {
+  if (!f->map && f->src.a->len != f->n) {
+    rt_fail("an array's length changed during a for loop over it: it was %lld, and is now %lld",
+      (long long)f->n, (long long)f->src.a->len);
+  }
+  return k < f->n;
+}
+// The collection's path (xs, state.items) must still hold the collection being walked.
+static void rt_for_guard(wfor *f, wv now, const char *path) {
+  const void *was = f->map ? (const void *)f->src.mp : (const void *)f->src.a;
+  const void *is = now.tag == T_ARR ? (const void *)now.a : now.tag == T_MAP ? (const void *)now.mp : NULL;
+  if (now.tag != f->src.tag || is != was) {
+    rt_fail("'%s' was set to another value during a for loop over it", path);
+  }
+}
+static inline int64_t for_at(const wfor *f, int64_t k) { return f->rev ? f->n - 1 - k : k; }
+// The variable of a one-name loop: an element, or a map's key.
+static wv rt_for_item(wfor *f, int64_t k) {
+  int64_t i = for_at(f, k);
+  return f->map ? f->keys.a->items[i] : f->src.a->items[i];
+}
+// The first and second variables of a two-name loop: index and element, or key and value.
+static wv rt_for_key(wfor *f, int64_t k) {
+  int64_t i = for_at(f, k);
+  return f->map ? f->keys.a->items[i] : rt_i(i);
+}
+static wv rt_for_val(wfor *f, int64_t k) {
+  int64_t i = for_at(f, k);
+  return f->map ? f->vals.a->items[i] : f->src.a->items[i];
+}
+
 // ---- sorting (§10.6) ----
 // A stable merge sort of positions by their keys, so that every backend gives
 // the same order. The keys are checked before sorting, so that the same key

@@ -62,14 +62,31 @@
     ]
   },
   "Loop over an array": {
-    "prefix": "while-each",
-    "description": "while loop over an array's elements (§7.4)",
+    "prefix": "for",
+    "description": "for loop over an array's elements, or a map's keys, or an enum's members (§7.4)",
     "body": [
-      ";var ${1:i} is 0",
-      ";while (${1:i} < ${2:xs}(\\$length)) {",
-      "\t;const ${3:x} is ${2:xs}[${1:i}]",
+      ";for (${1:x} in ${2:xs}) {",
       "\t$0",
-      "\t;set ${1:i} += 1",
+      "}"
+    ]
+  },
+  "Loop over a range": {
+    "prefix": "for-range",
+    "description": "for loop over the ints from a up to b, not including b (§7.4)",
+    "body": [
+      ";for (${1:i} in ${2:0}, ${3:n}) {",
+      "\t$0",
+      "}"
+    ]
+  },
+  "Loop over a grid": {
+    "prefix": "for-grid",
+    "description": "for loops over every x and y of a width by height grid, row by row (§7.4)",
+    "body": [
+      ";for (${1:y} in 0, ${2:height}) {",
+      "\t;for (${3:x} in 0, ${4:width}) {",
+      "\t\t$0",
+      "\t}",
       "}"
     ]
   },
@@ -119,15 +136,11 @@
     ]
   },
   "Loop over a map": {
-    "prefix": "while-map",
-    "description": "while loop over a map's keys and values, in insertion order (§10.11)",
+    "prefix": "for-map",
+    "description": "for loop over a map's keys and values, in insertion order (§7.4, §10.11)",
     "body": [
-      ";const ${1:keys} is ${2:m}(\\$keys)",
-      ";var ${3:i} is 0",
-      ";while (${3:i} < ${1:keys}(\\$length)) {",
-      "\t;const ${4:value} is ${2:m}[${1:keys}[${3:i}]]",
+      ";for (${1:k}, ${2:v} in ${3:m}) {",
       "\t$0",
-      "\t;set ${3:i} += 1",
       "}"
     ]
   },

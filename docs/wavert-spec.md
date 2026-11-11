@@ -1,4 +1,4 @@
-# Wavert Language Specification (Draft 0.7)
+# Wavert Language Specification (Draft 0.8)
 
 > Draft 0.1 was the first Wavert specification. Wavert is derived from Γ-- ([wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). It changes Γ--'s syntax and names and keeps its semantics; [hybrid-syntax.md](hybrid-syntax.md) gives the reasons for each change. Section numbers follow the Γ-- specification, so a reference such as §10.4 means the same topic in both.
 >
@@ -13,6 +13,8 @@
 > Draft 0.6 allows records as map keys, compared by their contents (§10.11), and documents telling kinds of record apart with an enum field (§10.10).
 >
 > Draft 0.7 adds the standard library written in Wavert, imported from any program with the reserved prefix `$lib/` (§13.1).
+>
+> Draft 0.8 adds the `for` loop (§7.4), over ranges of ints, arrays, maps and enums, forwards or `reversed`. `for` is a keyword, and `in` and `reversed` are contextual keywords (§2.5).
 
 ## 1. Overview
 
@@ -94,7 +96,7 @@ Keywords are reserved and cannot be used as names, parameters, field names or en
 | declarations and assignment | `const`, `var`, `ref`, `set` |
 | conditionals | `if`, `!if`, `else` |
 | multi-way branch | `match`, `case` |
-| loops | `while`, `!while`, `break`, `continue` |
+| loops | `while`, `!while`, `for`, `break`, `continue` |
 | enumeration | `enum` |
 | modules | `import`, `export` |
 | constants | `true`, `false`, `null`, `nan`, `inf` |
@@ -107,9 +109,10 @@ Keywords are reserved and cannot be used as names, parameters, field names or en
 - `is`, right after the name in `;const x is ...`, `;var x is ...` and `;ref x is ...`;
 - `to`, right after the target in `;set target to ...`;
 - `from`, right after the module name in `;import name from "path"`;
+- `in`, right after the loop variables in `;for (x in xs)`, and `reversed`, right before the `)` that closes it (§7.4);
 - `end`, as a whole statement: `;end` followed by `;`, `}` or the end of the file (§13.1).
 
-So `;const end is 5`, `node.end` and `{ to: 1 }` are all valid.
+So `;const end is 5`, `node.end`, `{ to: 1 }` and `;for (in in ins)` are all valid.
 
 ### 2.6 Strings
 - Delimiter: `"..."` only. There is no character type.
@@ -155,7 +158,7 @@ So `;const end is 5`, `node.end` and `{ to: 1 }` are all valid.
 
 ## 3. Grammar Summary
 
-The grammar in EBNF. `{ x }` is zero or more, `[ x ]` is optional, and quoted text is literal. The words `IS`, `TO`, `FROM` and `END` are the contextual keywords of §2.5, which are identifiers elsewhere.
+The grammar in EBNF. `{ x }` is zero or more, `[ x ]` is optional, and quoted text is literal. The words `IS`, `TO`, `FROM`, `END`, `IN` and `REVERSED` are the contextual keywords of §2.5, which are identifiers elsewhere.
 
 ```
 file        = { statement } ;
@@ -163,9 +166,10 @@ statement   = ";" [ body [ onfail ] ] ;
 onfail      = "onfail" [ "(" ident ")" ] block ;
 body        = [ "export" ] ( fn | enum | decl ) | import | set
             | "return" [ expr ] | "panic" expr | "break" | "continue"
-            | ( "while" | "!while" ) "(" expr ")" block
+            | ( "while" | "!while" ) "(" expr ")" block | for
             | "fail" [ expr ] | "exit" [ expr ] | END | expr ;
 fn          = "fn" ident "(" [ param { "," param } ] ")" block ;
+for         = "for" "(" ident [ "," ident ] IN expr [ "," expr [ "," expr ] ] [ REVERSED ] ")" block ;
 param       = [ "var" | "ref" ] ident ;
 enum        = "enum" ident "(" ident { "," ident } ")" ;
 import      = "import" ident FROM string ;
@@ -243,7 +247,7 @@ Implicit conversions (the complete list):
 
 **Using**
 - `Name.member` is the member's value. It is resolved at compile time, and an unknown member is a compile error: `no member 'cal' in enum 'Kind'`.
-- An enum name is not a value. It may appear only on the left of `Name.member`, so `;Kind($print)` is a compile error.
+- An enum name is not a value. It may appear only on the left of `Name.member`, or as what a `for` loop goes through (§7.4), so `;Kind($print)` is a compile error.
 - A member is equal (`==`) only to itself. It never equals a member of another enum, a string or a number.
 - Ordering (`< > <= >=`) or arithmetic on members panics.
 - Interpolation and `$toString` give the member's name (`call`). `$typeOf` gives the enum's name (`"Kind"`). `$same` on members is `==`.
@@ -280,7 +284,7 @@ Implicit conversions (the complete list):
 - **No shadowing:** a binding (including a function parameter) may not reuse a name visible from an enclosing scope. Compile error.
   - Sibling blocks may reuse a name, since neither encloses the other.
   - Visibility is positional. An outer `const`, `var` or `ref` conflicts only if it appears before the inner declaration.
-  - Outer function names, enum names, module names, parameters and `onfail` codes are visible throughout their scope, so they always conflict.
+  - Outer function names, enum names, module names, parameters, `onfail` codes and `for` loop variables are visible throughout their scope, so they always conflict.
   - Redeclaring a name in the same scope is an error.
   - The standard library cannot be shadowed, because its names carry the `$` sigil (§2.9).
 - **Use before declaration:**
@@ -397,7 +401,59 @@ The fix is to parenthesize the value: `([1, 2])`, `((next))`, `(-1)`.
 ### 7.4 Loops
 - `while (cond) { ... }` runs while `cond` is `true`.
 - `!while (cond) { ... }` (until) runs while `cond` is `false`.
-- `break` leaves the innermost loop; `continue` starts its next iteration. Outside a loop they are compile errors.
+- `for` goes through a range of ints, an array, a map or an enum, binding one or two loop variables on each pass:
+  ```
+  ;for (i in 0, n) { ... }               // 0, 1, …, n - 1
+  ;for (i in 0, 10, 3) { ... }           // 0, 3, 6, 9
+  ;for (i in 0, 10, 3 reversed) { ... }  // 9, 6, 3, 0
+  ;for (x in xs) { ... }                 // each element of an array, in order
+  ;for (i, x in xs reversed) { ... }     // each index and element, from the last
+  ;for (k, v in m) { ... }               // each key of a map and its value, in insertion order
+  ;for (t in Terrain) { ... }            // each member of an enum, in declaration order
+  ```
+- `break` leaves the innermost loop; `continue` starts its next iteration. Outside a loop they are compile errors. In a `for` loop, `continue` goes on to the next value, so no value is skipped.
+- A `for` loop is a statement, never a value.
+
+**Ranges**
+- `;for (i in a, b)` goes through the ints from `a` up to `b`, not including `b`. If `b` is not greater than `a`, the loop runs zero times, as `;while (i < b)` would. The order of the bounds never makes a loop count down; `reversed` does (below).
+- `;for (i in a, b, step)` goes up by `step`: `a`, `a + step`, and so on, while the value is less than `b`.
+  - The step must be an int greater than 0. A literal step that is not is a compile error, and a computed one panics: `a for loop's step must be greater than 0, got -1`.
+- `a`, `b` and the step are evaluated once, in that order, before the first pass. Setting a binding they read during the loop does not change the loop.
+- They must be ints; anything else panics: `type error: a for loop's range needs ints, got int and float`.
+- A range gives one value on each pass, so it takes one name: `;for (i, j in 0, n)` is a compile error.
+
+**Collections**
+- **An array** gives each element in order. With two names, `;for (i, x in xs)`, the first is the element's index.
+- **A map** gives each key, in insertion order (§10.11). With two names, `;for (k, v in m)`, the second is the key's value.
+  - The loop goes through a snapshot of the keys and values taken before the first pass, as `$keys` and `$values` give them. So the body may add, remove and change keys: a key added during the loop is not visited, and a key removed is still visited, with the value it had at the start.
+- **An enum**, written `Name` or `module.Name`, gives each member in declaration order (§4.1). With two names, `;for (i, t in Terrain)`, the first is the member's position, counting from 0. An enum name is not a value anywhere else.
+- Anything else panics: `type error: a for loop goes through an array, a map, an enum or a range of ints, got string`. For a string's characters, loop over `(s, "")($split)`; for a record's field names, over `r($fields)`.
+- The collection is evaluated once, before the first pass.
+
+**`reversed`**, written just before the `)`, goes through the same values from the other end. `;for (i in 0, n reversed)` gives `n - 1` down to `0`, and `;for (i in 0, 10, 3 reversed)` gives `9, 6, 3, 0`. An array gives its last element first, with its index; a map, its last key; an enum, its last member.
+
+**Loop variables**
+- Each pass binds the loop variables afresh. They are visible only in the loop's body (§5.1): sibling loops may use the same names, and nested loops need different ones.
+- A loop variable cannot be set; that is a compile error: `cannot set 'i': a for loop's variable cannot be set`. To control a counter yourself, use `while`. To replace an element, set it through its array: `;set xs[i] to v`.
+- An element is bound as it is, as `ref` binds (§5): it is never copied. So a mutable record in an array can be changed through the loop variable, and changing a frozen one panics, as it would through a `ref` (§10.9):
+  ```
+  ;var rat is { hp: 3 }
+  ;var bat is { hp: 5 }
+  ;const monsters is [rat, bat]
+  ;for (m in monsters) {
+      ;set m.hp -= 1
+  }
+  ;"{rat.hp} {bat.hp}"($print)       // 2 4
+  ;exit
+  ```
+
+**Changing the collection during the loop**
+- An array's elements may be set during a loop over it, but its length must not change. The length is checked before each pass and after the last: `an array's length changed during a for loop over it: it was 2, and is now 3`. A loop over an array that grows as it goes, such as a queue of work, is a `while` loop.
+  - Only the array being walked is checked. An inner array, such as a row of a grid, may change its length, unless a `for` loop is walking that array too.
+- A map may change in any way, since the loop goes through a snapshot.
+- When the collection is written as a name or a field path, such as `xs` or `state.items`, the loop's body may not set it, or any part of the path before it. The name would no longer hold what the loop goes through, so this is a compile error: `cannot set 'state' inside a for loop over 'state.items'`. Build the new value in another binding, and set it after the loop.
+  - Setting elements and other fields is fine: `;set xs[i] to v` and `;set state.turn += 1`.
+  - A set the compiler cannot see, such as one in a function called from the body, is caught when the program runs. Before each pass and after the last, the path must still hold the collection being walked, or the loop panics: `'xs' was set to another value during a for loop over it`.
 
 ### 7.5 Multi-way branch (`match` / `case`)
 ```
@@ -747,7 +803,7 @@ A map holds values under keys, and keys can be added and removed. A record's fie
 | `$values` | `;m($values)` | A frozen array of the values, in the same order as `$keys`. |
 | `$length` | `;m($length)` | The number of keys. |
 
-- `$keys` and `$values` are snapshots: changing the map afterwards does not change them, so a loop over `m($keys)` may add and remove keys.
+- `$keys` and `$values` are snapshots: changing the map afterwards does not change them, so a loop over `m($keys)` may add and remove keys. A `for` loop over a map works the same way (§7.4).
 - `($keys)[i]` and `($values)[i]` belong together, so one index walks both.
 - `$values` does not copy the values: a mutable record in a map is the same record in the array, so `;set all[0].hp -= 1` changes it in the map.
 - A key of the wrong type panics in `$get`, `$has` and `$remove`, as in `m[k]`.
@@ -1243,6 +1299,8 @@ More examples are in [examples/](../examples/), each showing one feature, and [s
 - Functions as values and closures. Today a nested function never outlives the call that contains it, so the native backend needs no heap-allocated closures. If functions become values, `(name)` at the start of an expression would become ambiguous (§6.2) and must be revisited.
 - Static types, written `;const x: int is 5`. They must decide the type of a computed field read `rec[k]` (§10.8).
 - Destructuring, written `;const [a, b] is pair`.
+- An enum's members as an array, for choosing one at random or counting them. A `for` loop can go through them (§7.4), but an enum name is not a value (§4.1), so this needs its own syntax.
+- A `for` loop over a string's characters. Today it panics, and `(s, "")($split)` gives the characters as an array.
 - Records with nested records as map keys. A key must not change while it is in a map, and snapshots are shallow (§10.4), so this would need a deep freeze.
 - Looking up a key written as a record literal without building the record.
 - A pipeline operator `|>`. It is a syntax error today, so it can be added later without breaking code. Postfix calls already read as a pipeline; revisit after counting real inside-out chains.

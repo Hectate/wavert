@@ -51,6 +51,10 @@ There is no `=`: declare with `is`, assign with `set ... to`, compare with `==`.
 ;if (n < 0) { ... } else if (n == 0) { ... } else { ... }
 ;!if (done) { ... }                  // unless
 ;while (i < n) { ... }               // also !while (until), break, continue
+;for (i in 0, n) { ... }             // 0 to n - 1; (i in 0, n, 2) steps by 2
+;for (x in xs reversed) { ... }      // an array, from the last element
+;for (i, x in xs) { ... }            // index and element; (k, v in m) for a map
+;for (t in Terrain) { ... }          // an enum's members, in order
 ;const sign is if (n < 0) { "-" } else { "+" }   // as a value it needs a final else
 ;match (key) {
     case "q", "escape" { ;break }
@@ -62,6 +66,7 @@ There is no `=`: declare with `is`, assign with `set ... to`, compare with `==`.
 
 - Conditions must be booleans.
 - `match` cases are literal constants or members of one enum. An enum `match` without `else` must list every member.
+- `for` loop variables cannot be set, and an element is not copied, so `;set x.hp -= 1` changes the record in the array. A range runs zero times if its end is not greater than its start: count down with `reversed`. Changing the length of the array being walked panics; for a growing queue, use `while`.
 - A block's value is its trailing expression without `;`. If a value is used, write it out, even if it's `null`: `{ ;x($print) null }`.
 
 ## Failures (§8)

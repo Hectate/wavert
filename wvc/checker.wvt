@@ -87,7 +87,7 @@
         ;const s is list[i]
         ;if (s.handler != null && s.handler.body.stmts(getsAwayWithValue)) { ;return true }
         ;if (s.k == "return" && s.e != null) { ;return true }
-        ;if (s.k == "while" && s.body.stmts(getsAwayWithValue)) { ;return true }
+        ;if ((s.k == "while" || s.k == "for") && s.body.stmts(getsAwayWithValue)) { ;return true }
         ;if (s.k == "expr" && s.e.k == "chain") {
             ;var b is 0
             ;while (b < s.e.branches($length)) {
@@ -298,7 +298,7 @@
                 ;(ps, p.name, ("param", p.name, p(modeOf), p.pos, null, func.id, null)(decl))(declare)
                 ;set k += 1
             }
-            ;(s.body, ps(newScope), { func: func, loops: 0 })(block)
+            ;(s.body, ps(newScope), { func: func, loops: 0, guards: ctx.guards })(block)
             ;return
         }
         ;if (kind == "return") {
@@ -311,7 +311,10 @@
             ;return
         } else if (kind == "while") {
             ;(s.cond, scope, ctx)(expr)
-            ;(s.body, scope(newScope), { func: ctx.func, loops: ctx.loops + 1 })(block)
+            ;(s.body, scope(newScope), { func: ctx.func, loops: ctx.loops + 1, guards: ctx.guards })(block)
+            ;return
+        } else if (kind == "for") {
+            ;(s, scope, ctx)(forLoop)
             ;return
         } else if (kind == "fail") {
             ;if (ctx.func.top) { ;(s.pos, "'fail' outside a function: there is no caller to fail to", null)(error) }
@@ -344,6 +347,72 @@
             ;(s.target, scope, ctx)(lvalue)
         }
         ;if (s.handler != null) { ;(s, scope, ctx)(onfailHandler) }
+    }
+
+    // A for loop (§7.4). Its variables are visible throughout its body and cannot
+    // be set. A collection written as a name or a field path (xs, state.items) is
+    // guarded: the body may not set it, or any part of the path before it.
+    ;fn forLoop(s, scope, ctx) {
+        ;var guards is []
+        ;var k is 0
+        ;while (k < ctx.guards($length)) {
+            ;(guards, ctx.guards[k])($push)
+            ;set k += 1
+        }
+        ;if (s.coll == null) {
+            ;(s.from, scope, ctx)(expr)
+            ;(s.to, scope, ctx)(expr)
+            ;if (s.step != null) { ;(s.step, scope, ctx)(expr) }
+        } else if ((s.coll, scope)(enumNamed) == null) {
+            ;(s.coll, scope, ctx)(expr)
+            ;const path is s.coll(pathOf)
+            ;if (path != null) { ;(guards, path)($push) }
+        }
+        ;const ls is scope(newScope)
+        ;set k to 0
+        ;while (k < s.names($length)) {
+            ;const n is s.names[k]
+            ;(ls, n.name, ("loop", n.name, "", n.pos, null, ctx.func.id, null)(decl))(declare)
+            ;set k += 1
+        }
+        ;(s.body, ls(newScope), { func: ctx.func, loops: ctx.loops + 1, guards: guards })(block)
+    }
+
+    // The names of a name or a field path (state.items is ["state", "items"]), or null.
+    ;fn pathOf(x) {
+        ;if (x.k == "name") { ;return [x.name] }
+        ;if (x.k != "mem") { ;return null }
+        ;const p is x.rec(pathOf)
+        ;if (p == null) { ;return null }
+        ;var out is p
+        ;(out, x.field)($push)
+        out
+    }
+
+    // Reports a set of target t inside a for loop over t, or over a field path
+    // that t starts (§7.4). Returns whether it did.
+    ;fn guarded(t, ctx) {
+        ;const p is t(pathOf)
+        ;if (p == null) { ;return false }
+        ;var g is 0
+        ;while (g < ctx.guards($length)) {
+            ;const gp is ctx.guards[g]
+            ;set g += 1
+            ;var prefix is p($length) <= gp($length)
+            ;var k is 0
+            ;while (prefix && k < p($length)) {
+                ;if (p[k] != gp[k]) { ;set prefix to false }
+                ;set k += 1
+            }
+            ;if (prefix) {
+                ;const name is (p, ".")($join)
+                ;const over is p($length) == gp($length) ? "it" : "'{(gp, ".")($join)}'"
+                ;(t.pos, "cannot set '{name}' inside a for loop over {over}",
+                    "build the new value in another variable, and set '{name}' to it after the loop")(error)
+                ;return true
+            }
+        }
+        false
     }
 
     // `onfail` handles the outermost call of its statement (§8.2).
@@ -552,6 +621,7 @@
     }
 
     ;fn lvalue(ref t, scope, ctx) {
+        ;if ((t, ctx)(guarded)) { ;return }
         ;if (t.k == "name") {
             ;const d is (t.name, t.pos, scope, ctx)(resolve)
             ;if (d != null) {
@@ -597,6 +667,12 @@
     ;fn mustBeMutable(d, name, pos, message, rebind) {
         ;if (d.kind == "fn" || d.kind == "enum" || d.kind == "module") {
             ;(pos, "'{name}' is a{d.kind(kindText)}, not a binding", null)(error)
+        } else if (d.kind == "loop") {
+            // Through a loop variable, the element's own mutability is checked at runtime, as through a ref.
+            ;if (rebind) {
+                ;(pos, "cannot set '{name}': a for loop's variable cannot be set",
+                    "to replace an element, set it through its array, such as ;set xs[i] to v; to control a counter yourself, use a while loop")(error)
+            }
         } else if (!d.isVar && !d.isRef) {
             ;var hint is null
             ;if (d.kind == "param") {
@@ -839,7 +915,7 @@
         }
         ;const scope is null(newScope)
         ;(m, scope)(importNames)
-        ;({ stmts: program.stmts, value: null }, scope, { func: topFn, loops: 0 })(block)
+        ;({ stmts: program.stmts, value: null }, scope, { func: topFn, loops: 0, guards: [] })(block)
         ;(m, scope, isEntry, last)(libraryRules)
     }
 

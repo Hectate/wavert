@@ -1,0 +1,33 @@
+// for: loops over ranges, arrays, maps and enums.
+//
+// A for loop manages its own counter: the loop variables are fresh on each
+// pass, cannot be set, and continue can never skip a step. A range goes from
+// its first bound up to its second, not including it; reversed goes through the
+// same values from the other end.
+//
+// Usage: wvc build examples/for.wvt
+
+;enum Terrain (sea, shore, hill)
+
+// ---- Ranges ----
+;var line is ""
+;for (i in 0, 5) { ;set line to line + "{i} " }
+;line($print)
+
+;set line to ""
+;for (i in 0, 10, 3 reversed) { ;set line to line + "{i} " }
+;line($print)
+
+// ---- Arrays, with or without the index ----
+;const names is ["rat", "bat", "orc"]
+;for (i, name in names) { ;"{i}: {name}"($print) }
+
+// ---- Maps, in insertion order ----
+;const gold is ["rat": 1, "orc": 12]
+;for (who, coins in gold) { ;"{who} carries {coins}"($print) }
+
+// ---- Enums, in declaration order ----
+;set line to ""
+;for (t in Terrain reversed) { ;set line to line + "{t} " }
+;line($print)
+;exit

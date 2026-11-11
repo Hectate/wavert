@@ -57,8 +57,14 @@ test('keywords and reserved words match the lexer', () => {
   for (const w of BANG) assert.ok(scopeOf('bang-keywords', `!${w}`), `'!${w}' is not highlighted`);
   for (const op of SET_OPS) assert.equal(scopeOf('operators', op), 'keyword.operator.assignment.compound', op);
   // The contextual words are keywords only in their statements.
-  for (const w of ['is', 'to', 'from', 'end']) assert.equal(scopeOf('keywords', w), null, w);
+  for (const w of ['is', 'to', 'from', 'end', 'in', 'reversed']) assert.equal(scopeOf('keywords', w), null, w);
   assert.ok(new RegExp(repo.declaration.match).test('const x is 1'));
+  const forBegin = new RegExp(repo['for-loop'].begin);
+  for (const s of ['for (x in', 'for (i, x in', 'for(i in']) assert.ok(forBegin.test(s), s);
+  for (const s of ['for (x of', 'for (in)', 'form (x in']) assert.ok(!forBegin.test(s), s);
+  const forEnd = new RegExp(repo['for-loop'].end);
+  assert.equal(forEnd.exec('xs reversed)')[1], 'reversed');
+  assert.equal(forEnd.exec('0, n)')[1], undefined);
   assert.ok(new RegExp(repo.import.match).test('import lib from "lib.wvt"'));
   assert.ok(new RegExp(repo['end-marker'].match).test(';end'));
   assert.ok(!new RegExp(repo['end-marker'].match).test(';end.x'));

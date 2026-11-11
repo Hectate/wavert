@@ -118,6 +118,57 @@ test('if, !if, else if; while and !while; break and continue', { skip }, () => {
 }`), lines('-0+', 'unless', '1', '3'));
 });
 
+test('for over ranges, with a step and reversed', { skip }, () => {
+  assert.equal(out(`
+;var s is ""
+;for (i in 0, 4) { ;set s to s + "{i}" }
+;for (i in 0, 4 reversed) { ;set s to s + "{i}" }
+;set s to s + " "
+;for (i in 1, 10, 4) { ;set s to s + "{i}," }
+;for (i in 1, 10, 4 reversed) { ;set s to s + "{i}," }
+;for (i in 5, 0) { ;set s to s + "never" }
+;for (i in 3, 3 reversed) { ;set s to s + "never" }
+;s($print)
+;var n is 2
+;for (i in 0, n) { ;set n += 1 ;i($print) }`), lines('01233210 1,5,9,9,5,1,', '0', '1'));
+});
+
+test('for over arrays, maps and enums; break, continue and nesting', { skip }, () => {
+  assert.equal(out(`
+;enum Dir (north, east, south)
+;const xs is ["a", "b", "c"]
+;for (x in xs) { ;if (x == "b") { ;continue } ;x($print) }
+;for (i, x in xs reversed) { ;if (i == 0) { ;break } ;"{i}{x}"($print) }
+;var m is [1: "one", 2: "two"]
+;for (k, v in m) { ;(m, k)($remove) ;set m[k + 10] to v ;"{k}={v}"($print) }
+;m($keys)($length)($print)
+;for (i, d in Dir) { ;"{i} {d}"($print) }
+;for (d in Dir reversed) { ;d($print) }
+;var rat is { hp: 3 }
+;const monsters is [rat]
+;for (mon in monsters) { ;set mon.hp -= 1 }
+;rat.hp($print)
+;for (y in 0, 2) { ;for (x in 0, 2) { ;fn at() { "{x},{y}" } ;(at)($print) } }
+;fn firstEven(ys) { ;for (y in ys) { ;if (y % 2 == 0) { ;return y } } null }
+;[1, 3, 4](firstEven)($print)`),
+  lines('a', 'c', '2c', '1b', '1=one', '2=two', '2', '0 north', '1 east', '2 south', 'south', 'east', 'north', '2',
+    '0,0', '1,0', '0,1', '1,1', '4'));
+});
+
+test('for loops panic on a bad range, collection or change to it', { skip }, () => {
+  const panics = (source) => run(source + '\n;exit\n').err.split('\n')[0];
+  assert.equal(panics(';for (i in 0, 2.5) { }'), 'uncaught panic: type error: a for loop\'s range needs ints, got int and float');
+  assert.equal(panics(';const s is 0 - 2\n;for (i in 0, 4, s) { }'), 'uncaught panic: a for loop\'s step must be greater than 0, got -2');
+  assert.equal(panics(';for (c in "ab") { }'),
+    'uncaught panic: type error: a for loop goes through an array, a map, an enum or a range of ints, got string (for its characters, loop over (s, "")($split))');
+  assert.equal(panics(';var xs is [1, 2]\n;for (x in xs) { ;(xs, 3)($push) }'),
+    'uncaught panic: an array\'s length changed during a for loop over it: it was 2, and is now 3');
+  assert.equal(panics(';var xs is [1, 2]\n;for (x in xs) { ;if (x == 2) { ;xs($pop) } }'),
+    'uncaught panic: an array\'s length changed during a for loop over it: it was 2, and is now 1');
+  assert.equal(panics(';var xs is [1, 2]\n;fn clear() { ;set xs to [] }\n;fn walk() { ;for (x in xs) { ;(clear) } }\n;(walk)'),
+    'uncaught panic: \'xs\' was set to another value during a for loop over it');
+});
+
 test('match with cases, enums and else', { skip }, () => {
   assert.equal(out(`
 ;enum Color (red, green)

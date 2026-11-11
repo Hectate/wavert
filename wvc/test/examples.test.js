@@ -34,6 +34,9 @@ const expected = {
     out: lines('rock, paper, scissors are each a Hand', 'rock vs scissors: rock wins', 'scissors vs paper: scissors wins',
       'rock vs paper: paper wins', 'paper vs paper: draw', 'red -> green -> amber -> red -> green', 'false'),
   },
+  'examples/for.wvt': {
+    out: lines('0 1 2 3 4 ', '9 6 3 0 ', '0: rat', '1: bat', '2: orc', 'rat carries 1', 'orc carries 12', 'hill shore sea '),
+  },
   'examples/files.wvt': { out: lines('first line', 'second line', 'listed: true', 'exists: false', 'cannot read it now') },
   'examples/fizzbuzz.wvt': { out: lines(...fizzbuzz, '1.5') },
   'examples/hello.wvt': { out: lines('Hello, World') },

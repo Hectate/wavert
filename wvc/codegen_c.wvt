@@ -235,6 +235,25 @@
         } else if (kind == "while") {
             ;(s.cond, scope, f)(aexpr)
             ;(s.body, scope(newScope), f, topScope)(ablock)
+        } else if (kind == "for") {
+            ;if (s.coll == null) {
+                ;(s.from, scope, f)(aexpr)
+                ;(s.to, scope, f)(aexpr)
+                ;if (s.step != null) { ;(s.step, scope, f)(aexpr) }
+            } else if (!(s.coll, scope)(notValue)) {
+                ;(s.coll, scope, f)(aexpr)
+            }
+            // Loop variables bind like ref: an element is never copied (§7.4).
+            ;const ls is scope(newScope)
+            ;var k is 0
+            ;while (k < s.names($length)) {
+                ;const nm is s.names[k]
+                ;const d is ("decl", nm.name, f, false, "ref")(bind)
+                ;set curSlot[nm.pos] to d
+                ;(ls, nm.name, "decl", d)(put)
+                ;set k += 1
+            }
+            ;(s.body, ls(newScope), f, topScope)(ablock)
         } else if (kind == "return" || kind == "panic" || kind == "exit" || kind == "decl") {
             ;if (s.e != null) { ;(s.e, scope, f)(aexpr) }
         } else if (kind == "expr") {
@@ -548,6 +567,7 @@
             ;"}}"(emit)
             ;return
         }
+        ;if (kind == "for") { ;s(forStmt) ;return }
         ;if (kind == "fail") { ;"rt_i({s.code})"(signal) ;return }
         ;if (kind == "exit") { ;"rt_exit({s.e == null ? "rt_i(0)" : s.e(expr).c});"(emit) ;return }
         ;if (kind == "expr") {
@@ -560,6 +580,77 @@
         ;if (kind == "decl") { ;(curSlot[s.namePos], (s.e, s(modeOf))(bindRhs))(bindDecl) ;return }
         ;if (kind == "set") { ;s(setStmt) ;return }
         ;panic "codegen: unhandled statement {kind}"
+    }
+
+    // A name or field path as written (state.items), or null for any other expression.
+    ;fn pathText(x) {
+        ;if (x.k == "name") { ;return x.name }
+        ;if (x.k != "mem") { ;return null }
+        ;const p is x.rec(pathText)
+        p == null ? null : "{p}.{x.field}"
+    }
+
+    // A for loop (§7.4): a C loop over pass numbers k, 0 to the count, with the
+    // loop variables bound at the start of each pass. continue goes to k++.
+    ;fn forStmt(s) {
+        ;const k is (tmp)
+        ;const first is curSlot[s.names[0].pos]
+        ;const second is s.names($length) == 2 ? curSlot[s.names[1].pos] : null
+        ;"{{"(emit)
+        ;set indent += 1
+        ;if (s.coll == null) {
+            // A range: its bounds and step are evaluated once, in order.
+            ;const lo is (tmp)
+            ;const hi is (tmp)
+            ;const st is (tmp)
+            ;const count is (tmp)
+            ;"wv {lo} = {s.from(expr).c};"(emit)
+            ;"wv {hi} = {s.to(expr).c};"(emit)
+            ;"wv {st} = {s.step == null ? "rt_i(1)" : s.step(expr).c};"(emit)
+            ;"int64_t {count} = rt_for_range({lo}, {hi}, {st});"(emit)
+            ;"for (int64_t {k} = 0; {k} < {count}; {k}++) {{"(emit)
+            ;set indent += 1
+            ;const at is s.reversed ? "{count} - 1 - {k}" : k
+            ;(first, "rt_i({lo}.i + ({at}) * {st}.i)")(bindDecl)
+        } else {
+            ;const en is s.coll(enumOf)
+            ;if (en != null) {
+                // An enum's members are a static array (§4.1).
+                ;const count is en.node.members($length)
+                ;"for (int64_t {k} = 0; {k} < {count}; {k}++) {{"(emit)
+                ;set indent += 1
+                ;const at is s.reversed ? "{count - 1} - {k}" : k
+                ;if (second == null) {
+                    ;(first, "rt_m(&{en.c}[{at}])")(bindDecl)
+                } else {
+                    ;(first, "rt_i({at})")(bindDecl)
+                    ;(second, "rt_m(&{en.c}[{at}])")(bindDecl)
+                }
+            } else {
+                // An array or a map, evaluated once. A collection named by a path is
+                // checked before each pass to still be the one being walked.
+                ;const fr is (tmp)
+                ;"wfor {fr};"(emit)
+                ;"rt_for_start(&{fr}, {s.coll(expr).c}, {s.reversed ? 1 : 0});"(emit)
+                ;const path is s.coll(pathText)
+                ;const guard is path == null ? "" : "rt_for_guard(&{fr}, {s.coll(expr).c}, {path(cString)}), "
+                ;"for (int64_t {k} = 0; {guard}rt_for_more(&{fr}, {k}); {k}++) {{"(emit)
+                ;set indent += 1
+                ;if (second == null) {
+                    ;(first, "rt_for_item(&{fr}, {k})")(bindDecl)
+                } else {
+                    ;(first, "rt_for_key(&{fr}, {k})")(bindDecl)
+                    ;(second, "rt_for_val(&{fr}, {k})")(bindDecl)
+                }
+            }
+        }
+        ;set loops += 1
+        ;s.body(blockBody)
+        ;set loops -= 1
+        ;set indent -= 1
+        ;"}}"(emit)
+        ;set indent -= 1
+        ;"}}"(emit)
     }
 
     // A fail leaves the function at once; the caller sees the code (§8.2).

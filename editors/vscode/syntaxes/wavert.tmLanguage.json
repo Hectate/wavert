@@ -13,6 +13,7 @@
         { "include": "#strings" },
         { "include": "#fn-definition" },
         { "include": "#enum-definition" },
+        { "include": "#for-loop" },
         { "include": "#declaration" },
         { "include": "#import" },
         { "include": "#set" },
@@ -134,6 +135,24 @@
       ]
     },
 
+    "for-loop": {
+      "comment": ";for (i, x in xs reversed) { ... }: the loop variables are declared here, and in and reversed are keywords only in this header (§7.4)",
+      "begin": "\\b(for)\\s*(\\()\\s*([A-Za-z_][A-Za-z0-9_]*)(?:\\s*(,)\\s*([A-Za-z_][A-Za-z0-9_]*))?\\s+(in)\\b",
+      "end": "\\b(reversed)\\s*(?=\\))|(?=\\))",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.loop.wavert" },
+        "2": { "name": "punctuation.section.parens.wavert" },
+        "3": { "name": "variable.other.declaration.wavert" },
+        "4": { "name": "punctuation.separator.comma.wavert" },
+        "5": { "name": "variable.other.declaration.wavert" },
+        "6": { "name": "keyword.control.loop.wavert" }
+      },
+      "endCaptures": {
+        "1": { "name": "keyword.control.loop.wavert" }
+      },
+      "patterns": [{ "include": "#expression" }]
+    },
+
     "declaration": {
       "comment": ";export const name is value; is is a keyword only here",
       "match": "\\b(?:(export)\\s+)?(const|var|ref)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(is)\\b",
@@ -205,7 +224,7 @@
     "keywords": {
       "patterns": [
         { "name": "keyword.control.conditional.wavert", "match": "\\b(?:if|else|match|case)\\b" },
-        { "name": "keyword.control.loop.wavert", "match": "\\b(?:while|break|continue)\\b" },
+        { "name": "keyword.control.loop.wavert", "match": "\\b(?:while|for|break|continue)\\b" },
         { "name": "keyword.control.flow.wavert", "match": "\\b(?:return|exit)\\b" },
         { "name": "keyword.control.exception.wavert", "match": "\\b(?:fail|onfail|panic)\\b" },
         { "name": "keyword.control.import.wavert", "match": "\\b(?:import|export)\\b" },

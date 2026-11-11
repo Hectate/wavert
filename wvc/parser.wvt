@@ -12,8 +12,10 @@
 //   map holds its keys and values in turn in items: k, v, k, v.
 //   failWith is `;fail c` with a computed code; chain is an if/!if/else chain.
 // Statement nodes (k): empty fn enum import end return panic break continue
-//   while fail exit expr decl set. Each has pos, end and handler: null, or the statement's
+//   while for fail exit expr decl set. Each has pos, end and handler: null, or the statement's
 //   onfail handler as { pos, param, paramPos, body }.
+//   for (§7.4) has names, one or two { name, pos }; coll, the collection, or null for a
+//   range from, to and step (null for 1); and reversed.
 //   decl is const, var (isVar) or ref (isRef); fail has a literal code; end holds
 //   the names of the declarations marked export, which the parser collects.
 
@@ -234,6 +236,7 @@
                 pos: null, end: null, handler: null
             }
         }
+        ;if (kind == "for") { ;return (forStatement) }
         ;if (kind == "fail") { ;return (failStatement) }
         ;if (kind == "exit") {
             ;(next)
@@ -285,6 +288,64 @@
         ;const found is (peek)
         ;(found, "expected 'to' or a compound assignment such as '+=' after the target, found {found(describe)}",
             ";set x to value")(failAtHint)
+    }
+
+    // ;for (x in xs) { ... }, ;for (i, x in xs) { ... }, ;for (i in a, b) { ... },
+    // ;for (i in a, b, step) { ... }, each optionally with reversed before the ')' (§7.4).
+    ;fn forStatement() {
+        ;(next)
+        ;const form is ";for (x in xs) {{ ... }} or ;for (i in 0, n) {{ ... }}"
+        ;("(", "expected '(' after 'for'", form)(expect)
+        ;var names is []
+        ;while (true) {
+            ;const tk is (peek)
+            ;if (tk.t != "id") {
+                ;const message is (lexer.keywords, tk.t)(text.contains) ? "'{tk.t}' is a keyword and cannot be a loop variable"
+                    : "expected a name for the loop variable, found {tk(describe)}"
+                ;(tk, message, form)(failAtHint)
+            }
+            ;(next)
+            ;(names, { name: tk.v, pos: tk.pos })($push)
+            ;if (names($length) == 2 || ","(accept) == null) { ;break }
+        }
+        ;("in", form)(expectWord)
+        ;const first is (expr)
+        ;var coll is first
+        ;var from is null
+        ;var to is null
+        ;var step is null
+        ;if (","(at)) {
+            ;(next)
+            ;set coll to null
+            ;set from to first
+            ;set to to (expr)
+            ;if (","(accept) != null) {
+                ;const st is (peek)
+                ;set step to (expr)
+                ;const negative is step.k == "un" && step.op == "-" && (step.e.k == "int" || step.e.k == "float")
+                ;if (negative || step.k == "int" && step.v < 1) {
+                    ;(st, "a for loop's step must be greater than 0",
+                        "to count down, add reversed: ;for (i in 0, n, 2 reversed)")(failAtHint)
+                }
+            }
+            ;if (names($length) == 2) {
+                ;(names[1].pos, "a range gives one value on each pass, so it takes one name",
+                    ";for ({names[0].name} in a, b) {{ ... }}")(diag.failHint)
+            }
+        }
+        ;const rev is "reversed"(atWord)
+        ;if (rev) { ;(next) }
+        ;if (!")"(at)) {
+            ;const found is (peek)
+            ;const backwards is coll != null ? ";for (x in xs reversed)" : ";for (i in 0, n reversed)"
+            ;const hint is found.t == "id" ? "to go backwards, write reversed: {backwards}" : form
+            ;(found, "expected ')' to close the for loop, found {found(describe)}", hint)(failAtHint)
+        }
+        ;(next)
+        {
+            k: "for", names: names, coll: coll, from: from, to: to, step: step, reversed: rev,
+            body: (block), pos: null, end: null, handler: null
+        }
     }
 
     // ;fail, ;fail 3 (a code), or ;fail c (a computed code) (§8.2).
