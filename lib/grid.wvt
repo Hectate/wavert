@@ -11,7 +11,8 @@
 //
 // x grows to the right and y downward, as on a screen: (0, 0) is the top left.
 //
-// Off the grid: a function for one cell (get, put, at, putAt, index, posOf)
+// Off the grid: a function for one cell (get, put, at, putAt, putIndex,
+// index, posOf)
 // fails there, so the caller decides what it means, with onfail: a wall, or
 // nothing to do. A function for an area (fill, valuesAt, cellsAt) uses only
 // the area's positions that are on the grid.
@@ -132,6 +133,13 @@
 ;export fn put(ref g, x, y, v) {
     ;const i is (g, x, y)(index)
         onfail { ;fail }
+    ;(g, i, v)(putIndex)
+}
+
+// Sets cell i of g (an index from index, as for g.cells[i]) to v. Fails,
+// changing nothing, if g has no cell i.
+;export fn putIndex(ref g, i, v) {
+    ;if (i < 0 || i >= g.width * g.height) { ;fail }
     // A frozen cells array is copied once; after that, cells is g's own.
     ;var cells is g.cells
     ;set cells[i] to v

@@ -122,11 +122,12 @@ test('grid: cells, positions and indexes', { skip }, () => {
 ;var map is (4, 3, ".")(grid.new)
 ;(map, 1, 2, "#")(grid.put)
 ;(map, (3, 0)(grid.pos), "@")(grid.putAt)
+;(map, 4, "+")(grid.putIndex)
 ;(map(grid.rows), "|")($join)($print)
 ;"{(map, 1, 2)(grid.get)} {(map, (3, 0)(grid.pos))(grid.at)} {(map, 3, 2)(grid.inside)} {(map, 4, 0)(grid.inside)} {(map, -1, 0)(grid.inside)}"($print)
 ;const p is (map, 9)(grid.posOf)
 ;"{(map, 1, 2)(grid.index)} {p.x},{p.y} {map.width}x{map.height} {(0, 0, 0)(grid.new).cells($length)}"($print)`)),
-  lines('...@|....|.#..', '# @ true false false', '9 1,2 4x3 0'));
+  lines('...@|+...|.#..', '# @ true false false', '9 1,2 4x3 0'));
   assert.equal(panicOf(gridProgram(';(-1, 3, 0)(grid.new)')), 'grid.new: the size -1 x 3 is negative');
 });
 
@@ -146,6 +147,10 @@ test('grid: off the grid, one cell fails and the caller decides', { skip }, () =
 ;(map, 9, 9, "@")(grid.put)
     onfail { null }
 ;(map, (-1, 0)(grid.pos), "@")(grid.putAt)
+    onfail { null }
+;(map, 12, "@")(grid.putIndex)
+    onfail { null }
+;(map, -1, "@")(grid.putIndex)
     onfail { null }
 ;(map(grid.rows), "|")($join)($print)`)),
   lines('# # -1 null', '....|....|....'));
