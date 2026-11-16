@@ -191,7 +191,7 @@ Wavert is a **new language inspired by Γ--**, not a replacement for it. Γ-- an
 All four steps are done (October 2026). `wvc` is written in Wavert ([wvc/](../wvc/)), and its seed `wvc/wvc.c` reproduces itself.
 
 1. `wahc` was forked, and its lexer and parser were rewritten for Wavert, still in Γ--. Names in `wahc` that Wavert reserves were renamed first: `fail` → `abort`, `fn` → `func` and `ref` → `resolve`.
-2. [tools/wah2wvt.wah](../tools/wah2wvt.wah) converted the Γ-- examples and `src/` programs. [tools/verify.mjs](../tools/verify.mjs) confirmed the same syntax trees and byte-identical C and JavaScript.
+2. `tools/wah2wvt.wah` converted the Γ-- examples and `src/` programs. `tools/verify.mjs` confirmed the same syntax trees and byte-identical C and JavaScript. Both were retired in November 2026, when nothing was left to convert; they are in the git history.
 3. The converted compiler, compiled by `wvc`, produced the same C as the Γ-- original compiled by `wahc` (8,705 lines).
 4. That C became the seed. A native `wvc` built from it compiles `wvc/wvc.wvt` back to the same file.
 
@@ -204,4 +204,4 @@ Decisions made during the implementation, beyond this document:
 - A negative number is a literal: the parser folds `-` applied to a number literal, so `case -1` works and the syntax tree matches Γ--'s `WAH`. `-(5)` stays a negation.
 - Runtime messages call non-`var` arrays and records *frozen*: `cannot modify a frozen array`.
 - `wvc`'s default target is C. The JavaScript backend (`--target js`) was kept for a while, then removed so that new features are written once.
-- The syntax tree kept `wahc`'s node kinds (`scheme`, `claim`, `lineup`, `suspect`, …) through the bootstrap. They were renamed afterwards (`fn`, `decl`, `enum`, `match`, …), as were the runtime's internal names (`rt_tantrum` → `rt_panic`), with the generated code checked to be unchanged. `tools/verify.mjs` maps `wahc`'s names when it compares.
+- The syntax tree kept `wahc`'s node kinds (`scheme`, `claim`, `lineup`, `suspect`, …) through the bootstrap. They were renamed afterwards (`fn`, `decl`, `enum`, `match`, …), as were the runtime's internal names (`rt_tantrum` → `rt_panic`), with the generated code checked to be unchanged. `tools/verify.mjs` mapped `wahc`'s names when it compared.

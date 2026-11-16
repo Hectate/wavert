@@ -2,7 +2,7 @@
 
 `wvc` compiles Wavert (`.wvt`) to C. It is written in Wavert and compiles itself. `wvc.c` is `wvc` compiled to C, the bootstrap seed: a C compiler is all you need to build it.
 
-It began as a fork of `wahc`, the Γ-- compiler in [../wah/wahc](../wah/wahc). The lexer and parser were rewritten for Wavert, and the rest was converted from Γ-- with [../tools/wah2wvt.wah](../tools/wah2wvt.wah). See [../docs/hybrid-syntax.md](../docs/hybrid-syntax.md#bootstrap-status) for how the bootstrap went.
+It began as a fork of `wahc`, the Γ-- compiler in [../wah/wahc](../wah/wahc). The lexer and parser were rewritten for Wavert, and the rest was converted from Γ-- with a converter, `tools/wah2wvt.wah`, since retired (it is in the git history). See [../docs/hybrid-syntax.md](../docs/hybrid-syntax.md#bootstrap-status) for how the bootstrap went.
 
 ## Usage
 
@@ -70,4 +70,3 @@ Run `npm test` here (Node ≥ 22.3). The tests need [Zig](https://ziglang.org), 
 | `lib.test.js` | The standard library in [../lib](../lib), and the `$lib/` prefix: importing from anywhere, its errors, and finding `lib/` from where `wvc` is rather than the current directory. |
 | `editor.test.js` | The VS Code extension's documentation: `builtins.json` matches the specification's tables and the checker, every standard library export has a documentation comment, and the scanner behind hovers and completions. |
 | `grammar.test.js` | The VS Code grammar ([../editors/vscode](../editors/vscode)) agrees with the lexer's keywords, the stdlib table and the number syntax. |
-| `convert.test.js` | `tools/wah2wvt.wah`, built with `wahc` from `../wah`: the Γ-- examples convert to Wavert that has the same syntax tree and compiles to the same C. |

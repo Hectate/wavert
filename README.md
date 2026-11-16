@@ -48,7 +48,6 @@ The language is specified in [docs/wavert-spec.md](docs/wavert-spec.md). The rea
 | [src/](src/) | Programs, built by `build.ps1`. |
 | [build.ps1](build.ps1) | Builds every program in `src\` into `bin\` with `wvc` and Zig. |
 | [editors/vscode/](editors/vscode/) | VS Code syntax highlighting and snippets. |
-| [tools/](tools/) | `wah2wvt.wah`, a Γ-- to Wavert converter written in Γ--, and `verify.mjs`, which checks a conversion. |
 | [wah/](wah/) | The Γ-- language and toolchain, imported from the wah repo (commit `5d2318b`): spec, compilers, runtime, examples, editor support and project template. It was the seed for bootstrapping Wavert, and Wavert no longer depends on it. This repo does not depend on the wah repo. |
 
 ## Building
@@ -69,15 +68,3 @@ See [wvc/README.md](wvc/README.md) for its options, and for changing it.
 ## Tests
 
 Run `npm test` in `wvc\` (Node ≥ 22.3, and Zig). The imported Γ-- toolchain has its own tests: `npm test` in `wah\js`, `wah\wahc` or `wah\runtime`.
-
-## Converting Γ-- code
-
-```
-zig cc -O2 -o .wvt/wahc.exe wah/wahc/wahc.c
-.wvt/wahc.exe tools/wah2wvt.wah --target c -o .wvt/wah2wvt.c --runtime wah/runtime/wah.c
-zig cc -O2 -o .wvt/wah2wvt.exe .wvt/wah2wvt.c
-.wvt/wah2wvt.exe program.wah              # writes program.wvt
-node tools/verify.mjs .wvt/wahc.exe wvc/wvc.exe <dir with .wah files> <dir with .wvt files>
-```
-
-The converter keeps comments, blank lines and line breaks. It refuses names that are Wavert keywords (rename them in the Γ-- source first) and `$toWah`. Comparisons with `$typeOf`'s result `"purple"` must be changed to `"string"` by hand.

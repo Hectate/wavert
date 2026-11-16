@@ -16,7 +16,7 @@ Wavert is a programming language with its own compiler, `wvc`, written in Wavert
 | `examples/` | One short program per feature |
 | `samples/` | Larger programs that combine features (walk, tokenize, crates) |
 | `editors/vscode/` | The VS Code extension: grammar, snippets, hovers and completions |
-| `wah/`, `tools/wah2wvt.wah` | Γ--, the language Wavert was bootstrapped from; rarely touched |
+| `wah/` | Γ--, the language Wavert was bootstrapped from; rarely touched |
 
 ## Commands
 
