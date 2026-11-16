@@ -682,6 +682,22 @@ static int rt_depth;
 static int64_t rt_failcode;     // a pending fail's code, or 0
 static const char *rt_failfrom; // the function or stdlib function that failed
 
+// Where the running statement is: its file's index in rt_files, shifted left
+// by 20, or'ed with its line; 0 before the first. Every statement sets it
+// (RT_AT). rt_enter saves the caller's in rt_ats, and RT_RET puts it back, so
+// rt_ats[i] is where frame i - 1 (or main, for i = 0) made its call.
+#define RT_AT(file, line) (rt_at = ((file) << 20) | (line))
+static int32_t rt_at;
+static int32_t rt_ats[RT_DEPTH];
+static const char *const *rt_files; // the program's source files, set by wvt_main
+
+// One line of a panic's stack trace: "    file:line in name".
+static void trace_line(sb *b, const char *name, int32_t at) {
+  int line = at & 0xFFFFF;
+  if (line && rt_files) sb_printf(b, "    %s:%d in %s\n", rt_files[at >> 20], line, name);
+  else sb_printf(b, "    in %s\n", name);
+}
+
 static _Noreturn void rt_die(const char *msg, size_t n) {
 #ifdef WVT_TEST_DIE
   WVT_TEST_DIE(msg, n); // the runtime tests report a panic and go on
@@ -690,8 +706,15 @@ static _Noreturn void rt_die(const char *msg, size_t n) {
   sb_puts(&b, "uncaught panic: ");
   sb_putn(&b, msg, n);
   sb_putc(&b, '\n');
-  int shown = 0;
-  for (int i = rt_depth - 1; i >= 0 && shown < 48; i--, shown++) sb_printf(&b, "    in %s\n", rt_stack[i]);
+  // Innermost first; a deep stack shows its 40 innermost frames and its 8 outermost.
+  for (int i = rt_depth - 1; i >= 0; i--) {
+    if (rt_depth > 48 && i == rt_depth - 41) {
+      sb_printf(&b, "    ... %d more\n", rt_depth - 48);
+      i = 7;
+    }
+    trace_line(&b, rt_stack[i], i == rt_depth - 1 ? rt_at : rt_ats[i + 1]);
+  }
+  trace_line(&b, "main", rt_depth ? rt_ats[0] : rt_at);
   rt_write(2, b.p, b.n);
   rt_exit_code(1);
   for (;;) {}
@@ -714,9 +737,10 @@ static _Noreturn void rt_fail_sb(sb *b) { rt_die(b->p ? b->p : "", b->n); }
 // Called on entry to every function; RT_RET pops.
 static inline void rt_enter(const char *name) {
   if (rt_depth == RT_DEPTH) rt_fail("stack overflow");
+  rt_ats[rt_depth] = rt_at;
   rt_stack[rt_depth++] = name;
 }
-#define RT_RET(x) do { wv r_ = (x); rt_depth--; return r_; } while (0)
+#define RT_RET(x) do { wv r_ = (x); rt_at = rt_ats[--rt_depth]; return r_; } while (0)
 
 static const char *type_name(wv x) {
   switch (x.tag) {
@@ -1382,37 +1406,70 @@ static wv rt_rec(int is_mut, int64_t n, const wstr *const *keys, const wv *vals)
   return (wv){ .tag = T_REC, .r = r };
 }
 static wv rec_copy(const wrec *src, int is_mut) { return rt_rec(is_mut, src->n, src->keys, src->vals); }
-static const wstr *rec_key(wv k) {
-  if (k.tag != T_STR) rt_fail("type error: a record key must be a string, got %s", type_name(k));
-  return k.s;
+// Describes x for an error message: its type, and a record's field names,
+// "record { x, y }", so that a wrong record is told apart from the right one.
+static void describe(sb *b, wv x) {
+  sb_puts(b, type_name(x));
+  if (x.tag != T_REC) return;
+  if (x.r->n == 0) { sb_puts(b, " {}"); return; }
+  sb_puts(b, " { ");
+  for (int64_t i = 0; i < x.r->n; i++) {
+    if (i == 12) { sb_printf(b, ", ... %lld more", (long long)(x.r->n - 12)); break; }
+    if (i) sb_puts(b, ", ");
+    sb_putn(b, x.r->keys[i]->data, x.r->keys[i]->bytes);
+  }
+  sb_puts(b, " }");
 }
 // The slot of field key in r; key is registered, or NULL for a key no record has.
 static wv *field(const wstr *key, const wstr *name, wv r) {
-  if (r.tag != T_REC) rt_fail("type error: member access needs a record, got %s", type_name(r));
+  if (r.tag != T_REC) {
+    sb b = { 0 };
+    sb_puts(&b, "type error: reading field '");
+    sb_putn(&b, name->data, name->bytes);
+    sb_puts(&b, "' needs a record, got ");
+    describe(&b, r);
+    rt_fail_sb(&b);
+  }
   if (key) for (int64_t i = 0; i < r.r->n; i++) if (r.r->keys[i] == key) return &r.r->vals[i];
   sb b = { 0 };
   sb_puts(&b, "no field '");
   sb_putn(&b, name->data, name->bytes);
-  sb_puts(&b, "' in record");
+  sb_puts(&b, "' in ");
+  describe(&b, r);
   rt_fail_sb(&b);
 }
 static wv rt_get(const wstr *key, wv r) { return *field(key, key, r); }
-static void writable(wv r) {
-  if (!r.r->is_mut) rt_fail("cannot modify a field of a frozen record");
+static void writable(const wstr *name, wv r) {
+  if (r.r->is_mut) return;
+  sb b = { 0 };
+  sb_puts(&b, "cannot set field '");
+  sb_putn(&b, name->data, name->bytes);
+  sb_puts(&b, "' of a frozen ");
+  describe(&b, r);
+  rt_fail_sb(&b);
 }
 static void rt_set_mem(wv v, const wstr *key, wv r) {
   wv *p = field(key, key, r);
-  writable(r);
+  writable(key, r);
   *p = v;
 }
 static void rt_upd_mem(wv v, const wstr *key, wv r, wv (*op)(wv, wv)) {
   wv *p = field(key, key, r);
-  writable(r);
+  writable(key, r);
   *p = op(*p, v);
 }
+// Indexing record r with k, which names a field. A non-string k is most often
+// a map key given to a record, so the message shows both.
 static wv *computed(wv k, wv r) {
-  const wstr *name = rec_key(k);
-  return field(sym_find(name), name, r);
+  if (k.tag != T_STR) {
+    sb b = { 0 };
+    sb_puts(&b, "type error: a record's field name must be a string, got ");
+    describe(&b, k);
+    sb_puts(&b, ", indexing ");
+    describe(&b, r);
+    rt_fail_sb(&b);
+  }
+  return field(sym_find(k.s), k.s, r);
 }
 
 // ---- maps (§10.11) ----
@@ -1576,7 +1633,7 @@ static void rt_set_idx(wv v, wv i, wv arr) {
   }
   if (arr.tag == T_REC) {
     wv *p = computed(i, arr);
-    writable(arr);
+    writable(i.s, arr); // computed checked that i is a string
     *p = v;
     return;
   }
@@ -1593,7 +1650,7 @@ static void rt_upd_idx(wv v, wv i, wv arr, wv (*op)(wv, wv)) {
   }
   if (arr.tag == T_REC) {
     wv *p = computed(i, arr);
-    writable(arr);
+    writable(i.s, arr); // computed checked that i is a string
     *p = op(*p, v);
     return;
   }

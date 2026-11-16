@@ -131,6 +131,23 @@
     ;var stolen is []
     ;var ownEnums is []
     ;var cur is 0
+    // The positions where the current module's lines start, for RT_AT.
+    ;var lineStarts is [0]
+
+    // RT_AT(file, line) for the source position pos in the current module: the
+    // runtime's record of where the program is, for a panic's stack trace.
+    ;fn atLine(pos) {
+        // The last line start at or before pos.
+        ;var lo is 0
+        ;var hi is lineStarts($length) - 1
+        ;while (lo < hi) {
+            ;const mid is ((lo + hi + 1) / 2)($floor)
+            ;if (lineStarts[mid] <= pos) { ;set lo to mid } else { ;set hi to mid - 1 }
+        }
+        "RT_AT({curMod}, {lo + 1})"
+    }
+    // C expression c, after recording that it is at pos.
+    ;fn atExpr(pos, c) { "({pos(atLine)}, {c})" }
 
     // The id of module m: its place in initialization order for a library, "" for the entry file.
     ;fn modId(m) { m == modules($length) - 1 ? "" : "{m + 1}" }
@@ -382,6 +399,11 @@
         ;set cur to tops[m]
         ;set stolen to []
         ;set ownEnums to []
+        ;set lineStarts to [0]
+        ;const chars is modules[m].chars
+        ;for (i, c in chars) {
+            ;if (c == "\n") { ;(lineStarts, i + 1)($push) }
+        }
         ;const list is modules[m].program.stmts
         ;var k is 0
         ;while (k < list($length)) {
@@ -536,16 +558,18 @@
     ;fn blockBody(b) {
         ;b(resets)
         ;b.stmts(stmts)
-        ;if (b.value != null) { ;"(void){b.value(expr).c};"(emit) }
+        ;if (b.value != null) { ;"(void){b(valueOf)};"(emit) }
     }
 
-    ;fn valueOf(b) { b.value == null ? "RT_NULL" : b.value(expr).c }
+    // A block's value, recording its line first: it has no statement of its own to do that.
+    ;fn valueOf(b) { b.value == null ? "RT_NULL" : (b.value.pos, b.value(expr).c)(atExpr) }
 
     ;fn stmt(ref s) {
-        ;if (s.handler != null) { ;s(onfailStmt) ;return }
         ;const kind is s.k
         ;if (kind == "empty" || kind == "enum" || kind == "import" || kind == "end") { ;return }
         ;if (kind == "fn") { ;s(fnDef) ;return }
+        ;if (kind != "break" && kind != "continue") { ;"{s.pos(atLine)};"(emit) }
+        ;if (s.handler != null) { ;s(onfailStmt) ;return }
         ;if (kind == "return") {
             ;if (iife) { ;(s.pos, "'return' inside a conditional used as a value is not supported yet")(diag.abort) }
             ;"RT_RET({s.e == null ? "RT_NULL" : s.e(expr).c});"(emit)
@@ -558,7 +582,8 @@
             ;return
         }
         ;if (kind == "while") {
-            ;"while ({s.neg ? "!" : ""}rt_cond({s.cond(expr).c})) {{"(emit)
+            // The condition records its line too, since it runs again after the body.
+            ;"while ({s.neg ? "!" : ""}rt_cond({(s.cond.pos, s.cond(expr).c)(atExpr)})) {{"(emit)
             ;set indent += 1
             ;set loops += 1
             ;s.body(blockBody)
@@ -1166,7 +1191,12 @@
             ;set k += 1
         }
         ;(all, "")($push)
+        ;var files is []
+        ;for (m in modules) { ;(files, m.name(text.quote))($push) }
+        ;(all, "static const char *const W_files[] = {{ {(files, ", ")($join)} }};")($push)
+        ;(all, "")($push)
         ;(all, "static void wvt_main(void) {{")($push)
+        ;(all, "  rt_files = W_files;")($push)
         ;if (fields($length) > 0) {
             ;var refs is []
             ;set k to 0

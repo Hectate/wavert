@@ -64,6 +64,29 @@ const renamed = (text) => text
   .replace(/(\bstd_|\bname: ")isNobody\b/g, '$1isNan')
   .replace(/^(\s*\w+: )(uninvited|real|fake)$/gm, (m, key, v) => key + { uninvited: 'null', real: 'true', fake: 'false' }[v]);
 
+// wvc's C without what it emits to record source lines: the RT_AT statements,
+// the (RT_AT(f, l), value) wrappers around values, and the table of files.
+function withoutLines(c) {
+  c = c.replace(/^ *RT_AT\(\d+, \d+\);\n/gm, '')
+    .replace(/^static const char \*const W_files\[\] = .*\n\n/m, '')
+    .replace(/^ {2}rt_files = W_files;\n/m, '');
+  const open = '(RT_AT(';
+  let out = '';
+  for (let at = c.indexOf(open); at >= 0; at = c.indexOf(open)) {
+    // Drop the wrapper's "(RT_AT(f, l), " and its closing parenthesis, skipping string literals.
+    const start = c.indexOf('), ', at) + 3;
+    let depth = 1, i = start;
+    for (; depth > 0; i++) {
+      if (c[i] === '"') { for (i++; c[i] !== '"'; i++) if (c[i] === '\\') i++; }
+      else if (c[i] === '(') depth++;
+      else if (c[i] === ')') depth--;
+    }
+    out += c.slice(0, at);
+    c = c.slice(start, i - 1) + c.slice(i);
+  }
+  return out + c;
+}
+
 const files = only.length ? only : walk(wahDir);
 let failed = 0;
 for (const wah of files) {
@@ -85,8 +108,9 @@ for (const wah of files) {
     const rb = run(wvc, [wvt, '-o', outB, '--runtime', runtimeC]);
     if (ra.code !== 0 || rb.code !== 0) problems.push(`compiling to C failed:\n${ra.err}${rb.err}`);
     else {
-      // wvc registers a program's globals with the collector, which wahc predates.
-      const wvtOut = readFileSync(outB, 'utf8').replace(/^ {2}rt_roots\(.*\);\n/m, '');
+      // wvc registers a program's globals with the collector, and records source
+      // lines for stack traces, both of which wahc predates.
+      const wvtOut = withoutLines(readFileSync(outB, 'utf8').replace(/^ {2}rt_roots\(.*\);\n/m, ''));
       if (renamed(readFileSync(outA, 'utf8')) !== wvtOut) problems.push('the C differs');
     }
   }

@@ -39,6 +39,43 @@ test('$lib/ imports a standard library module from anywhere', { skip }, () => {
   assert.equal(d.match(/warning/g).length, 1);
 });
 
+test('a panic names the file and line of each frame, the standard library as $lib/', { skip }, () => {
+  const files = {
+    ...stdlib,
+    'parts/shape.wvt': ';export fn area(r) {\n    ;const w is r.width\n    w * r.height\n}\n;end\n',
+  };
+  const r = run(`;import u from "$lib/util.wvt"
+;import shape from "parts/shape.wvt"
+;fn draw(r) {
+    ;const n is 1
+    r(shape.area)
+}
+;const two is 1(u.twice)
+;{ width: two, h: 3 }(draw)
+;exit
+`, { files, lib: 'std' });
+  assert.equal(r.err, lines(
+    "uncaught panic: no field 'height' in record { width, h }",
+    '    parts/shape.wvt:3 in area',
+    '    main.wvt:5 in draw',
+    '    main.wvt:8 in main'));
+  // In the standard library: the line of the block value that made the call.
+  const s = run(';import u from "$lib/util.wvt"\n;"x"(u.twice)\n;exit\n', { files: stdlib, lib: 'std' });
+  assert.equal(s.err, lines(
+    "uncaught panic: type error: '*' cannot be applied to string and int",
+    '    $lib/helper.wvt:1 in double',
+    '    $lib/util.wvt:2 in twice',
+    '    main.wvt:2 in main'));
+  // A while condition runs again after its body, and is reported on its own line.
+  const w = run(';var x is { n: 2 }\n;while (x.n > 0) {\n    ;set x to 3\n}\n;exit\n');
+  assert.equal(w.err, lines("uncaught panic: type error: reading field 'n' needs a record, got int", '    main.wvt:2 in main'));
+  // A deep stack shows its innermost and outermost frames.
+  const d = run(';fn down(n) {\n    (n + 1)(down)\n}\n;0(down)\n;exit\n').err.split('\n');
+  assert.deepEqual([d[0], d[1], d[40], d[41], d[42], d[49], d[50], d.length], [
+    'uncaught panic: stack overflow', '    main.wvt:2 in down', '    main.wvt:2 in down',
+    '    ... 99952 more', '    main.wvt:2 in down', '    main.wvt:2 in down', '    main.wvt:4 in main', 52]);
+});
+
 test('$lib/ is the only reserved prefix, and stays inside lib/', { skip }, () => {
   const first = (source) => diagnostics(source, stdlib, { lib: 'std' }).split('\n').slice(0, 2).join(' | ');
   assert.equal(first(';import u from "$std/util.wvt"\n;exit\n'),
@@ -176,7 +213,7 @@ test('grid: copies never change each other', { skip }, () => {
 ;"{a(grid.rows)[0]} {snap(grid.rows)[0]} {c(grid.rows)[0]}"($print)`)),
   lines('a.. ..b ...', 'a!. a.. a.c'));
   assert.equal(panicOf(gridProgram(';const g is (2, 2, 0)(grid.new)\n;fn change(ref h) { ;(h, 0, 0, 1)(grid.put) }\n;g(change)')),
-    'cannot modify a field of a frozen record');
+    "cannot set field 'cells' of a frozen record { width, height, cells }");
 });
 
 test('grid: neighbors, distances and lines', { skip }, () => {
@@ -524,7 +561,7 @@ test('records: get, getOr, toMap, copyFields and toString', { skip }, () => {
   assert.equal(panicOf(`;import records from "$lib/records.wvt"
 ;const frozen is { hp: 1 }
 ;fn f(ref r) { ;(r, { hp: 2 })(records.copyFields) }
-;frozen(f)`), 'cannot modify a field of a frozen record');
+;frozen(f)`), "cannot set field 'hp' of a frozen record { hp }");
 });
 
 // ---- view.wvt ----

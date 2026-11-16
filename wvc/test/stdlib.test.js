@@ -393,8 +393,8 @@ test('misusing $sort and $sortBy panics', { skip }, () => {
   assert.equal(panicOf(';[[1], [0]]($sort)'), 'type error: $sort can sort only numbers and strings, got array');
   assert.equal(panicOf(';[1, nan, 0]($sort)'), '$sort cannot sort nan');
   assert.equal(panicOf(';enum E (a, b)\n;[E.b, E.a]($sort)'), 'type error: $sort can sort only numbers and strings, got E');
-  assert.equal(panicOf(';([{ a: 1 }, { b: 2 }], "a")($sortBy)'), "no field 'a' in record");
-  assert.equal(panicOf(';([{ a: 1 }, 2], "a")($sortBy)'), 'type error: member access needs a record, got int');
+  assert.equal(panicOf(';([{ a: 1 }, { b: 2 }], "a")($sortBy)'), "no field 'a' in record { b }");
+  assert.equal(panicOf(';([{ a: 1 }, 2], "a")($sortBy)'), "type error: reading field 'a' needs a record, got int");
   assert.equal(panicOf(';([1, 2], [1])($sortBy)'), '$sortBy: there are 1 keys for 2 items');
   assert.equal(panicOf(';([1, 2], 5)($sortBy)'), 'type error: $sortBy expects a field name or an array of keys, got int');
   assert.equal(panicOf(';"abc"($sort)'), 'type error: $sort expects an array, got string');

@@ -16,6 +16,8 @@
 >
 > Draft 0.8 adds the `for` loop (§7.4), over ranges of ints, arrays, maps and enums, forwards or `reversed`. `for` is a keyword, and `in` and `reversed` are contextual keywords (§2.5).
 
+> Draft 0.9 gives each frame of a panic's stack trace its file and line (§8.1), and has the errors about records describe the record by its fields (§10.8, §10.9).
+
 ## 1. Overview
 
 | Item | Value |
@@ -497,12 +499,15 @@ Wavert has two error mechanisms: a **fail** is an expected failure that only the
 ### 8.1 `panic`
 - Syntax: `;panic expr`. Any value may be given: a string is printed as it is, and any other value as a literal (`[1, 2]`, `"a"` inside an array).
 - Runtime errors panic too: type errors, out-of-range indexes, integer overflow, mutating a frozen value, and an unhandled fail (§8.2).
-- A panic ends the program. It prints `uncaught panic: ` and the message, then the function stack, innermost first, to stderr, and exits with code 1:
+- A panic ends the program. It prints `uncaught panic: ` and the message, then the function stack, innermost first, to stderr, and exits with code 1. Each frame gives the file and line it had reached: the panic's own for the innermost, and the call's for the others. `main` is the program's top level:
   ```
-  uncaught panic: it broke
-      in boom
-      in main
+  uncaught panic: no field 'height' in record { width, h }
+      parts/shape.wvt:3 in area
+      game.wvt:5 in draw
+      game.wvt:8 in main
   ```
+  - A file is named by its path as `wvc` was given it, and imported files by their paths from there; a standard library module is `$lib/name.wvt`.
+  - A deep stack shows its 40 innermost frames and its 8 outermost, with the number left out between them.
 - Catching panics is not designed yet. `recover` and `finally` are reserved for it (§16).
 
 ### 8.2 `fail` and `onfail`
@@ -699,11 +704,11 @@ A copy happens **only when mutability changes**:
 - When the left side is an enum (§4.1) or a module name (§13.1), `.` is resolved at compile time instead: `Kind.call` is an enum member, `lexer.keywords` is what the module `lexer` exports as `keywords`, and `shapes.Shape.circle` is a member of the enum `Shape` from the module `shapes`.
 - There are no methods: `.` is only member access, and calls stay postfix. `x.f(y)` parses as `y(x.f)`, a call of `y` with the field `x.f`, which is a compile error unless `y` is a function.
 - `.` must touch both sides (§2.7).
-- Reading a field of a non-record panics. Reading a missing field panics: `no field 'knid' in record`.
+- Reading a field of a non-record panics. Reading a missing field panics. The messages describe a record by its fields, to tell a wrong record from the right one: `no field 'knid' in record { kind, hp }`.
 
 ### 10.9 Record mutability
 - Records use the same frozen/mutable model as arrays. The copy table (§10.4) applies with "record" in place of "array".
-- `;set node.kind to x` assigns an existing field. `node` must be mutable. Through a `ref` binding this is checked at runtime.
+- `;set node.kind to x` assigns an existing field. `node` must be mutable. Through a `ref` binding this is checked at runtime, and panics: `cannot set field 'kind' of a frozen record { kind, hp }`.
   - Compound forms work too: `;set stats.count += 1`.
   - Computed targets follow the same rules: `;set node[k] to x` assigns the existing field named by `k`.
   - Assigning a missing field panics. A mutable record's shape is as fixed as a frozen one's; only its values change.
