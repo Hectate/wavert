@@ -141,7 +141,7 @@ Import with `;import name from "$lib/name.wvt"`; see [lib/README.md](../lib/READ
 
 | Module | For |
 |---|---|
-| `math` | `abs min max clamp div isqrt gcd lcm sum minOf maxOf lerp` |
+| `math` | `abs min max clamp div isqrt gcd lcm sum minOf maxOf lerp inverseLerp smoothstep pi tau sin cos` |
 | `text` | `repeat padLeft padRight center trim startsWith endsWith indexOf contains replace toUpper toLower wrap` |
 | `arrays` | `indexOf contains count range filled concat removeAt insertAt toString` |
 | `maps` | `getOr add pushTo toString` |

@@ -140,6 +140,38 @@ test('math: sum, minOf, maxOf and lerp', { skip }, () => {
   lines('6.5 0 -1 7', 'none 2.5 5.0 5.0'));
 });
 
+test('math: inverseLerp and smoothstep', { skip }, () => {
+  assert.equal(out(`;import math from "$lib/math.wvt"
+;const same is (1, 1, 1)(math.inverseLerp)
+    onfail { "fail" }
+;"{(0, 10, 2.5)(math.inverseLerp)} {(10, 0, 2.5)(math.inverseLerp)} {(0, 10, 15)(math.inverseLerp)} {same}"($print)
+;"{(0, 10, -1)(math.smoothstep)} {(0, 10, 2.5)(math.smoothstep)} {(0, 10, 5)(math.smoothstep)} {(0, 10, 11)(math.smoothstep)}"($print)
+;"{(10, 0, 2.5)(math.smoothstep)} {(3, 3, 2)(math.smoothstep)} {(3, 3, 3)(math.smoothstep)}"($print)`),
+  lines('0.25 0.75 1.5 fail', '0.0 0.15625 0.5 1.0', '0.84375 0.0 1.0'));
+});
+
+test('math: pi, tau, sin and cos', { skip }, () => {
+  assert.equal(out(`;import math from "$lib/math.wvt"
+;"{math.pi} {math.tau} {0(math.sin)} {0(math.cos)} {math.pi(math.sin)} {(math.pi / 2)(math.cos)}"($print)
+;"{(math.pi / 2)(math.sin)} {(math.pi / 6)(math.sin)} {(-math.pi / 2)(math.sin)} {math.pi(math.cos)}"($print)
+;"{nan(math.sin)} {inf(math.cos)} {(-inf)(math.sin)}"($print)`),
+  lines('3.141592653589793 6.283185307179586 0.0 1.0 1.2246467991473515e-16 6.123233995736757e-17',
+    '1.0 0.49999999999999994 -1.0 -1.0', 'nan nan nan'));
+  // Within 2 ulps of JavaScript's (fdlibm's) sin and cos, over a spread of
+  // angles in every quadrant, up to a million in size.
+  const xs = [];
+  for (let i = 0; i < 400; i++) xs.push((i - 200) * 0.0251, (i - 200) * 7.3131, (i - 200) * 4999.77);
+  const got = out(`;import math from "$lib/math.wvt"
+;const xs is [${xs.map((x) => (Number.isInteger(x) ? x + '.0' : String(x))).join(', ')}]
+;for (x in xs) { ;"{x(math.sin)} {x(math.cos)}"($print) }`).trim().split('\n');
+  const ulp = (v) => 2 ** (Math.floor(Math.log2(Math.max(Math.abs(v), 2 ** -1022))) - 52);
+  xs.forEach((x, i) => {
+    const [s, c] = got[i].split(' ').map(Number);
+    assert.ok(Math.abs(s - Math.sin(x)) <= 2 * ulp(Math.sin(x)), `sin ${x}: ${s} vs ${Math.sin(x)}`);
+    assert.ok(Math.abs(c - Math.cos(x)) <= 2 * ulp(Math.cos(x)), `cos ${x}: ${c} vs ${Math.cos(x)}`);
+  });
+});
+
 // ---- grid.wvt ----
 
 // A Wavert function that shows an area as "x,y x,y ...".
