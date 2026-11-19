@@ -17,7 +17,7 @@ To install it permanently, package a `.vsix`:
 ```
 cd editors/vscode
 npx @vscode/vsce package --skip-license --allow-missing-repository
-code --install-extension wavert-language-0.3.2.vsix
+code --install-extension wavert-language-0.3.3.vsix
 ```
 
 After changing the extension, reload the window (**Developer: Reload Window**). An installed copy must be repackaged and reinstalled.
@@ -51,7 +51,26 @@ Hovering a name shows what it is and its documentation comment: the `//` lines d
 | `lib` itself | the import, and the comment at the top of the module |
 | `$name` | its call form and notes from the specification's tables, and the section |
 
-Typing `lib.` completes the module's exports, each with its signature and comment, and `$` completes the standard library's names. Wavert calls put the function after its arguments, so there is no help while typing arguments: the signature in the completion shows their order first.
+Typing `lib.` completes the module's exports, each with its signature and comment, and `$` completes the standard library's names. Other names complete to the file's own declarations and imports, and to the words of the file.
+
+## Writing calls
+
+Wavert calls put the function after its arguments, so completing a function writes out the whole call, with a placeholder for each argument. Type the argument over the selected placeholder, and press Tab to move to the next one, then past the call:
+
+| Typed | Completed |
+|---|---|
+| `;(grid.po` | `;(x, y)(grid.pos)`, with `x` selected |
+| `;$pri` | `;x($print)` |
+| `;$ti` | `;($time)` |
+| `;wa`, for the file's `fn walk(ref g, var at, steps)` | `;(g, at, steps)(walk)` |
+
+Completing a call inside a placeholder nests it: Tab goes through the inner call's placeholders first, then carries on with the outer ones. While the suggestion list is open, Tab accepts the suggestion instead, so close the list with Escape first. Escape with no list open ends the placeholders, keeping the text.
+
+Where the function of a call is being written, after an expression and `(` as in `xs(grid.po`, a completion inserts only the name.
+
+While a placeholder is selected, VS Code does not open the suggestion list as you type, except after `.` and `$`. Press Ctrl+Space for the file's own functions.
+
+Inside the arguments of a call, as in `(1, |)(grid.pos)`, parameter hints show the function's parameters, with the one at the cursor in bold. They open after typing `(` or `,` in a call whose function is already written, and after completing a call with two or more parameters. Ctrl+Shift+Space opens them anywhere.
 
 `$lib/` imports are found in the standard library folder, as `wvc` finds it:
 

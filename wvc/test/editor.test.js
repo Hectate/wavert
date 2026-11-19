@@ -111,3 +111,44 @@ test('imports lead to files, and $lib/ to the standard library', () => {
   assert.equal(docs.findLib({ wvcPath: join(root, 'wvc/wvc.exe') }), lib);
   assert.equal(docs.findLib({ libPath: join(root, 'no-such-folder') }), null);
 });
+
+test('completing a function writes out its call, with a placeholder per argument', () => {
+  const [walk] = docs.declarations(';fn walk(ref g, var at, steps) { 1 }');
+  assert.deepEqual(docs.parameters(walk), ['ref g', 'var at', 'steps']);
+  assert.equal(docs.callSnippet('walk', docs.parameters(walk)), '(${1:g}, ${2:at}, ${3:steps})(walk)$0');
+  assert.equal(docs.callSnippet('grid.pos', ['x']), '${1:x}(grid.pos)$0');
+  assert.equal(docs.callSnippet('$time', []), '(\\$time)$0');
+  assert.deepEqual(docs.builtinParameters(';(x, i)($at)'), ['x', 'i']);
+  assert.deepEqual(docs.builtinParameters(';x($ceil)'), ['x']);
+  assert.deepEqual(docs.builtinParameters(';($time)'), []);
+  assert.deepEqual(docs.builtinParameters(';"HOME"($env)'), ['"HOME"']);
+  // Every stdlib function's parameters agree with its arity.
+  for (const [name, b] of Object.entries(builtins)) {
+    if (b.arity !== 'constant') assert.equal(docs.builtinParameters(b.call).length, b.arity, name);
+  }
+  // A name is the function of a call already written after an expression.
+  for (const s of [';xs(', ';(1, 2)(', ';x[0](', ';"a"(', ';5(', ';node.kind(']) assert.ok(docs.calleeBefore(s), s);
+  for (const s of [';(', ';(1, (', ';x + (', ';if (', ';while(', '']) assert.ok(!docs.calleeBefore(s), s);
+});
+
+test('parameter hints: the call around the cursor and its argument', () => {
+  const around = (s) => docs.callAround(s.replace('|', ''), s.indexOf('|'));
+  assert.deepEqual(around(';(|1, 2)(math.average)'), { name: 'math.average', active: 0 });
+  assert.deepEqual(around(';(1, |)(math.average)'), { name: 'math.average', active: 1 });
+  assert.deepEqual(around(';(|)($time)'), { name: '$time', active: 0 });
+  // Nested calls: the innermost whose arguments hold the cursor.
+  assert.deepEqual(around(';((x, |y)(grid.pos), b)(f)'), { name: 'grid.pos', active: 1 });
+  assert.deepEqual(around(';((x, y)(grid.pos), |b)(f)'), { name: 'f', active: 1 });
+  assert.deepEqual(around(';((x, y)(grid.p|os), b)(f)'), { name: 'f', active: 0 });
+  // Commas in arrays, records, strings and comments are not between arguments.
+  assert.deepEqual(around(';([1, 2], { a: 1, b: 2 }, ",", |x)(f)'), { name: 'f', active: 3 });
+  assert.deepEqual(around(';(a, // b, c\n  |d)(f)'), { name: 'f', active: 1 });
+  assert.deepEqual(around(';("{(1, 2)(g)}, (", |x)(f)'), { name: 'f', active: 1 });
+  assert.deepEqual(around(';("{(1, |2)(g)}", x)(f)'), { name: 'g', active: 1 });
+  // Not among arguments: grouping, an unfinished call, or a parameter list.
+  assert.equal(around(';x(f|)'), null);
+  assert.equal(around(';(a + |b) / c'), null);
+  assert.equal(around(';(1, |'), null);
+  assert.equal(around(';fn f(a, |b) { 1 }'), null);
+  assert.equal(around(';"(1, |2)(f)"'), null);
+});
