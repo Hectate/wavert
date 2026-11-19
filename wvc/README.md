@@ -12,6 +12,7 @@ wvc/wvc.exe build examples/fizzbuzz.wvt     # writes examples/fizzbuzz.c and bui
 wvc/wvc.exe examples/fizzbuzz.wvt           # just the C, as examples/fizzbuzz.c
 wvc/wvc.exe --tokens examples/hello.wvt
 wvc/wvc.exe --ast examples/hello.wvt
+wvc/wvc.exe --types examples/hello.wvt     # check, and the inferred types as JSON, for editors
 ```
 
 - With a file, `wvc` writes C to `<file>.c`, or to `-o`, inlining the runtime [../runtime/wvt.c](../runtime/wvt.c). Pass `--runtime` to use another runtime file.
@@ -20,6 +21,7 @@ wvc/wvc.exe --ast examples/hello.wvt
 - `build` compiles to C, writes it beside the program as `<program>.c`, and runs a C compiler. The program defaults to the input without `.wvt`, with `.exe` on Windows. The compiler is `--cc`, else the `ZIG` variable, else `zig` on `PATH`. Zig is called as `zig cc`; other compilers get the flags directly. See [Getting Zig](../wah/README.md#getting-zig).
 - A program that imports libraries is compiled whole: libraries are found through their import paths.
 - `--tokens` and `--ast` show the given file alone, without the libraries it imports.
+- `--types` checks the program without making C. Warnings and errors go to stderr as usual, with exit code 2 on an error, and stdout gets the types the checker inferred (§4.2) as JSON: `{ files, names }`, where each name is `{ file, line, col, name, kind, type }`, `file` indexes `files`, and `type` is `{ text }` with `fields` for a record. It is for editors: the input may be a library as well as a program, and `--text <file>` checks another file's text, such as an unsaved copy, as if it were the input's, so its imports still resolve from the input's folder.
 
 Warnings and errors go to stderr, with exit code 2 on an error. The lexer and parser stop at the first error; the checker reports every error it finds.
 

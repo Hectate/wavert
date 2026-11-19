@@ -18,7 +18,7 @@
 
 > Draft 0.9 gives each frame of a panic's stack trace its file and line (§8.1), and has the errors about records describe the record by its fields (§10.8, §10.9).
 >
-> Draft 0.10 reports, as compile errors, operations that the compiler can tell from the types of their values would always panic, such as a missing field of a record built in view, or `"n=" + n` (§4.2).
+> Draft 0.10 reports, as compile errors, operations that the compiler can tell from the types of their values would always panic, such as a missing field of a record built in view, or `"n=" + n`. It knows the types of the elements of frozen arrays, such as array literals (§4.2).
 
 ## 1. Overview
 
@@ -262,12 +262,12 @@ Implicit conversions (the complete list):
 Types are checked when a value is used, and a wrong type panics. Where the compiler can tell from the program's text that an operation would panic whenever it runs, it reports a compile error instead. It reports nothing it is unsure of: a program that might run correctly still compiles, and a program that compiles may still panic.
 
 The compiler knows the type of:
-- A literal. A record literal is a record with exactly its fields, and since it is frozen (§10.4), the types of its fields' values are known too.
+- A literal. A record literal is a record with exactly its fields, and since it is frozen (§10.4), the types of its fields' values are known too. An array literal is frozen as well, so when its elements all have one type, every element of the array is known to have it: `[[Hand.rock, Hand.paper]]` is an array of arrays of `Hand` members. Nothing is known of the elements of a mutable array, since anything may be pushed into it.
 - An operator's result, and an `if`, `match` or ternary value whose branches agree.
-- A standard library call that always returns one type, such as `$length`, and `$terminal` and `$terminalSize`, whose records' fields are known.
+- A standard library call that always returns one type, such as `$length`, and `$terminal` and `$terminalSize`, whose records' fields are known. The arrays it returns are frozen: `$split`, `$fields`, `$listDir` and `$args` hold strings, and `$sort`, `$sortBy`, `$reverse` and `$slice` hold the elements of the array they are given.
 - A call of a function declared earlier in the program, when every way the function returns gives one type. A parameter's type is not known, so `;fn pos(x, y) { { x: x, y: y } }` is known to return a record `{ x, y }`, with fields of unknown types.
 - A `const` binding, and a `var` or `ref` binding that no `;set name to ...` or `;set name += ...` rebinds anywhere in its module. A `var` binding holds a mutable copy, and a mutable record's fields may be set to values of other types (§10.9), so of a record only its field names stay known.
-- A range's loop variable, which is an int, as is the index of a loop over an array; an enum loop's variable; and an `onfail` code, which is an int.
+- A range's loop variable, which is an int, as is the index of a loop over an array; the element of a loop over an array whose elements are known, and an element read by indexing it or with `$at`; an enum loop's variable; and an `onfail` code, which is an int.
 
 What it reports:
 
@@ -1319,7 +1319,7 @@ More examples are in [examples/](../examples/), each showing one feature, and [s
   - On Windows, key mode clears `ENABLE_ECHO_INPUT` and `ENABLE_LINE_INPUT` and keeps `ENABLE_PROCESSED_INPUT`. Keys come from `ReadConsoleInputW` key-down events and are mapped by virtual-key code and character.
   - A stream is a terminal when `isatty` is true for it on POSIX, and when `GetConsoleMode` succeeds for it on Windows. The size comes from `ioctl` with `TIOCGWINSZ` on POSIX, and from the window rectangle of `GetConsoleScreenBufferInfo` on Windows.
 - **Waiting and the clock (§12.2, §12.8).** `$elapsed` reads `CLOCK_MONOTONIC` on POSIX and `QueryPerformanceCounter` on Windows. On POSIX, `$waitKey` waits with `poll` and `$sleep` with `nanosleep`. On Windows they wait on a high-resolution waitable timer, so short waits are not rounded up to the 15.6 ms system tick; `$waitKey` waits on the console input handle together with it, and checks a pipe with `PeekNamedPipe` every millisecond, since pipes cannot be waited on.
-- **Editor support.** [editors/vscode/](../editors/vscode/) has syntax highlighting and snippets for VS Code.
+- **Editor support.** [editors/vscode/](../editors/vscode/) has syntax highlighting and snippets for VS Code. It checks files as they are edited with `wvc --types`, which reports the diagnostics and the types the compiler infers (§4.2) as JSON.
 - **Tests.** `wvc/test` runs every example, checks this specification's syntax and diagnostics, and checks the bootstrap fixed point.
 
 ---

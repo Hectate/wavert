@@ -130,22 +130,41 @@
 // what it knows, so a program it accepts may still panic.
 //
 // A type is null when nothing is known. Otherwise it is { t }, where t is int,
-// float, boolean, string, null, array or map; { t: "record", names, types }
-// for a record with exactly the fields names, where types holds what is known
-// of their values, or is null when the record may be mutable, since its
-// fields may then be set to values of other types (§10.9); { t: "enum", name,
-// id } for a member of an enum; or { t: "never" } for code that never
-// completes, such as a block ending in ;return.
+// float, boolean, string, null or map; { t: "array", elem } for an array,
+// where elem is the type of every element, or null when that is not known: a
+// mutable array may have any value pushed into it, so only a frozen one's
+// elements are known (§10.4); { t: "record", names, types } for a record
+// with exactly the fields names, where types holds what is known of their
+// values, or is null when the record may be mutable, since its fields may
+// then be set to values of other types (§10.9); { t: "enum", name, id } for a
+// member of an enum; or { t: "never" } for code that never completes, such as
+// a block ending in ;return.
 ;const tInt is { t: "int" }
 ;const tFloat is { t: "float" }
 ;const tBool is { t: "boolean" }
 ;const tString is { t: "string" }
 ;const tNull is { t: "null" }
-;const tArray is { t: "array" }
+;const tArray is { t: "array", elem: null }
 ;const tMap is { t: "map" }
 ;const tNever is { t: "never" }
 
 ;fn recordType(names, types) { { t: "record", names: names, types: types } }
+
+// A frozen array whose elements are all of type elem. The elements of an empty
+// one are never anything, so they are not known.
+;fn arrayOf(elem) { { t: "array", elem: elem != null && elem.t == "never" ? null : elem } }
+
+// The type of an element of an array of type x, or null.
+;fn elemOf(x) { x(known) && x.t == "array" ? x.elem : null }
+
+// The array of type x, as a new frozen array of the same elements, as from $sort.
+;fn sameElems(x) { x(known) && x.t == "array" ? x : tArray }
+
+// What the last check found, for typesJson: the declarations of every module,
+// and the types of bindings and of what functions return, by "module:position".
+;var lastDecls is []
+;var lastBindingTypes is [:]
+;var lastFnTypes is [:]
 
 // Whether x tells anything about a value.
 ;fn known(x) { x != null && x.t != "never" }
@@ -168,6 +187,7 @@
     ;if (b.t == "never") { ;return a }
     ;if (a.t != b.t) { ;return null }
     ;if (a.t == "enum") { ;return a.id == b.id ? a : null }
+    ;if (a.t == "array") { ;return (a.elem, b.elem)(join)(arrayOf) }
     ;if (a.t != "record") { ;return a }
     ;if (!(a.names, b.names)($same)) { ;return null }
     ;if (a.types == null || b.types == null) { ;return (a.names, null)(recordType) }
@@ -177,8 +197,12 @@
 }
 
 // The type of a mutable copy of a value of type x: a record's fields may be
-// set, so only their names stay known.
-;fn thaw(x) { x(known) && x.t == "record" ? (x.names, null)(recordType) : x }
+// set, so only their names stay known, and anything may be put in an array.
+;fn thaw(x) {
+    ;if (!x(known)) { ;return x }
+    ;if (x.t == "record") { ;return (x.names, null)(recordType) }
+    x.t == "array" ? tArray : x
+}
 
 // Whether a value of type x converts to text, as interpolation, $print and
 // $toString need (§9.3). If not, a hint for converting it.
@@ -197,8 +221,12 @@
         case "toFloat", "randomFloat" { tFloat }
         case "toString", "fromCode", "join", "readLine", "readKey", "readFile", "env" { tString }
         case "same", "has", "isNan", "fileExists" { tBool }
-        case "split", "keys", "values", "fields", "sort", "sortBy", "reverse", "listDir" { tArray }
+        // The arrays they return are frozen.
+        case "split", "fields", "listDir" { tString(arrayOf) }
+        case "keys", "values" { tArray }
+        case "sort", "sortBy", "reverse" { args[0](sameElems) }
         case "slice" { args[0](known) && (args[0].t == "string" || args[0].t == "array") ? args[0] : null }
+        case "at" { args[0](known) && args[0].t == "string" ? tString : args[0](elemOf) }
         case "terminal" { (["input", "output"], null)(recordType) }
         case "terminalSize" { (["width", "height"], null)(recordType) }
         else { null }
@@ -261,6 +289,87 @@
     ;for (f in fields) { ;(node[f], found)(rebinds) }
 }
 
+// ---- The types found, as JSON, for editors (wvc --types) ----
+
+;const hexDigits is "0123456789abcdef"
+
+// s as a JSON string.
+;fn jsonString(s) {
+    ;var parts is ["\""]
+    ;for (c in (s, "")($split)) {
+        ;const code is c($code)
+        ;if (c == "\"" || c == "\\") {
+            ;(parts, "\\" + c)($push)
+        } else if (code < 32) {
+            ;(parts, "\\u00" + (hexDigits, (code / 16)($floor))($at) + (hexDigits, code % 16)($at))($push)
+        } else {
+            ;(parts, c)($push)
+        }
+    }
+    ;(parts, "\"")($push)
+    (parts, "")($join)
+}
+
+// A type as an editor shows it: as the messages name it, but with what an
+// array holds, when that is known: array of Hand.
+;fn typeLabel(x) {
+    ;if (x.t == "array" && x.elem != null) { ;return "array of {x.elem(typeLabel)}" }
+    x(typeText)
+}
+
+// A type as JSON: null when nothing is known, else { text }, and for a record
+// fields, each { name, type }, and for an array whose elements are known, elem.
+;fn typeJson(x) {
+    ;if (x == null) { ;return "null" }
+    ;var out is "{{\"text\": {x(typeLabel)(jsonString)}"
+    ;if (x.t == "array" && x.elem != null) { ;set out to out + ", \"elem\": {x.elem(typeJson)}" }
+    ;if (x.t == "record") {
+        ;var fields is []
+        ;for (i, n in x.names) {
+            ;const ft is x.types == null ? null : x.types[i]
+            ;(fields, "{{\"name\": {n(jsonString)}, \"type\": {ft(typeJson)}}}")($push)
+        }
+        ;set out to out + ", \"fields\": [{(fields, ", ")($join)}]"
+    }
+    out + "}}"
+}
+
+// The types the last check found, as JSON for an editor:
+// { files, names }, where files lists each module's file, and names each
+// binding, parameter, loop variable and function whose type is known, as
+// { file (an index into files), line, col, name, kind, type }. kind is const,
+// var, ref, param, loop, onfail or fn; a function's type is what it returns.
+;export fn typesJson(modules) {
+    // Where each line of each module starts.
+    ;var starts is []
+    ;for (m in modules) {
+        ;var lines is [0]
+        ;for (i, c in m.chars) {
+            ;if (c == "\n") { ;(lines, i + 1)($push) }
+        }
+        ;(starts, lines)($push)
+    }
+    ;var names is []
+    ;for (d in lastDecls) {
+        ;const key is "{d.mod}:{d.namePos}"
+        ;const types is d.kind == "fn" ? lastFnTypes : lastBindingTypes
+        ;if (!(types, key)($has)) { ;continue }
+        ;const kind is d.kind == "decl" ? (d.isVar ? "var" : d.isRef ? "ref" : "const") : d.kind
+        // The line holding the name: the last that starts at or before it.
+        ;const ls is starts[d.mod]
+        ;var lo is 0
+        ;var hi is ls($length) - 1
+        ;while (lo < hi) {
+            ;const mid is ((lo + hi + 1) / 2)($floor)
+            ;if (ls[mid] <= d.namePos) { ;set lo to mid } else { ;set hi to mid - 1 }
+        }
+        ;(names, "{{\"file\": {d.mod}, \"line\": {lo + 1}, \"col\": {d.namePos - ls[lo] + 1}, \"name\": {d.name(jsonString)}, \"kind\": \"{kind}\", \"type\": {types[key](typeJson)}}}")($push)
+    }
+    ;var files is []
+    ;for (m in modules) { ;(files, m.file(jsonString))($push) }
+    "{{\"files\": [{(files, ", ")($join)}],\n\"names\": [\n{(names, ",\n")($join)}\n]}}"
+}
+
 // The type of a block without a value: never if it never reaches its end
 // (§7.2), else null.
 ;fn endType(b) {
@@ -280,7 +389,8 @@
 // Checks the modules, in initialization order with the entry file last;
 // returns the errors (an empty array if there are none), and fills in each
 // module's exports and notLibrary. requireExit: the entry-file rule that the
-// last statement is ;exit (§13).
+// last statement is ;exit (§13). Without it, as for an editor, the entry file
+// may be a program or a library.
 ;export fn check(modules, requireExit) {
     ;var errors is []
     ;var nextFn is 1
@@ -301,6 +411,8 @@
     ;var returnTypes is [:]
     // The names that some ;set rebinds in the module being checked.
     ;var rebound is [:]
+    // Every declaration, in the order they were declared.
+    ;var allDecls is []
 
     ;fn error(pos, message, hint) { ;(errors, (pos, message, hint)(diag.err))($push) }
 
@@ -355,8 +467,11 @@
     ;fn indexed(at, index, it, pos, verb) {
         ;if (!at(known)) { ;return null }
         ;if (at.t == "array") {
-            ;if (it(known) && it.t != "int") { ;(index.pos, "an index must be an int, got {it(typeText)}", null)(error) }
-            ;return null
+            ;if (it(known) && it.t != "int") {
+                ;(index.pos, "an index must be an int, got {it(typeText)}", null)(error)
+                ;return null
+            }
+            ;return at.elem
         }
         ;if (at.t == "map") {
             ;if (it(known) && (["float", "null", "array", "map"], it.t)(text.contains)) {
@@ -507,6 +622,7 @@
             ;set s to s.parent
         }
         ;(scope.names, d)($push)
+        ;(allDecls, d)($push)
     }
 
     ;fn lookup(ref scope, name) {
@@ -666,7 +782,7 @@
         } else {
             ;const ct is (s.coll, scope, ctx)(expr)
             ;(s.coll, ct)(collection)
-            ;if (ct(known) && ct.t == "array" && s.names($length) == 2) { ;set names to [tInt] }
+            ;if (ct(known) && ct.t == "array") { ;set names to s.names($length) == 2 ? [tInt, ct.elem] : [ct.elem] }
             ;const path is s.coll(pathOf)
             ;if (path != null) { ;(guards, path)($push) }
         }
@@ -1068,11 +1184,17 @@
             } else if (sig != "const") {
                 ;(e.pos, "'\${e.name}' is a function; call it with (\${e.name})", null)(error)
             }
-            ;return e.name == "args" ? tArray : e.name == "programPath" ? tString : null
+            ;return e.name == "args" ? tString(arrayOf) : e.name == "programPath" ? tString : null
         }
-        ;if (kind == "arr" || kind == "map") {
+        // An array literal is frozen, so its elements are what it holds.
+        ;if (kind == "arr") {
+            ;var elem is tNever
+            ;for (item in e.items) { ;set elem to (elem, (item, scope, ctx)(expr))(join) }
+            ;return elem(arrayOf)
+        }
+        ;if (kind == "map") {
             ;for (item in e.items) { ;(item, scope, ctx)(expr) }
-            ;return kind == "arr" ? tArray : tMap
+            ;return tMap
         }
         // A literal is frozen, so its fields keep the types of their values.
         ;if (kind == "rec") {
@@ -1280,7 +1402,9 @@
         ;const scope is null(newScope)
         ;(m, scope)(importNames)
         ;({ stmts: program.stmts, value: null }, scope, { func: topFn, loops: 0, guards: [] })(block)
-        ;(m, scope, isEntry, last)(libraryRules)
+        // Without requireExit, an entry file that ends with ;end is checked as a library.
+        ;const asLibrary is !requireExit && last != null && last.k == "end"
+        ;(m, scope, isEntry && !asLibrary, last)(libraryRules)
     }
 
     ;const topFn is { id: 0, top: true }
@@ -1306,17 +1430,19 @@
     }
     ;entry(enter)
     ;const program is modules[entry].program
-    ;if (requireExit) {
-        ;var last is null
-        ;var k is 0
-        ;while (k < program.stmts($length)) {
-            ;if (program.stmts[k].k != "empty") { ;set last to program.stmts[k] }
-            ;set k += 1
-        }
-        ;if (last == null || last.k != "exit") {
-            ;(program.end, "a program must end with ;exit", "end the program with ;exit, or a library with ;end")(error)
-        }
+    ;var last is null
+    ;var k is 0
+    ;while (k < program.stmts($length)) {
+        ;if (program.stmts[k].k != "empty") { ;set last to program.stmts[k] }
+        ;set k += 1
     }
+    // Without requireExit, an entry file ending with ;end is a library.
+    ;if ((last == null || last.k != "exit") && (requireExit || last == null || last.k != "end")) {
+        ;(program.end, "a program must end with ;exit", "end the program with ;exit, or a library with ;end")(error)
+    }
+    ;set lastDecls to allDecls
+    ;set lastBindingTypes to bindingTypes
+    ;set lastFnTypes to fnTypes
     errors
 }
 

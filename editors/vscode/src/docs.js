@@ -98,6 +98,23 @@ function findLib({ libPath = '', wvcPath = '', file = '' } = {}) {
   return null;
 }
 
+// The wvc compiler that checks files as they are edited: the wvcPath setting;
+// else, for a file in the Wavert repository, a wvc built in its .wvt/ or wvc/
+// folder. null if none.
+function findWvc({ wvcPath = '', file = '', platform = process.platform } = {}) {
+  if (wvcPath) return fs.existsSync(wvcPath) ? wvcPath : null;
+  const exe = platform === 'win32' ? 'wvc.exe' : 'wvc';
+  for (let dir = path.dirname(file); file; ) {
+    if (fs.existsSync(path.join(dir, 'wvc', 'wvc.wvt'))) {
+      return [path.join(dir, '.wvt', exe), path.join(dir, 'wvc', exe)].find((p) => fs.existsSync(p)) ?? null;
+    }
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return null;
+}
+
 // The dotted name around column col of a line, such as grid.circle or
 // $sortBy, and which part of it the column is in: { parts, index }, or null.
 function nameAt(line, col) {
@@ -256,6 +273,6 @@ function callAround(text, offset) {
 }
 
 module.exports = {
-  declarations, header, imports, resolveImport, findLib, nameAt, qualifierBefore, enumMembers,
+  declarations, header, imports, resolveImport, findLib, findWvc, nameAt, qualifierBefore, enumMembers,
   parameters, builtinParameters, callSnippet, callSignature, calleeBefore, codeMask, callAround,
 };

@@ -12,6 +12,7 @@
 // Usage: wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>] [--lib <dir>]
 //        wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>] [--lib <dir>]
 //        wvc (--tokens | --ast) <file.wvt>
+//        wvc --types <file.wvt> [--text <file>] [--lib <dir>]
 
 ;import txt from "text.wvt"
 ;import diag from "diag.wvt"
@@ -28,17 +29,19 @@
     "  wvc <file.wvt> [-o <out.c>] [--runtime <wvt.c>] [--lib <dir>]\n" +
     "  wvc build <file.wvt> [-o <program>] [--cc <compiler>] [--runtime <wvt.c>] [--lib <dir>]\n" +
     "  wvc --tokens <file.wvt>\n" +
-    "  wvc --ast <file.wvt>"
+    "  wvc --ast <file.wvt>\n" +
+    "  wvc --types <file.wvt> [--text <file>] [--lib <dir>]"
 
 ;fn die() {
     ;usage($eprint)
     ;exit 2
 }
 
-// Reads file into srcFile and srcChars, dropping a byte-order mark.
-;fn load(file) {
-    ;const text is file($readFile)
-        onfail { ;"wvc: cannot read {file}"($eprint) ;exit 2 }
+// Reads file into srcFile and srcChars, dropping a byte-order mark. The
+// text comes from the file from, which is file unless --text names another.
+;fn load(file, from) {
+    ;const text is from($readFile)
+        onfail { ;"wvc: cannot read {from}"($eprint) ;exit 2 }
     ;const chars is (text, "")($split)
     ;const bom is chars($length) > 0 && chars[0] == "\u{FEFF}" ? 1 : 0
     ;(file, (chars, bom, chars($length))($slice))(diag.setSource)
@@ -52,14 +55,16 @@
 ;var runtimePath is ""
 ;var cc is ""
 ;var libGiven is ""
+// --text: a file whose text is checked as the input's, such as an editor's unsaved copy.
+;var textGiven is ""
 ;var arg is 0
 ;while (arg < argv($length)) {
     ;const a is argv[arg]
     ;if (arg == 0 && a == "build") {
         ;set mode to a
-    } else if (a == "--tokens" || a == "--ast") {
+    } else if (a == "--tokens" || a == "--ast" || a == "--types") {
         ;set mode to a
-    } else if (a == "-o" || a == "--runtime" || a == "--cc" || a == "--lib") {
+    } else if (a == "-o" || a == "--runtime" || a == "--cc" || a == "--lib" || a == "--text") {
         ;set arg += 1
         ;if (arg >= argv($length)) { ;(die) }
         ;if (a == "-o") {
@@ -68,6 +73,8 @@
             ;set runtimePath to argv[arg]
         } else if (a == "--lib") {
             ;set libGiven to argv[arg]
+        } else if (a == "--text") {
+            ;set textGiven to argv[arg]
         } else {
             ;set cc to argv[arg]
         }
@@ -79,7 +86,8 @@
     ;set arg += 1
 }
 ;const inspect is mode == "--tokens" || mode == "--ast"
-;if (input == "" || inspect && (output != "" || runtimePath != "" || libGiven != "") || mode != "build" && cc != "") { ;(die) }
+;if (input == "" || inspect && (output != "" || runtimePath != "" || libGiven != "") || mode != "build" && cc != "" ||
+    mode == "--types" && (output != "" || runtimePath != "") || mode != "--types" && textGiven != "") { ;(die) }
 
 ;fn onWindows() {
     ;const os is "OS"($env)
@@ -146,7 +154,7 @@
     null
 }
 
-;input(load)
+;(input, textGiven != "" ? textGiven : input)(load)
 // --tokens and --ast show the input file alone, without the libraries it imports.
 ;if (mode == "--tokens") {
     ;const tokens is diag.srcChars(lexer.lex)
@@ -162,7 +170,16 @@
 }
 ;const libDir is (findLib)
 ;const modules is (diag.srcFile, diag.srcChars, libDir, searched)(loader.loadProgram)
-;const problems is (modules, true)(checker.check)
+// For an editor (--types), the input may be a library as well as a program.
+;const problems is (modules, mode != "--types")(checker.check)
+// --types: the diagnostics, then what the checker knows of the types, as JSON
+// for an editor (checker.typesJson). No C is made.
+;if (mode == "--types") {
+    ;(diag.flushWarnings)
+    ;for (p in problems) { ;p(diag.formatDiag)($eprint) }
+    ;modules(checker.typesJson)($print)
+    ;exit problems($length) > 0 ? 2 : 0
+}
 ;if (problems($length) > 0) {
     ;(diag.flushWarnings)
     ;var p is 0

@@ -1,8 +1,8 @@
 {
   "name": "wavert-language",
   "displayName": "Wavert",
-  "description": "Syntax highlighting, brackets, snippets, and documentation on hover and in completions, call completions and parameter hints for Wavert (.wvt)",
-  "version": "0.3.3",
+  "description": "Syntax highlighting, brackets, snippets, documentation on hover and in completions, call completions, parameter hints, and checking with wvc as you edit for Wavert (.wvt)",
+  "version": "0.4.0",
   "publisher": "wavert",
   "private": true,
   "license": "MIT",
@@ -52,7 +52,12 @@
         "wavert.wvcPath": {
           "type": "string",
           "default": "",
-          "description": "The wvc compiler. Its standard library is found as wvc finds it: lib/ next to wvc, then one folder up."
+          "description": "The wvc compiler, which checks files as they are edited (wavert.check). Its standard library is found as wvc finds it: lib/ next to wvc, then one folder up. Empty: a wvc built in the Wavert repository the file is in, in .wvt/ or wvc/."
+        },
+        "wavert.check": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check Wavert files with wvc as they are edited: show its errors, and use the types it infers in hovers and to complete a record's fields. Needs wvc: the wavert.wvcPath setting, or a wvc built in the Wavert repository the file is in."
         }
       }
     }

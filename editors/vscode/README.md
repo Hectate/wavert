@@ -17,7 +17,7 @@ To install it permanently, package a `.vsix`:
 ```
 cd editors/vscode
 npx @vscode/vsce package --skip-license --allow-missing-repository
-code --install-extension wavert-language-0.3.3.vsix
+code --install-extension wavert-language-0.4.0.vsix
 ```
 
 After changing the extension, reload the window (**Developer: Reload Window**). An installed copy must be repackaged and reinstalled.
@@ -83,13 +83,28 @@ With neither set, a file inside the Wavert repository uses the repository's `lib
 
 The extension reads files line by line, as the grammar does, rather than parsing them: `wvc` is the authority. Unsaved changes to an open file are included.
 
+## Checking as you edit
+
+The extension checks each open file with `wvc --types` when it opens, as you type (once typing pauses) and when any file is saved. It checks the text in the editor, saved or not.
+
+- **Errors and warnings** from `wvc` are shown in the file, and in the files it imports. A file that does not parse shows its first syntax error.
+- **Types** that `wvc` infers (§4.2 of the specification) appear in hovers: a binding's type, what a function returns, and a field's type, as in `state.cursor`. Hovering a local binding, parameter or loop variable shows its type, where it is known.
+- **Fields:** typing `p.` after a binding holding a record whose fields are known, such as one from `grid.pos` or a record literal, completes its fields.
+
+The types come from the last version of the file that parsed, so while a line is half written, hovers and completions use what was known before it. A name is matched to the nearest declaration of it above the cursor.
+
+| Setting | Meaning |
+|---|---|
+| `wavert.check` | Check files as they are edited. On by default. |
+| `wavert.wvcPath` | The `wvc` that checks them. Empty: a `wvc` built in the Wavert repository the file is in, in `.wvt/` or `wvc/`. Without one, nothing is checked. |
+
 ## Limits
 
 TextMate grammars match regexes line by line and do not parse expressions. Two consequences:
 - A `;set` statement whose `to` is on a later line highlights the rest of the statement as ordinary code.
 - A record key on a line of its own is recognized by `name:` at the start of the line. A ternary whose `:` branch starts a line would be shown as a key.
 
-Unknown names, arity errors and other semantic checks need a language server, which does not exist yet.
+Checking runs the whole of `wvc` for each check, on the file and what it imports; a language server would answer faster and per keystroke, and does not exist yet.
 
 ## Keeping it in sync
 

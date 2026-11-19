@@ -1,18 +1,20 @@
 // The VS Code extension's documentation (editors/vscode): builtins.json agrees
 // with the specification and the checker, every export of the standard
 // library is documented (§2.2), and the scanner behind hovers and completions
-// reads Wavert as intended. These need neither Zig nor VS Code.
+// reads Wavert as intended. These need neither Zig nor VS Code, except the
+// test of wvc --types, which the extension runs to check files as they change.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { readRepo, root } from './helpers.js';
+import { noZig, readRepo, root, writeFiles, wvc } from './helpers.js';
 import { generated } from '../../editors/vscode/scripts/builtins.mjs';
 
 const require = createRequire(import.meta.url);
 const docs = require('../../editors/vscode/src/docs.js');
+const types = require('../../editors/vscode/src/types.js');
 const builtins = JSON.parse(readRepo('editors/vscode/builtins.json'));
 
 test('builtins.json is generated from the specification and the checker', () => {
@@ -151,4 +153,79 @@ test('parameter hints: the call around the cursor and its argument', () => {
   assert.equal(around(';(1, |'), null);
   assert.equal(around(';fn f(a, |b) { 1 }'), null);
   assert.equal(around(';"(1, |2)(f)"'), null);
+});
+
+test('reading what wvc --types reports', () => {
+  const err = [
+    'D:/w/main.wvt:3:17: error: \'+\' cannot be applied to string and int',
+    '  hint: use interpolation, as in "n={n}"',
+    '    ;const s is "x" + 1',
+    '                    ^',
+    'main.wvt:1:2: warning: this statement has no effect',
+    '    ;n',
+    '     ^',
+  ].join('\r\n');
+  assert.deepEqual(types.parseDiagnostics(err), [
+    { file: 'D:/w/main.wvt', line: 3, col: 17, severity: 'error', message: "'+' cannot be applied to string and int", hint: 'use interpolation, as in "n={n}"' },
+    { file: 'main.wvt', line: 1, col: 2, severity: 'warning', message: 'this statement has no effect', hint: null },
+  ]);
+  assert.ok(types.samePath('C:/A/b.wvt', 'c:\\a\\B.wvt', 'win32'));
+  assert.ok(!types.samePath('/a/b.wvt', '/a/B.wvt', 'linux'));
+  const point = { text: 'record { x, y }', fields: [{ name: 'x', type: { text: 'int' } }, { name: 'y', type: null }] };
+  const info = {
+    files: [join(root, 'lib/grid.wvt'), join(root, 'main.wvt')],
+    names: [
+      { file: 0, line: 5, col: 1, name: 'pos', kind: 'fn', type: point },
+      { file: 1, line: 2, col: 8, name: 'k', kind: 'loop', type: { text: 'int' } },
+      { file: 1, line: 9, col: 8, name: 'k', kind: 'const', type: { text: 'string' } },
+      { file: 1, line: 12, col: 8, name: 'state', kind: 'const', type: { text: 'record { cursor }', fields: [{ name: 'cursor', type: point }] } },
+    ],
+  };
+  const main = join(root, 'main.wvt');
+  // The nearest declaration above the line, else the first below it.
+  assert.equal(types.bindingAt(info, main, 'k', 5).type.text, 'int');
+  assert.equal(types.bindingAt(info, main, 'k', 20).type.text, 'string');
+  assert.equal(types.bindingAt(info, main, 'state', 1).name, 'state');
+  assert.equal(types.bindingAt(info, main, 'pos', 20), null);
+  assert.equal(types.functionIn(info, join(root, 'lib/grid.wvt'), 'pos').type, point);
+  assert.equal(types.fieldType(info.names[3].type, ['cursor', 'x']).text, 'int');
+  assert.equal(types.fieldType(info.names[3].type, ['cursor', 'y']), null);
+  assert.equal(types.fieldType(info.names[3].type, ['nope']), null);
+  // wvc is found from a file in the repository, if one is built there.
+  const found = docs.findWvc({ file: join(root, 'examples/hello.wvt') });
+  assert.ok(found === null || /[\\/](\.wvt|wvc)[\\/]wvc(\.exe)?$/.test(found), found);
+  assert.equal(docs.findWvc({ wvcPath: join(root, 'no-such-wvc') }), null);
+});
+
+test('wvc --types: diagnostics, and the types of names as JSON', { skip: noZig }, () => {
+  const dir = writeFiles({
+    'main.wvt': ';fn pos(x, y) { { x: x, y: y } }\n;const p is (1, 2)(pos)\n;var state is { cursor: p, n: 0 }\n;for (i in 0, 3) { ;i($print) }\n;const s is "x" + 1\n;exit\n',
+    'unsaved.wvt': ';const q is { a: [1] }\n;exit\n',
+    'shapes.wvt': '// shapes: a library.\n;export fn square(n) { n * n }\n;end\n',
+    'noexit.wvt': ';"x"($print)\n',
+  });
+  const r = wvc(['--types', 'main.wvt'], { cwd: dir });
+  assert.equal(r.code, 2);
+  assert.match(r.err, /^main\.wvt:5:17: error: '\+' cannot be applied to string and int\n/);
+  const info = JSON.parse(r.out);
+  assert.deepEqual(info.files, ['main.wvt']);
+  const xy = { text: 'record { x, y }', fields: [{ name: 'x', type: null }, { name: 'y', type: null }] };
+  assert.deepEqual(info.names, [
+    { file: 0, line: 1, col: 5, name: 'pos', kind: 'fn', type: xy },
+    { file: 0, line: 2, col: 8, name: 'p', kind: 'const', type: xy },
+    // A var binding holds a mutable copy, whose fields may change type.
+    { file: 0, line: 3, col: 6, name: 'state', kind: 'var', type: { text: 'record { cursor, n }', fields: [{ name: 'cursor', type: null }, { name: 'n', type: null }] } },
+    { file: 0, line: 4, col: 7, name: 'i', kind: 'loop', type: { text: 'int' } },
+  ]);
+  // --text checks another file's text as the input's, as an editor's unsaved copy.
+  const u = wvc(['--types', 'main.wvt', '--text', 'unsaved.wvt'], { cwd: dir });
+  assert.equal(u.err, '');
+  assert.deepEqual(JSON.parse(u.out).names, [
+    { file: 0, line: 1, col: 8, name: 'q', kind: 'const', type: { text: 'record { a }', fields: [{ name: 'a', type: { text: 'array of int', elem: { text: 'int' } } }] } },
+  ]);
+  // A library is checked as a library, and a program still needs ;exit.
+  assert.deepEqual({ ...wvc(['--types', 'shapes.wvt'], { cwd: dir }), out: '' }, { out: '', err: '', code: 0 });
+  const noExit = wvc(['--types', 'noexit.wvt'], { cwd: dir });
+  assert.equal(noExit.code, 2);
+  assert.match(noExit.err, /^noexit\.wvt:2:1: error: a program must end with ;exit\n/);
 });

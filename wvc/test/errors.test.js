@@ -119,6 +119,12 @@ const typeCases = [
   [';const xs is [1, 2]\n;for (i in 0, xs) { }\n;exit\n', "2:15: error: a for loop's range needs ints, got array | to go through an array, write ;for (x in xs), or ;for (i, x in xs) for each index too"],
   [';for (i in 0, 10, 0.5) { }\n;exit\n', "1:19: error: a for loop's step must be an int, got float"],
   [';const s is "abc"\n;for (c in s) { }\n;exit\n', '2:12: error: a for loop goes through an array, a map, an enum or a range of ints, got string | for its characters, go through (s, "")($split)'],
+  // A frozen array's elements are known: from a literal, and from the stdlib's frozen arrays.
+  [';const ps is [{ x: 1 }, { x: 2 }]\n;ps[0].y($print)\n;exit\n', "2:8: error: no field 'y' in record { x }"],
+  [';const ps is [{ x: 1 }, { x: 2 }]\n;for (i, p in ps) { ;p.z($print) }\n;exit\n', "2:24: error: no field 'z' in record { x }"],
+  [';const rows is [[1, 2], [3]]\n;for (row in rows) { ;row[0].x($print) }\n;exit\n', "2:30: error: reading field 'x' needs a record, got int"],
+  [';const parts is ("a,b", ",")($split)\n;const n is parts[0] + 1\n;exit\n', "2:22: error: '+' cannot be applied to string and int | use interpolation, as in \"n={n}\""],
+  [';const ps is [{ x: 1 }]\n;(ps, 0)($at).y($print)\n;exit\n', "2:15: error: no field 'y' in record { x }"],
 ];
 
 for (const [source, expected] of [...cases, ...typeCases]) {
@@ -139,6 +145,9 @@ const typeOk = [
   ';for (i, x in [1, 2]) { ;(i + 1)($print) }\n;exit\n',
   ';const n is "5"($toInt) onfail { 0 }\n;(n + 1)($print)\n;exit\n',
   ';const n is 1 < "a"\n;exit\n',                                      // ordering across types is false (§11.1)
+  ';var xs is [1]\n;(xs, "a")($push)\n;const s is xs[1] + "b"\n;exit\n', // anything may be pushed into a mutable array
+  ';const xs is [1, "a"]\n;const s is xs[1] + "b"\n;exit\n',             // elements of different types
+  ';fn hide(x) { x }\n;const s is ("ab"(hide), 0, 1)($slice) + "c"\n;exit\n', // $slice of a string or an array
 ];
 
 for (const source of typeOk) {

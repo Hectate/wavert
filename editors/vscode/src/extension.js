@@ -2,15 +2,20 @@
 // is and its documentation, for the file's own declarations, the libraries it
 // imports (including the standard library, '$lib/'), and the stdlib's $names.
 // Completing a function writes out its call, and parameter hints show its
-// parameters inside a call's arguments.
+// parameters inside a call's arguments. Files are checked with wvc --types as
+// they are edited: its errors are shown in the file, and the types it infers
+// appear in hovers and complete a record's fields.
 // The grammar, brackets and snippets are declared in package.json.
 
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const childProcess = require('child_process');
 const vscode = require('vscode');
 const docs = require('./docs');
+const types = require('./types');
 const builtins = require('../builtins.json');
 
 // The documentation of stdlib name, or undefined: only builtins.json's own
@@ -27,6 +32,104 @@ function textOf(file) {
 function libDir(file) {
   const config = vscode.workspace.getConfiguration('wavert');
   return docs.findLib({ libPath: config.get('libPath'), wvcPath: config.get('wvcPath'), file });
+}
+
+// ---- Checking with wvc --types ----
+
+const problems = vscode.languages.createDiagnosticCollection('wavert');
+// For each document checked, by URI: { info, the types wvc last reported;
+// reported, the files it last reported diagnostics in; running; again, whether
+// to check once more when the run ends; timer; temp, its unsaved text's file }.
+const checks = new Map();
+let nextTemp = 0;
+
+function stateOf(document) {
+  const key = document.uri.toString();
+  if (!checks.has(key)) {
+    checks.set(key, { info: null, reported: [], running: false, again: false, timer: null, temp: path.join(os.tmpdir(), `wavert-check-${process.pid}-${nextTemp++}.wvt`) });
+  }
+  return checks.get(key);
+}
+
+// The types wvc last reported for document, or null.
+const infoOf = (document) => checks.get(document.uri.toString())?.info ?? null;
+
+// Checks document with wvc, using its text as it is in the editor, saved or not.
+function check(document) {
+  if (document.languageId !== 'wavert' || document.uri.scheme !== 'file' || document.isClosed) return;
+  const config = vscode.workspace.getConfiguration('wavert');
+  if (!config.get('check')) return;
+  const file = document.uri.fsPath;
+  const wvc = docs.findWvc({ wvcPath: config.get('wvcPath'), file });
+  if (!wvc) return;
+  const state = stateOf(document);
+  if (state.running) { state.again = true; return; }
+  state.running = true;
+  try { fs.writeFileSync(state.temp, document.getText()); } catch { state.running = false; return; }
+  const args = ['--types', file, '--text', state.temp];
+  const lib = libDir(file);
+  if (lib) args.push('--lib', lib);
+  const cwd = path.dirname(file);
+  childProcess.execFile(wvc, args, { cwd, maxBuffer: 64 * 1024 * 1024, timeout: 30000 }, (error, stdout, stderr) => {
+    state.running = false;
+    // A file that does not parse gives no types; the last ones stay.
+    try { state.info = JSON.parse(stdout); } catch { /* keep the last */ }
+    if (!error || stderr) publish(state, cwd, stderr);
+    if (state.again) {
+      state.again = false;
+      check(document);
+    }
+  });
+}
+
+// Shows the diagnostics in wvc's output, in each file they are in, and clears
+// those it no longer reports.
+function publish(state, cwd, stderr) {
+  const byFile = new Map();
+  for (const d of types.parseDiagnostics(stderr)) {
+    const uri = vscode.Uri.file(path.resolve(cwd, d.file));
+    const open = vscode.workspace.textDocuments.find((doc) => types.samePath(doc.uri.fsPath, uri.fsPath));
+    const start = new vscode.Position(d.line - 1, d.col - 1);
+    const word = open?.getWordRangeAtPosition(start, /\$?[A-Za-z0-9_]+|\S/);
+    const range = word ?? new vscode.Range(start, start.translate(0, 1));
+    const diagnostic = new vscode.Diagnostic(range, d.hint ? `${d.message}\nhint: ${d.hint}` : d.message,
+      d.severity === 'error' ? vscode.DiagnosticSeverity.Error : vscode.DiagnosticSeverity.Warning);
+    diagnostic.source = 'wvc';
+    const key = uri.toString();
+    if (!byFile.has(key)) byFile.set(key, { uri, list: [] });
+    byFile.get(key).list.push(diagnostic);
+  }
+  for (const old of state.reported) {
+    if (!byFile.has(old.toString())) problems.delete(old);
+  }
+  for (const { uri, list } of byFile.values()) problems.set(uri, list);
+  state.reported = [...byFile.values()].map((f) => f.uri);
+}
+
+// Checks document soon, once typing pauses.
+function checkSoon(document) {
+  if (document.languageId !== 'wavert') return;
+  const state = stateOf(document);
+  clearTimeout(state.timer);
+  state.timer = setTimeout(() => check(document), 400);
+}
+
+function forget(document) {
+  const key = document.uri.toString();
+  const state = checks.get(key);
+  if (!state) return;
+  clearTimeout(state.timer);
+  for (const uri of state.reported) problems.delete(uri);
+  try { fs.unlinkSync(state.temp); } catch { /* never written */ }
+  checks.delete(key);
+}
+
+// Markdown for what wvc knows of a name's type: "type record { x, y }", or
+// for a function, "returns ...".
+function appendType(md, entry) {
+  if (!entry || !entry.type) return md;
+  md.appendMarkdown(`\n\n${entry.kind === 'fn' ? '*returns*' : '*type*'} \`${entry.type.text}\`\n\n`);
+  return md;
 }
 
 // The module an import name stands for in the file: { file, label, text }, or null.
@@ -98,12 +201,34 @@ function hover(document, position) {
     }
     // module.name, or module.Enum.member, which shows the enum.
     const decl = docs.declarations(mod.text).find((d) => d.exported && d.name === parts[1]);
-    return decl ? new vscode.Hover(describe(decl, mod.label)) : null;
+    if (!decl) return null;
+    const info = infoOf(document);
+    const entry = decl.kind === 'fn' ? types.functionIn(info, mod.file, decl.name) : types.bindingAt(info, mod.file, decl.name, Infinity);
+    return new vscode.Hover(appendType(describe(decl, mod.label), index === 1 ? entry : null));
+  }
+  const info = infoOf(document);
+  const binding = types.bindingAt(info, file, parts[0], position.line + 1);
+  // A field of a binding whose type is known: state.cursor.
+  if (index > 0 && binding) {
+    const t = types.fieldType(binding.type, parts.slice(1, index + 1));
+    if (!t) return null;
+    const md = new vscode.MarkdownString();
+    md.appendCodeblock(`${parts.slice(0, index + 1).join('.')}`, 'wavert');
+    md.appendMarkdown(`*field, type* \`${t.text}\``);
+    return new vscode.Hover(md);
   }
   // A name of this file, or Enum.member of one of its enums.
   if (index > 0 && !(index === 1 && parts.length === 2)) return null;
   const decl = docs.declarations(text).find((d) => d.name === parts[0] && (index === 0 || d.kind === 'enum'));
-  return decl ? new vscode.Hover(describe(decl, null)) : null;
+  if (decl) {
+    const entry = decl.kind === 'fn' ? types.functionIn(info, file, decl.name) : binding;
+    return new vscode.Hover(appendType(describe(decl, null), index === 0 ? entry : null));
+  }
+  // A local binding, parameter or loop variable, known only from wvc.
+  if (index > 0 || !binding) return null;
+  const md = new vscode.MarkdownString();
+  md.appendCodeblock(`${binding.kind} ${binding.name}`, 'wavert');
+  return new vscode.Hover(appendType(md, binding));
 }
 
 const kinds = {
@@ -149,10 +274,14 @@ function completions(document, position) {
   }
   const names = docs.qualifierBefore(before);
   if (!names) return /(?<![A-Za-z0-9_$.])[A-Za-z0-9_]*$/.test(before) ? bareNames(document, position) : null;
-  if (names.length > 2) return null;
   const file = document.uri.fsPath;
   const text = document.getText();
   const mod = moduleOf(file, text, names[0]);
+  if (!mod) {
+    const fields = recordFields(document, position, names);
+    if (fields) return fields;
+  }
+  if (names.length > 2) return null;
   // module.: what the module exports, functions written out as calls.
   if (names.length === 1 && mod) {
     const range = new vscode.Range(at(/[A-Za-z0-9_.]*$/.exec(before)[0].length), position);
@@ -174,6 +303,20 @@ function completions(document, position) {
     const item = new vscode.CompletionItem(m, vscode.CompletionItemKind.EnumMember);
     item.detail = decl.signature;
     item.documentation = describe(decl, names.length === 2 ? mod.label : null);
+    return item;
+  });
+}
+
+// After a binding and a dot, such as state. or state.cursor., the fields of
+// the record it holds, when wvc knows them. null if not.
+function recordFields(document, position, names) {
+  const binding = types.bindingAt(infoOf(document), document.uri.fsPath, names[0], position.line + 1);
+  const t = binding && types.fieldType(binding.type, names.slice(1));
+  if (!t || !t.fields) return null;
+  return t.fields.map((f, i) => {
+    const item = new vscode.CompletionItem(f.name, vscode.CompletionItemKind.Field);
+    item.detail = f.type ? f.type.text : `field of ${t.text}`;
+    item.sortText = String(i).padStart(4, '0'); // in the record's order
     return item;
   });
 }
@@ -269,9 +412,21 @@ function activate(context) {
       triggerCharacters: ['(', ','],
       retriggerCharacters: [','],
     }),
+    problems,
+    vscode.workspace.onDidOpenTextDocument(check),
+    vscode.workspace.onDidChangeTextDocument((e) => checkSoon(e.document)),
+    // Saving one file can change what the files that import it find.
+    vscode.workspace.onDidSaveTextDocument(() => vscode.workspace.textDocuments.forEach(checkSoon)),
+    vscode.workspace.onDidCloseTextDocument(forget),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('wavert')) vscode.workspace.textDocuments.forEach(check);
+    }),
   );
+  vscode.workspace.textDocuments.forEach(check);
 }
 
-function deactivate() {}
+function deactivate() {
+  for (const document of vscode.workspace.textDocuments) forget(document);
+}
 
 module.exports = { activate, deactivate };
