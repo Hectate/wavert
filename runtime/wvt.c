@@ -2303,7 +2303,10 @@ static int input_wait(int64_t ms) {
     DWORD r = t ? WaitForMultipleObjects(2, hs, FALSE, INFINITE) : WaitForSingleObject(key_in, (DWORD)ms);
     return r == WAIT_OBJECT_0;
   }
-  // Pipes cannot be waited on, so they are polled; files and devices are always ready.
+  // Pipes cannot be waited on, so they are polled every millisecond; files
+  // and devices are always ready. Sleep(1) would sleep until the next 15.6 ms
+  // system tick, so a key arriving just after the deadline would be taken
+  // instead of the timeout; sleep_for uses the high-resolution timer.
   HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
   if (GetFileType(h) != FILE_TYPE_PIPE) return 1;
   int64_t end = mono_ms() + ms;
@@ -2311,7 +2314,7 @@ static int input_wait(int64_t ms) {
     DWORD avail;
     if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) || avail > 0) return 1; // data, or the end
     if (mono_ms() >= end) return 0;
-    Sleep(1);
+    sleep_for(1);
   }
 #else
   struct pollfd p = { .fd = 0, .events = POLLIN };

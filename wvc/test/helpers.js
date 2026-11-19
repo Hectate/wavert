@@ -15,7 +15,9 @@ export const runtimeC = join(root, 'runtime/wvt.c');
 // The standard library: wvc is built into a temporary directory, where it
 // would not find lib/ by itself, so the tests name it.
 export const libDir = join(root, 'lib');
-export const readRepo = (path) => readFileSync(join(root, path), 'utf8');
+// A file of the repository as text, with LF line endings: a Windows checkout
+// may have CRLF, which the tests' patterns, written with \n and $, would miss.
+export const readRepo = (path) => readFileSync(join(root, path), 'utf8').replaceAll('\r\n', '\n');
 
 // A fresh temporary directory.
 export const tempDir = (prefix = 'wvt-test-') => mkdtempSync(join(tmpdir(), prefix));
