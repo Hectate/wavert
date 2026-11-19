@@ -6,6 +6,7 @@
 // - return / break / continue / fail only where they make sense
 // - conditional chains used as values end in a plain `anyway { ... }`
 // - the entry file ends with ;exit
+// - operations that would always panic, by the types of their values (§4.2; "Types" below)
 //
 // Unlike the earlier phases, the checker reports every error it finds, not just the first.
 // A scope is { parent, names }, where names is a mutable array of declarations:
@@ -121,6 +122,158 @@
 }
 ;fn lineOf(pos) { (diag.srcChars, pos)(lineIn) }
 
+// ---- Types: what the checker knows about a value ----
+//
+// Wavert has no static types, but the checker infers what it can, and reports
+// what would certainly panic if it ran: "n=" + 1, a missing field of a record
+// built in view, indexing a record with a position (§10.8). It only reports
+// what it knows, so a program it accepts may still panic.
+//
+// A type is null when nothing is known. Otherwise it is { t }, where t is int,
+// float, boolean, string, null, array or map; { t: "record", names, types }
+// for a record with exactly the fields names, where types holds what is known
+// of their values, or is null when the record may be mutable, since its
+// fields may then be set to values of other types (§10.9); { t: "enum", name,
+// id } for a member of an enum; or { t: "never" } for code that never
+// completes, such as a block ending in ;return.
+;const tInt is { t: "int" }
+;const tFloat is { t: "float" }
+;const tBool is { t: "boolean" }
+;const tString is { t: "string" }
+;const tNull is { t: "null" }
+;const tArray is { t: "array" }
+;const tMap is { t: "map" }
+;const tNever is { t: "never" }
+
+;fn recordType(names, types) { { t: "record", names: names, types: types } }
+
+// Whether x tells anything about a value.
+;fn known(x) { x != null && x.t != "never" }
+
+// A type as the runtime's messages name it: int, record { x, y }, Kind.
+;fn typeText(x) {
+    ;if (x.t == "enum") { ;return x.name }
+    ;if (x.t != "record") { ;return x.t }
+    ;if (x.names($length) == 0) { ;return "record {{}}" }
+    ;const shown is x.names($length) > 12 ? (x.names, 0, 12)($slice) : x.names
+    ;const more is x.names($length) > 12 ? ", ... {x.names($length) - 12} more" : ""
+    "record {{ {(shown, ", ")($join)}{more} }}"
+}
+
+// What two values could have in common: the type of a value that is one or
+// the other, as from the branches of an if.
+;fn join(a, b) {
+    ;if (a == null || b == null) { ;return null }
+    ;if (a.t == "never") { ;return b }
+    ;if (b.t == "never") { ;return a }
+    ;if (a.t != b.t) { ;return null }
+    ;if (a.t == "enum") { ;return a.id == b.id ? a : null }
+    ;if (a.t != "record") { ;return a }
+    ;if (!(a.names, b.names)($same)) { ;return null }
+    ;if (a.types == null || b.types == null) { ;return (a.names, null)(recordType) }
+    ;var types is []
+    ;for (i, ft in a.types) { ;(types, (ft, b.types[i])(join))($push) }
+    (a.names, types)(recordType)
+}
+
+// The type of a mutable copy of a value of type x: a record's fields may be
+// set, so only their names stay known.
+;fn thaw(x) { x(known) && x.t == "record" ? (x.names, null)(recordType) : x }
+
+// Whether a value of type x converts to text, as interpolation, $print and
+// $toString need (§9.3). If not, a hint for converting it.
+;fn noTextHint(x) {
+    ;if (!x(known)) { ;return null }
+    ;if (x.t == "array") { ;return "join its elements with (xs, \", \")(\$join), or use arrays.toString from \$lib/arrays.wvt" }
+    ;if (x.t == "record") { ;return "use records.toString from \$lib/records.wvt, or interpolate its fields" }
+    ;if (x.t == "map") { ;return "use maps.toString from \$lib/maps.wvt" }
+    null
+}
+
+// What the standard library's functions return, where it is always the same type.
+;fn stdResult(name, args) {
+    match (name) {
+        case "length", "code", "floor", "ceil", "round", "trunc", "toUint32", "toInt", "time", "elapsed", "random", "run" { tInt }
+        case "toFloat", "randomFloat" { tFloat }
+        case "toString", "fromCode", "join", "readLine", "readKey", "readFile", "env" { tString }
+        case "same", "has", "isNan", "fileExists" { tBool }
+        case "split", "keys", "values", "fields", "sort", "sortBy", "reverse", "listDir" { tArray }
+        case "slice" { args[0](known) && (args[0].t == "string" || args[0].t == "array") ? args[0] : null }
+        case "terminal" { (["input", "output"], null)(recordType) }
+        case "terminalSize" { (["width", "height"], null)(recordType) }
+        else { null }
+    }
+}
+
+// What the standard library's functions accept, where anything else panics:
+// for each argument in turn, the types it may have, or null for any.
+;const stdAccepts is [
+    { name: "length", args: [["string", "array", "map"]] },
+    { name: "at", args: [["string", "array"], ["int"]] },
+    { name: "slice", args: [["string", "array"], ["int"], ["int"]] },
+    { name: "code", args: [["string"]] }, { name: "fromCode", args: [["int"]] },
+    { name: "split", args: [["string"], ["string"]] }, { name: "join", args: [["array"], ["string"]] },
+    { name: "push", args: [["array"], null] }, { name: "pop", args: [["array"]] },
+    { name: "sort", args: [["array"]] }, { name: "sortBy", args: [["array"], null] }, { name: "reverse", args: [["array"]] },
+    { name: "get", args: [["map"], null] }, { name: "has", args: [["map"], null] }, { name: "remove", args: [["map"], null] },
+    { name: "keys", args: [["map"]] }, { name: "values", args: [["map"]] },
+    { name: "fields", args: [["record"]] },
+    { name: "floor", args: [["int", "float"]] }, { name: "ceil", args: [["int", "float"]] },
+    { name: "round", args: [["int", "float"]] }, { name: "trunc", args: [["int", "float"]] },
+    { name: "toUint32", args: [["int"]] },
+    { name: "readFile", args: [["string"]] }, { name: "fileExists", args: [["string"]] },
+    { name: "listDir", args: [["string"]] }, { name: "deleteFile", args: [["string"]] },
+    { name: "env", args: [["string"]] }, { name: "run", args: [["string"], ["array"]] },
+    { name: "sleep", args: [["int"]] }, { name: "waitKey", args: [["int"]] },
+    { name: "newRandom", args: [["int"]] }, { name: "random", args: [null, ["int"]] }
+]
+
+// The types that argument i of stdlib function name accepts, or null for any.
+;fn stdAccepted(name, i) {
+    ;for (entry in stdAccepts) {
+        ;if (entry.name == name) { ;return entry.args[i] }
+    }
+    null
+}
+
+// Types as a list in a message: "a string, an array or a map".
+;fn typesText(ts) {
+    ;var words is []
+    ;for (ty in ts) { ;(words, (ty == "int" || ty == "array" ? "an " : "a ") + ty)($push) }
+    ;if (words($length) == 1) { ;return words[0] }
+    "{((words, 0, -1)($slice), ", ")($join)} or {words[-1]}"
+}
+
+// The names that a ;set rebinds anywhere in node, as ;set name to x or
+// ;set name += x, added to found. No name is shadowed (§5.1), so a binding
+// whose name is not found is never rebound.
+;fn rebinds(node, ref found) {
+    ;const what is node($typeOf)
+    ;if (what == "array") {
+        ;for (item in node) { ;(item, found)(rebinds) }
+        ;return
+    }
+    ;if (what != "record") { ;return }
+    ;const fields is node($fields)
+    ;if ((fields, "k")(text.contains) && node.k == "set" && node.target.k == "name") {
+        ;set found[node.target.name] to true
+    }
+    ;for (f in fields) { ;(node[f], found)(rebinds) }
+}
+
+// The type of a block without a value: never if it never reaches its end
+// (§7.2), else null.
+;fn endType(b) {
+    ;var last is null
+    ;for (s in b.stmts) {
+        ;if (s.k != "empty") { ;set last to s }
+    }
+    ;if (last != null && ((neverCompletes, last.k)(text.contains) || last.k == "expr" && last.e.k == "failWith")) {
+        ;return tNever
+    }
+    null
+}
+
 // What a library's top level may contain (§13.1).
 ;const libraryTop is ["empty", "import", "fn", "decl", "enum", "end"]
 
@@ -140,8 +293,130 @@
     ;var uses is []
     // Enum declarations, as { mod, name, members }.
     ;var enums is []
+    // Types (above), by "module:position of the name": of bindings, parameters
+    // and loop variables, and of what functions return. While a function's
+    // body is checked, the types its ;return statements give, by function number.
+    ;var bindingTypes is [:]
+    ;var fnTypes is [:]
+    ;var returnTypes is [:]
+    // The names that some ;set rebinds in the module being checked.
+    ;var rebound is [:]
 
     ;fn error(pos, message, hint) { ;(errors, (pos, message, hint)(diag.err))($push) }
+
+    // The type of the binding, parameter or loop variable d, or null.
+    ;fn typeOfDecl(d) {
+        ;const key is "{d.mod}:{d.namePos}"
+        ;if ((bindingTypes, key)($has)) { ;return bindingTypes[key] }
+        null
+    }
+    // Records the type of the binding whose name is at pos in the current module.
+    ;fn bindType(pos, ty) {
+        ;if (ty != null) { ;set bindingTypes["{curMod}:{pos}"] to ty }
+    }
+
+    // The type of a member of the enum d.
+    ;fn enumType(d) { { t: "enum", name: d.name, id: "{d.mod}:{d.namePos}" } }
+
+    // A value of type ty, from x, used where text is needed.
+    ;fn noText(x, ty) {
+        ;const hint is ty(noTextHint)
+        ;if (hint != null) { ;(x.pos, "cannot convert {ty(typeText)} to text; convert it explicitly", hint)(error) }
+    }
+
+    // A value of type ty, from x, used as a condition.
+    ;fn condition(x, ty) {
+        ;if (ty(known) && ty.t != "boolean") { ;(x.pos, "a condition must be true or false, got {ty(typeText)}", null)(error) }
+    }
+    ;fn needBool(op, x, ty) {
+        ;if (ty(known) && ty.t != "boolean") { ;(x.pos, "'{op}' requires true or false, got {ty(typeText)}", null)(error) }
+    }
+    ;fn needInt(op, x, ty) {
+        ;if (ty(known) && ty.t != "int") { ;(x.pos, "'{op}' requires integers, got {ty(typeText)}", null)(error) }
+    }
+
+    // The type of field name of a value of type rt, reporting a field it
+    // cannot have. verb: what is done with the field, "reading" or "setting".
+    ;fn fieldOf(rt, name, pos, verb) {
+        ;if (!rt(known)) { ;return null }
+        ;if (rt.t != "record") {
+            ;(pos, "{verb} field '{name}' needs a record, got {rt(typeText)}", null)(error)
+            ;return null
+        }
+        ;for (i, n in rt.names) {
+            ;if (n == name) { ;return rt.types == null ? null : rt.types[i] }
+        }
+        ;(pos, "no field '{name}' in {rt(typeText)}", null)(error)
+        null
+    }
+
+    // The type of an element of a value of type at, indexed by the expression
+    // index of type it (§10.2, §10.8, §10.11).
+    ;fn indexed(at, index, it, pos, verb) {
+        ;if (!at(known)) { ;return null }
+        ;if (at.t == "array") {
+            ;if (it(known) && it.t != "int") { ;(index.pos, "an index must be an int, got {it(typeText)}", null)(error) }
+            ;return null
+        }
+        ;if (at.t == "map") {
+            ;if (it(known) && (["float", "null", "array", "map"], it.t)(text.contains)) {
+                ;(index.pos, "a map key must be an int, a string, a boolean, an enum member or a record, got {it(typeText)}", null)(error)
+            }
+            ;return null
+        }
+        ;if (at.t == "record") {
+            ;if (index.k == "str" && index.parts($length) == 1) { ;return (at, index.parts[0], pos, verb)(fieldOf) }
+            ;if (it(known) && it.t != "string") {
+                ;(index.pos, "a record's field name must be a string, got {it(typeText)}, indexing {at(typeText)}",
+                    "a record is indexed by the name of a field; for other keys, such as positions, use a map")(error)
+            }
+            ;return null
+        }
+        ;const hint is at.t == "string" ? "use \$at for a string: (s, i)(\$at)" : null
+        ;(pos, "indexing needs an array, a map or a record, got {at(typeText)}", hint)(error)
+        null
+    }
+
+    // The type of a binary operation, reporting operands it cannot be applied to (§11).
+    ;fn binary(e, lt, rt) {
+        ;const op is e.op
+        ;if (op == "&&" || op == "||") {
+            ;(op, e.l, lt)(needBool)
+            ;(op, e.r, rt)(needBool)
+            ;return tBool
+        }
+        ;if (op == "==" || op == "!=") { ;return tBool }
+        ;if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+            // Ordering two values of different types is false (§11.1).
+            ;if (lt(known) && rt(known) && lt.t == rt.t && !(["int", "float", "string"], lt.t)(text.contains)) {
+                ;const what is lt.t == "enum" ? "enum members" : "{lt.t} values"
+                ;(e.pos, "'{op}' cannot order {what}", null)(error)
+            }
+            ;return tBool
+        }
+        ;if ((["&", "|", "^", "<<", ">>"], op)(text.contains)) {
+            ;(op, e.l, lt)(needInt)
+            ;(op, e.r, rt)(needInt)
+            ;return tInt
+        }
+        // Arithmetic, on numbers, and + on two strings.
+        ;const both is lt(known) && rt(known)
+        ;const shown is both ? "{lt(typeText)} and {rt(typeText)}" : lt(known) ? lt(typeText) : rt(known) ? rt(typeText) : ""
+        ;if (op == "+" && (lt(known) && lt.t == "string" || rt(known) && rt.t == "string")) {
+            ;if (both && lt.t == rt.t) { ;return tString }
+            ;if (both) { ;(e.pos, "'+' cannot be applied to {shown}", "use interpolation, as in \"n={{n}}\"")(error) }
+            ;return both ? null : tString
+        }
+        ;const nums is ["int", "float"]
+        ;if (lt(known) && !(nums, lt.t)(text.contains) || rt(known) && !(nums, rt.t)(text.contains)) {
+            ;(e.pos, "'{op}' cannot be applied to {shown}", null)(error)
+            ;return null
+        }
+        ;if (op == "/") { ;return tFloat }
+        ;if (both && lt.t == "int" && rt.t == "int") { ;return op == "**" ? null : tInt }
+        ;if (lt(known) && lt.t == "float" || rt(known) && rt.t == "float") { ;return tFloat }
+        null
+    }
 
     // Makes module m the current one, for positions in errors.
     ;fn enter(m) {
@@ -282,7 +557,8 @@
             ;(b.stmts[k], scope, ctx)(stmt)
             ;set k += 1
         }
-        ;if (b.value != null) { ;(b.value, scope, ctx)(expr) }
+        ;if (b.value != null) { ;return (b.value, scope, ctx)(expr) }
+        b(endType)
     }
 
     ;fn stmt(ref s, scope, ctx) {
@@ -298,19 +574,27 @@
                 ;(ps, p.name, ("param", p.name, p(modeOf), p.pos, null, func.id, null)(decl))(declare)
                 ;set k += 1
             }
-            ;(s.body, ps(newScope), { func: func, loops: 0, guards: ctx.guards })(block)
+            ;const bodyType is (s.body, ps(newScope), { func: func, loops: 0, guards: ctx.guards })(block)
+            // What the function returns: its body's value, null if it reaches
+            // its end without one, and the values of its ;return statements.
+            ;var result is bodyType
+            ;if (s.body.value == null && bodyType == null) { ;set result to tNull }
+            ;if ((returnTypes, func.id)($has)) { ;set result to (result, returnTypes[func.id])(join) }
+            ;if (result != null) { ;set fnTypes["{curMod}:{s.namePos}"] to result }
             ;return
         }
+        // The type of the statement's value, for a declaration or a ;return.
+        ;var ty is null
         ;if (kind == "return") {
             ;if (ctx.func.top) { ;(s.pos, "'return' outside a function", null)(error) }
-            ;if (s.e != null) { ;(s.e, scope, ctx)(expr) }
+            ;set ty to s.e != null ? (s.e, scope, ctx)(expr) : tNull
         } else if (kind == "panic") {
             ;(s.e, scope, ctx)(expr)
         } else if (kind == "break" || kind == "continue") {
             ;if (ctx.loops == 0) { ;(s.pos, "'{kind == "break" ? "break" : "continue"}' outside a loop", null)(error) }
             ;return
         } else if (kind == "while") {
-            ;(s.cond, scope, ctx)(expr)
+            ;(s.cond, (s.cond, scope, ctx)(expr))(condition)
             ;(s.body, scope(newScope), { func: ctx.func, loops: ctx.loops + 1, guards: ctx.guards })(block)
             ;return
         } else if (kind == "for") {
@@ -331,22 +615,29 @@
                 ;(s.e, scope, ctx, true)(checkMatch)
             } else if (s.e.k == "call") {
                 // The whole statement is a call, so its value is discarded.
-                ;var k is 0
-                ;while (k < s.e.args($length)) {
-                    ;(s.e.args[k], scope, ctx)(expr)
-                    ;set k += 1
-                }
-                ;(s.e, scope, false)(callee)
+                ;var types is []
+                ;for (a in s.e.args) { ;(types, (a, scope, ctx)(expr))($push) }
+                ;(s.e, scope, false, types)(callee)
             } else {
                 ;(s.e, scope, ctx)(expr)
             }
         } else if (kind == "decl") {
-            ;(s.e, scope, ctx)(expr)
+            ;set ty to (s.e, scope, ctx)(expr)
         } else if (kind == "set") {
             ;(s.e, scope, ctx)(expr)
             ;(s.target, scope, ctx)(lvalue)
         }
-        ;if (s.handler != null) { ;(s, scope, ctx)(onfailHandler) }
+        // A handler's value replaces the call's.
+        ;if (s.handler != null) { ;set ty to (ty, (s, scope, ctx)(onfailHandler))(join) }
+        ;if (kind == "return" && !ctx.func.top) {
+            ;const id is ctx.func.id
+            ;set returnTypes[id] to (returnTypes, id)($has) ? (returnTypes[id], ty)(join) : ty
+        }
+        // A binding that is never rebound keeps the type of its value; a var
+        // binding holds a mutable copy (§10.4).
+        ;if (kind == "decl" && !((s.isVar || s.isRef) && (rebound, s.name)($has))) {
+            ;(s.namePos, s.isVar ? ty(thaw) : ty)(bindType)
+        }
     }
 
     // A for loop (§7.4). Its variables are visible throughout its body and cannot
@@ -359,12 +650,23 @@
             ;(guards, ctx.guards[k])($push)
             ;set k += 1
         }
+        // The types of the loop's variables, as far as they are known.
+        ;var names is []
+        ;const en is s.coll == null ? null : (s.coll, scope)(enumNamed)
         ;if (s.coll == null) {
-            ;(s.from, scope, ctx)(expr)
-            ;(s.to, scope, ctx)(expr)
-            ;if (s.step != null) { ;(s.step, scope, ctx)(expr) }
-        } else if ((s.coll, scope)(enumNamed) == null) {
-            ;(s.coll, scope, ctx)(expr)
+            ;(s.from, (s.from, scope, ctx)(expr))(rangeBound)
+            ;(s.to, (s.to, scope, ctx)(expr))(rangeBound)
+            ;if (s.step != null) {
+                ;const st is (s.step, scope, ctx)(expr)
+                ;if (st(known) && st.t != "int") { ;(s.step.pos, "a for loop's step must be an int, got {st(typeText)}", null)(error) }
+            }
+            ;set names to [tInt]
+        } else if (en != null) {
+            ;set names to [en(enumType)]
+        } else {
+            ;const ct is (s.coll, scope, ctx)(expr)
+            ;(s.coll, ct)(collection)
+            ;if (ct(known) && ct.t == "array" && s.names($length) == 2) { ;set names to [tInt] }
             ;const path is s.coll(pathOf)
             ;if (path != null) { ;(guards, path)($push) }
         }
@@ -373,9 +675,32 @@
         ;while (k < s.names($length)) {
             ;const n is s.names[k]
             ;(ls, n.name, ("loop", n.name, "", n.pos, null, ctx.func.id, null)(decl))(declare)
+            ;if (k < names($length)) { ;(n.pos, names[k])(bindType) }
             ;set k += 1
         }
         ;(s.body, ls(newScope), { func: ctx.func, loops: ctx.loops + 1, guards: guards })(block)
+    }
+
+    // A for loop's range bound x, of type ty (§7.4).
+    ;fn rangeBound(x, ty) {
+        ;if (!ty(known) || ty.t == "int") { ;return }
+        ;const hint is ty.t == "array" ? "to go through an array, write ;for (x in xs), or ;for (i, x in xs) for each index too"
+            : ty.t == "float" ? "round it to an int, such as with (\$floor)" : null
+        ;(x.pos, "a for loop's range needs ints, got {ty(typeText)}", hint)(error)
+    }
+
+    // What a for loop goes through, x, of type ty (§7.4).
+    ;fn collection(x, ty) {
+        ;if (!ty(known) || ty.t == "array" || ty.t == "map") { ;return }
+        ;var hint is null
+        ;if (ty.t == "string") {
+            ;set hint to "for its characters, go through (s, \"\")(\$split)"
+        } else if (ty.t == "record") {
+            ;set hint to "for its field names, go through r(\$fields)"
+        } else if (ty.t == "int") {
+            ;set hint to "for the ints from 0 to n - 1, write ;for (i in 0, n)"
+        }
+        ;(x.pos, "a for loop goes through an array, a map, an enum or a range of ints, got {ty(typeText)}", hint)(error)
     }
 
     // The names of a name or a field path (state.items is ["state", "items"]), or null.
@@ -425,9 +750,11 @@
         ;const hs is scope(newScope)
         ;if (h.param != null) {
             ;(hs, h.param, ("onfail", h.param, "", h.paramPos, null, ctx.func.id, null)(decl))(declare)
+            ;(h.paramPos, tInt)(bindType)
         }
-        ;(h.body, hs(newScope), ctx)(block)
+        ;const ty is (h.body, hs(newScope), ctx)(block)
         ;if ((onfailValueUsed, s.k)(text.contains)) { ;h.body(requireValue) }
+        ty
     }
 
     // A multi-way branch (§7.5). The parser has checked that each value is a
@@ -435,6 +762,8 @@
     // are resolved here.
     ;fn checkMatch(e, scope, ctx, stmtLevel) {
         ;(e.subject, scope, ctx)(expr)
+        // The type of the match's value: one of its blocks'.
+        ;var result is tNever
         // Alibi values seen so far, as { key, pos }.
         ;var seen is []
         // The sort of the values: "" for literals, else the enum as written
@@ -475,12 +804,12 @@
                 }
                 ;set j += 1
             }
-            ;(al.body, scope(newScope), ctx)(block)
+            ;set result to (result, (al.body, scope(newScope), ctx)(block))(join)
             ;if (!stmtLevel) { ;al.body(requireValue) }
             ;set a += 1
         }
         ;if (e.els != null) {
-            ;(e.els, scope(newScope), ctx)(block)
+            ;set result to (result, (e.els, scope(newScope), ctx)(block))(join)
             ;if (!stmtLevel) { ;e.els(requireValue) }
         } else if (sort != null && sort != "") {
             // Without else, a match over an enum must handle every member.
@@ -505,6 +834,7 @@
         } else if (!stmtLevel) {
             ;(e.pos, "a match used as a value must end with 'else {{ ... }}'", null)(error)
         }
+        result
     }
 
     // The module declaration that x names, or null.
@@ -560,7 +890,10 @@
             ;(e.pos, "'{label}' is a function; functions are not values", "to call it, write x({label}), or ({label}) with no arguments")(error)
         } else if (d != null && d.kind == "enum") {
             ;(e.pos, "'{label}' is an enum, not a value", "its members are written {label}.member")(error)
+        } else if (d != null) {
+            ;return d(typeOfDecl)
         }
+        null
     }
 
     // The enum that a case value Enum.member or module.Enum.member
@@ -604,20 +937,23 @@
     }
 
     ;fn chain(e, scope, ctx, stmtLevel) {
+        // The type of the chain's value: one of its blocks'.
+        ;var result is tNever
         ;var k is 0
         ;while (k < e.branches($length)) {
             ;const b is e.branches[k]
-            ;(b.cond, scope, ctx)(expr)
-            ;(b.body, scope(newScope), ctx)(block)
+            ;(b.cond, (b.cond, scope, ctx)(expr))(condition)
+            ;set result to (result, (b.body, scope(newScope), ctx)(block))(join)
             ;if (!stmtLevel) { ;b.body(requireValue) }
             ;set k += 1
         }
         ;if (e.els != null) {
-            ;(e.els, scope(newScope), ctx)(block)
+            ;set result to (result, (e.els, scope(newScope), ctx)(block))(join)
             ;if (!stmtLevel) { ;e.els(requireValue) }
         } else if (!stmtLevel) {
             ;(e.pos, "a conditional used as a value must end with a plain 'else {{ ... }}'", null)(error)
         }
+        result
     }
 
     ;fn lvalue(ref t, scope, ctx) {
@@ -636,7 +972,7 @@
         ;const isMem is t.k == "mem"
         ;const box is isMem ? t.rec : t.arr
         ;const what is isMem ? "a field" : "an element"
-        ;if (t.k == "idx") { ;(t.index, scope, ctx)(expr) }
+        ;const it is t.k == "idx" ? (t.index, scope, ctx)(expr) : null
         ;if (isMem) {
             ;if ((box, scope)(enumNamed) != null) {
                 ;(t.pos, "cannot set '{box(enumText)}.{t.field}': enum members are constants", null)(error)
@@ -651,13 +987,21 @@
                 ;return
             }
         }
+        // The type of what holds the target.
+        ;var bt is null
         ;if (box.k == "name") {
             ;const d is (box.name, box.pos, scope, ctx)(resolve)
             ;if (d != null) {
                 ;(d, box.name, box.pos, "cannot modify {what} of '{box.name}': it is not a var", false)(mustBeMutable)
+                ;set bt to d(typeOfDecl)
             }
         } else {
-            ;(box, scope, ctx)(expr)
+            ;set bt to (box, scope, ctx)(expr)
+        }
+        ;if (isMem) {
+            ;(bt, t.field, t.pos, "setting")(fieldOf)
+        } else {
+            ;(bt, t.index, it, t.pos, "setting")(indexed)
         }
     }
 
@@ -691,18 +1035,18 @@
             "'$' is reserved for the standard library; user names have no sigil")(error)
     }
 
+    // Checks expression e, and returns its type (above).
     ;fn expr(ref e, scope, ctx) {
         ;const kind is e.k
-        ;if (kind == "int" || kind == "float" || kind == "bool" || kind == "null" || kind == "nan" || kind == "inf") {
-            ;return
-        }
+        ;if (kind == "int") { ;return tInt }
+        ;if (kind == "float" || kind == "nan" || kind == "inf") { ;return tFloat }
+        ;if (kind == "bool") { ;return tBool }
+        ;if (kind == "null") { ;return tNull }
         ;if (kind == "str") {
-            ;var k is 0
-            ;while (k < e.parts($length)) {
-                ;if (e.parts[k]($typeOf) != "string") { ;(e.parts[k], scope, ctx)(expr) }
-                ;set k += 1
+            ;for (part in e.parts) {
+                ;if (part($typeOf) != "string") { ;(part, (part, scope, ctx)(expr))(noText) }
             }
-            ;return
+            ;return tString
         }
         ;if (kind == "name") {
             ;const d is (e.name, e.pos, scope, ctx)(resolve)
@@ -712,8 +1056,10 @@
                 ;(e.pos, "'{e.name}' is an enum, not a value", "its members are written {e.name}.member")(error)
             } else if (d != null && d.kind == "module") {
                 ;(e.pos, "'{e.name}' is a module, not a value", "what it exports is written {e.name}.name")(error)
+            } else if (d != null) {
+                ;return d(typeOfDecl)
             }
-            ;return
+            ;return null
         }
         ;if (kind == "std") {
             ;const sig is e.name(stdSig)
@@ -722,28 +1068,25 @@
             } else if (sig != "const") {
                 ;(e.pos, "'\${e.name}' is a function; call it with (\${e.name})", null)(error)
             }
-            ;return
+            ;return e.name == "args" ? tArray : e.name == "programPath" ? tString : null
         }
         ;if (kind == "arr" || kind == "map") {
-            ;var k is 0
-            ;while (k < e.items($length)) {
-                ;(e.items[k], scope, ctx)(expr)
-                ;set k += 1
-            }
-            ;return
+            ;for (item in e.items) { ;(item, scope, ctx)(expr) }
+            ;return kind == "arr" ? tArray : tMap
         }
+        // A literal is frozen, so its fields keep the types of their values.
         ;if (kind == "rec") {
-            ;var k is 0
-            ;while (k < e.fields($length)) {
-                ;(e.fields[k].e, scope, ctx)(expr)
-                ;set k += 1
+            ;var names is []
+            ;var types is []
+            ;for (f in e.fields) {
+                ;(names, f.name)($push)
+                ;(types, (f.e, scope, ctx)(expr))($push)
             }
-            ;return
+            ;return (names, types)(recordType)
         }
         ;if (kind == "idx") {
-            ;(e.index, scope, ctx)(expr)
-            ;(e.arr, scope, ctx)(expr)
-            ;return
+            ;const it is (e.index, scope, ctx)(expr)
+            ;return ((e.arr, scope, ctx)(expr), e.index, it, e.pos, "reading")(indexed)
         }
         // A field label is not a binding, so only the record side is resolved
         // (§10.8), unless that side names an enum (§4.1) or a module (§13.1).
@@ -751,61 +1094,74 @@
             ;const lin is (e.rec, scope)(enumNamed)
             ;if (lin != null) {
                 ;(e, lin)(member)
-                ;return
+                ;return lin(enumType)
             }
             ;const m is (e.rec, scope)(moduleNamed)
-            ;if (m != null) { ;(e, m)(qualified) } else { ;(e.rec, scope, ctx)(expr) }
-            ;return
+            ;if (m != null) { ;return (e, m)(qualified) }
+            ;return ((e.rec, scope, ctx)(expr), e.field, e.pos, "reading")(fieldOf)
         }
         ;if (kind == "un") {
-            ;(e.e, scope, ctx)(expr)
-            ;return
+            ;const ot is (e.e, scope, ctx)(expr)
+            ;if (e.op == "!") {
+                ;("!", e.e, ot)(needBool)
+                ;return tBool
+            }
+            ;if (e.op == "~") {
+                ;("~", e.e, ot)(needInt)
+                ;return tInt
+            }
+            ;if (!ot(known) || ot.t == "int" || ot.t == "float") { ;return ot }
+            ;(e.pos, "'-' cannot be applied to {ot(typeText)}", null)(error)
+            ;return null
         }
         ;if (kind == "bin") {
-            ;(e.l, scope, ctx)(expr)
-            ;(e.r, scope, ctx)(expr)
-            ;return
+            ;const lt is (e.l, scope, ctx)(expr)
+            ;return (e, lt, (e.r, scope, ctx)(expr))(binary)
         }
         ;if (kind == "tern") {
-            ;(e.c, scope, ctx)(expr)
-            ;(e.a, scope, ctx)(expr)
-            ;(e.b, scope, ctx)(expr)
-            ;return
+            ;(e.c, (e.c, scope, ctx)(expr))(condition)
+            ;const at is (e.a, scope, ctx)(expr)
+            ;return (at, (e.b, scope, ctx)(expr))(join)
         }
         ;if (kind == "call") {
-            ;var k is 0
-            ;while (k < e.args($length)) {
-                ;(e.args[k], scope, ctx)(expr)
-                ;set k += 1
-            }
-            ;(e, scope, true)(callee)
-            ;return
+            ;var types is []
+            ;for (a in e.args) { ;(types, (a, scope, ctx)(expr))($push) }
+            ;return (e, scope, true, types)(callee)
         }
         ;if (kind == "failWith") {
             ;(e.pos, "'fail' is a statement: ;fail c", null)(error)
-            ;return
+            ;return null
         }
-        ;if (kind == "match") {
-            ;(e, scope, ctx, false)(checkMatch)
-            ;return
-        }
-        ;if (kind == "chain") {
-            ;(e, scope, ctx, false)(chain)
-            ;return
-        }
+        ;if (kind == "match") { ;return (e, scope, ctx, false)(checkMatch) }
+        ;if (kind == "chain") { ;return (e, scope, ctx, false)(chain) }
         ;panic "checker: unhandled node {kind}"
     }
 
-    // used: whether the call's value is used (it is unless the call is a whole statement).
-    ;fn callee(e, scope, used) {
+    // Checks a call's function, and returns the type of what it returns.
+    // used: whether the call's value is used (it is unless the call is a whole
+    // statement). types: the types of the arguments.
+    ;fn callee(e, scope, used, types) {
         ;const c is e.callee
         ;const n is e.args($length)
         ;if (c.k == "std") {
             ;const sig is c.name(stdSig)
-            ;if (sig == null) { ;c(unknownStd) ;return }
-            ;if (sig == "const") { ;(c.pos, "'\${c.name}' is a constant, not a function", null)(error) ;return }
-            ;if (sig != n) { ;(c.pos, "'\${c.name}' takes {sig(plural)}, got {n}", null)(error) }
-            ;return
+            ;if (sig == null) { ;c(unknownStd) ;return null }
+            ;if (sig == "const") { ;(c.pos, "'\${c.name}' is a constant, not a function", null)(error) ;return null }
+            ;if (sig != n) {
+                ;(c.pos, "'\${c.name}' takes {sig(plural)}, got {n}", null)(error)
+                ;return null
+            }
+            ;var wrong is false
+            ;for (i, ty in types) {
+                ;const ok is (c.name, i)(stdAccepted)
+                ;if (ok != null && ty(known) && !(ok, ty.t)(text.contains)) {
+                    ;(e.args[i].pos, "\${c.name} expects {ok(typesText)}, got {ty(typeText)}", null)(error)
+                    ;set wrong to true
+                }
+            }
+            ;if (wrong) { ;return null }
+            ;if ((["print", "write", "eprint", "toString"], c.name)(text.contains)) { ;(e.args[0], types[0])(noText) }
+            ;return (c.name, types)(stdResult)
         }
         ;ref d is null
         ;var label is ""
@@ -832,6 +1188,11 @@
         ;if (used && (d.mod, d.namePos)(firstUse) == null) {
             ;(uses, { mod: d.mod, namePos: d.namePos, pos: c.pos, useMod: curMod })($push)
         }
+        // Known once the function's body is checked: not yet in a call before
+        // its declaration, or a call of itself.
+        ;const key is "{d.mod}:{d.namePos}"
+        ;if ((fnTypes, key)($has)) { ;return fnTypes[key] }
+        null
     }
 
     // Each import declares a module name, visible throughout the file like a
@@ -913,6 +1274,9 @@
             ;set modules[m].notLibrary to true
             ;return
         }
+        ;var found is [:]
+        ;(program.stmts, found)(rebinds)
+        ;set rebound to found
         ;const scope is null(newScope)
         ;(m, scope)(importNames)
         ;({ stmts: program.stmts, value: null }, scope, { func: topFn, loops: 0, guards: [] })(block)

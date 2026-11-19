@@ -106,6 +106,7 @@ There is no `=`: declare with `is`, assign with `set ... to`, compare with `==`.
 - **Copies are shallow:** a `const` snapshot of a record still shares the arrays inside it.
 - Map keys are ints, strings, booleans, enum members, or flat records compared by contents (`{ x: 3, y: 4 }`; §10.11).
 - Records have no types. Tell kinds apart with a `kind` field holding an enum member, and `match` on it (§10.10).
+- Types are checked at run time, but the compiler reports what it can prove would panic: a field missing from a record built in view, `"n=" + n`, a `for` range over an array, a non-boolean condition (§4.2). It knows the types of literals, `const` bindings, bindings never rebound, and what functions declared earlier return; not of parameters.
 
 ## Modules (§13.1)
 

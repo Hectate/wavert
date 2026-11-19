@@ -93,9 +93,57 @@ const cases = [
   [';const x is 1\n;import lib from "lib.wvt"\n;exit\n', "2:2: error: 'import' must come before every other statement"],
 ];
 
-for (const [source, expected] of cases) {
+// Type errors the checker can prove (§4.2): each would panic whenever it runs.
+const typeCases = [
+  [';const n is 3\n;const s is "n=" + n\n;exit\n', "2:18: error: '+' cannot be applied to string and int | use interpolation, as in \"n={n}\""],
+  [';const r is { kind: 1, hp: 5 }\n;r.knid($print)\n;exit\n', "2:4: error: no field 'knid' in record { kind, hp }"],
+  [';var r is { kind: 1, hp: 5 }\n;set r.hpp to 2\n;exit\n', "2:8: error: no field 'hpp' in record { kind, hp }"],
+  [';const r is { a: { b: 1 } }\n;r.a.c($print)\n;exit\n', "2:6: error: no field 'c' in record { b }"],
+  [';fn pos(x, y) { { x: x, y: y } }\n;(1, 2)(pos).z($print)\n;exit\n', "2:14: error: no field 'z' in record { x, y }"],
+  [';fn f(n) { ;if (n > 0) { ;return { a: 1 } } { a: 2 } }\n;5(f).b($print)\n;exit\n', "2:7: error: no field 'b' in record { a }"],
+  [';const t is ($terminalSize) onfail { ;exit }\n;t.w($print)\n;exit\n', "2:4: error: no field 'w' in record { width, height }"],
+  [';const n is 3\n;n.x($print)\n;exit\n', "2:4: error: reading field 'x' needs a record, got int"],
+  [';import grid from "$lib/grid.wvt"\n;const g is (3, 3, 0)(grid.new)\n;g[(1, 1)(grid.pos)]($print)\n;exit\n',
+    "3:16: error: a record's field name must be a string, got record { x, y }, indexing record { width, height, cells } | a record is indexed by the name of a field; for other keys, such as positions, use a map"],
+  [';const s is "abc"\n;s[0]($print)\n;exit\n', "2:3: error: indexing needs an array, a map or a record, got string | use $at for a string: (s, i)($at)"],
+  [';const xs is [1]\n;xs["0"]($print)\n;exit\n', "2:5: error: an index must be an int, got string"],
+  [';const xs is [1]\n;const n is xs * 2\n;exit\n', "2:16: error: '*' cannot be applied to array and int"],
+  [';const x is -"a"\n;exit\n', "1:13: error: '-' cannot be applied to string"],
+  [';const x is 1.5 & 1\n;exit\n', "1:13: error: '&' requires integers, got float"],
+  [';const x is !"yes"\n;exit\n', "1:14: error: '!' requires true or false, got string"],
+  [';enum K (a, b)\n;const x is K.a < K.b\n;exit\n', "2:17: error: '<' cannot order enum members"],
+  [';const xs is [1, 2]\n;if (xs($length)) { }\n;exit\n', '2:9: error: a condition must be true or false, got int'],
+  [';const r is { a: 1 }\n;"{r}"($print)\n;exit\n', "2:4: error: cannot convert record { a } to text; convert it explicitly | use records.toString from $lib/records.wvt, or interpolate its fields"],
+  [';const xs is [1]\n;xs($print)\n;exit\n', "2:2: error: cannot convert array to text; convert it explicitly | join its elements with (xs, \", \")($join), or use arrays.toString from $lib/arrays.wvt"],
+  [';const n is 5\n;n($keys)($print)\n;exit\n', '2:2: error: $keys expects a map, got int'],
+  [';const xs is [1, 2]\n;for (i in 0, xs) { }\n;exit\n', "2:15: error: a for loop's range needs ints, got array | to go through an array, write ;for (x in xs), or ;for (i, x in xs) for each index too"],
+  [';for (i in 0, 10, 0.5) { }\n;exit\n', "1:19: error: a for loop's step must be an int, got float"],
+  [';const s is "abc"\n;for (c in s) { }\n;exit\n', '2:12: error: a for loop goes through an array, a map, an enum or a range of ints, got string | for its characters, go through (s, "")($split)'],
+];
+
+for (const [source, expected] of [...cases, ...typeCases]) {
   test(JSON.stringify(source), { skip }, () => {
     assert.equal(first(source), expected);
+  });
+}
+
+// What the checker cannot be sure of, it does not report.
+const typeOk = [
+  ';var n is 0\n;set n to "s"\n;const s is "n=" + n\n;exit\n',      // rebound: its type is not known
+  ';fn f(r) { r.anything }\n;exit\n',                                 // a parameter's type is not known
+  ';var r is { a: 1 }\n;set r.a to "x"\n;const s is r.a + 1\n;exit\n', // a mutable record's field may change type
+  ';fn f(x) { ;if (x) { ;return 1 } "s" }\n;const s is true(f) + 1\n;exit\n', // returns an int or a string
+  ';const r is { a: 1 }\n;r["a"]($print)\n;exit\n',
+  ';const n is 1 + 2.5\n;"{n * 2}"($print)\n;exit\n',
+  ';var xs is []\n;(xs, { a: 1 })($push)\n;xs[0].a($print)\n;exit\n',
+  ';for (i, x in [1, 2]) { ;(i + 1)($print) }\n;exit\n',
+  ';const n is "5"($toInt) onfail { 0 }\n;(n + 1)($print)\n;exit\n',
+  ';const n is 1 < "a"\n;exit\n',                                      // ordering across types is false (§11.1)
+];
+
+for (const source of typeOk) {
+  test(`no error: ${JSON.stringify(source)}`, { skip }, () => {
+    assert.equal(diagnostics(source), '');
   });
 }
 

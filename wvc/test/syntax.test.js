@@ -157,9 +157,9 @@ test('for over arrays, maps and enums; break, continue and nesting', { skip }, (
 
 test('for loops panic on a bad range, collection or change to it', { skip }, () => {
   const panics = (source) => run(source + '\n;exit\n').err.split('\n')[0];
-  assert.equal(panics(';for (i in 0, 2.5) { }'), 'uncaught panic: type error: a for loop\'s range needs ints, got int and float');
+  assert.equal(panics(';fn hide(x) { x }\n;for (i in 0, 2.5(hide)) { }'), 'uncaught panic: type error: a for loop\'s range needs ints, got int and float');
   assert.equal(panics(';const s is 0 - 2\n;for (i in 0, 4, s) { }'), 'uncaught panic: a for loop\'s step must be greater than 0, got -2');
-  assert.equal(panics(';for (c in "ab") { }'),
+  assert.equal(panics(';fn hide(x) { x }\n;for (c in "ab"(hide)) { }'),
     'uncaught panic: type error: a for loop goes through an array, a map, an enum or a range of ints, got string (for its characters, loop over (s, "")($split))');
   assert.equal(panics(';var xs is [1, 2]\n;for (x in xs) { ;(xs, 3)($push) }'),
     'uncaught panic: an array\'s length changed during a for loop over it: it was 2, and is now 3');

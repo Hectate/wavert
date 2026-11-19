@@ -1,4 +1,4 @@
-# Wavert Language Specification (Draft 0.8)
+# Wavert Language Specification (Draft 0.10)
 
 > Draft 0.1 was the first Wavert specification. Wavert is derived from Γ-- ([wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). It changes Γ--'s syntax and names and keeps its semantics; [hybrid-syntax.md](hybrid-syntax.md) gives the reasons for each change. Section numbers follow the Γ-- specification, so a reference such as §10.4 means the same topic in both.
 >
@@ -17,6 +17,8 @@
 > Draft 0.8 adds the `for` loop (§7.4), over ranges of ints, arrays, maps and enums, forwards or `reversed`. `for` is a keyword, and `in` and `reversed` are contextual keywords (§2.5).
 
 > Draft 0.9 gives each frame of a panic's stack trace its file and line (§8.1), and has the errors about records describe the record by its fields (§10.8, §10.9).
+>
+> Draft 0.10 reports, as compile errors, operations that the compiler can tell from the types of their values would always panic, such as a missing field of a record built in view, or `"n=" + n` (§4.2).
 
 ## 1. Overview
 
@@ -255,6 +257,34 @@ Implicit conversions (the complete list):
 - Interpolation and `$toString` give the member's name (`call`). `$typeOf` gives the enum's name (`"Kind"`). `$same` on members is `==`.
 - Members can be stored in arrays and records, passed to functions and returned like any value. They are immutable, so the copy rules (§10.4) do not apply to them.
 - A library exports an enum by marking it `export` (§13.1). Its members are then written `module.Name.member`.
+
+### 4.2 Type errors found at compile time
+Types are checked when a value is used, and a wrong type panics. Where the compiler can tell from the program's text that an operation would panic whenever it runs, it reports a compile error instead. It reports nothing it is unsure of: a program that might run correctly still compiles, and a program that compiles may still panic.
+
+The compiler knows the type of:
+- A literal. A record literal is a record with exactly its fields, and since it is frozen (§10.4), the types of its fields' values are known too.
+- An operator's result, and an `if`, `match` or ternary value whose branches agree.
+- A standard library call that always returns one type, such as `$length`, and `$terminal` and `$terminalSize`, whose records' fields are known.
+- A call of a function declared earlier in the program, when every way the function returns gives one type. A parameter's type is not known, so `;fn pos(x, y) { { x: x, y: y } }` is known to return a record `{ x, y }`, with fields of unknown types.
+- A `const` binding, and a `var` or `ref` binding that no `;set name to ...` or `;set name += ...` rebinds anywhere in its module. A `var` binding holds a mutable copy, and a mutable record's fields may be set to values of other types (§10.9), so of a record only its field names stay known.
+- A range's loop variable, which is an int, as is the index of a loop over an array; an enum loop's variable; and an `onfail` code, which is an int.
+
+What it reports:
+
+| Error | Example |
+|---|---|
+| `no field 'knid' in record { kind, hp }` | reading or setting a field that the record does not have |
+| `reading field 'x' needs a record, got int` | `.` on a value that is not a record |
+| `a record's field name must be a string, got record { x, y }, indexing record { width, height, cells }` | indexing a grid with a position, which is what a map is for |
+| `indexing needs an array, a map or a record, got string`, `an index must be an int, got string`, `a map key must be ...` | indexing a value that cannot be indexed, or with an index it cannot take |
+| `'+' cannot be applied to string and int` | `"n=" + n`; the hint suggests interpolation |
+| `'*' cannot be applied to array and int`, `'-' cannot be applied to string`, `'&' requires integers, got float`, `'!' requires true or false, got string`, `'<' cannot order enum members` | other operators (§11.1) |
+| `a condition must be true or false, got int` | the condition of `if`, `while` or a ternary |
+| `cannot convert array to text; convert it explicitly` | interpolating, `$print`, `$write`, `$eprint` or `$toString` of an array, record or map (§9.3) |
+| `$keys expects a map, got int` | a standard library argument of the wrong type |
+| `a for loop's range needs ints, got array`, `a for loop's step must be an int, got float`, `a for loop goes through an array, a map, an enum or a range of ints, got string` | a `for` loop (§7.4) |
+
+Ordering values of different types is `false`, not a panic (§11.1), so `1 < "a"` is not reported.
 
 ---
 
@@ -724,7 +754,7 @@ A copy happens **only when mutability changes**:
 - `;node($typeOf)` is `"record"`.
 - `;node($fields)` returns a frozen array of the field names, in literal order.
 
-**Kinds of record.** Records have no types: every record's `$typeOf` is `"record"`, and nothing ties a record to the literal that made it. To tell kinds of record apart, give each a field holding a member of an enum (§4.1), conventionally named `kind`:
+**Kinds of record.** Records have no types: every record's `$typeOf` is `"record"`, and nothing ties a record to the literal that made it. (Where the compiler can see which literal made a record, it reports reading a field the record does not have, §4.2.) To tell kinds of record apart, give each a field holding a member of an enum (§4.1), conventionally named `kind`:
 ```
 ;enum Kind (monster, item)
 ;const orc is { kind: Kind.monster, hp: 5 }

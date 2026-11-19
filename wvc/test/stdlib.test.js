@@ -184,8 +184,8 @@ test('misusing a generator panics', { skip }, () => {
   assert.equal(panic(';[1, 2]($randomFloat)'), '$randomFloat: the argument is not a random generator');
   assert.equal(panic(';var rng is 1($newRandom)\n;(rng, 0)($random)'), '$random: n must be from 1 to 4294967296, got 0');
   assert.equal(panic(';var rng is 1($newRandom)\n;(rng, 2 ** 32 + 1)($random)'), '$random: n must be from 1 to 4294967296, got 4294967297');
-  assert.equal(panic(';var rng is 1($newRandom)\n;(rng, 1.5)($random)'), 'type error: $random expects an int, got float');
-  assert.equal(panic(';"x"($newRandom)'), 'type error: $newRandom expects an int, got string');
+  assert.equal(panic(';fn hide(x) { x }\n;var rng is 1($newRandom)\n;(rng, 1.5(hide))($random)'), 'type error: $random expects an int, got float');
+  assert.equal(panic(';fn hide(x) { x }\n;"x"(hide)($newRandom)'), 'type error: $newRandom expects an int, got string');
 });
 
 // ---- Draft 0.3: maps (§10.11) and sorting (§10.6) ----
@@ -308,14 +308,14 @@ test('misusing a map panics', { skip }, () => {
   assert.equal(panicOf(';var m is ["a": 2]\n;set m["b"] += 1'), 'no key "b" in map');
   assert.equal(panicOf(';const m is [1: 2]\n;fn f(ref x) { ;set x[1] to 3 }\n;m(f)'), 'cannot modify a frozen map');
   assert.equal(panicOf(';const m is [1: 2]\n;fn f(ref x) { ;(x, 1)($remove) }\n;m(f)'), 'cannot modify a frozen map with $remove');
-  assert.equal(panicOf(';var m is [1: 2]\n;set m[1.5] to 3'), 'type error: a map key must be an int, a string, a boolean, an enum member or a record, got float');
+  assert.equal(panicOf(';fn hide(x) { x }\n;var m is [1: 2]\n;set m[1.5(hide)] to 3'), 'type error: a map key must be an int, a string, a boolean, an enum member or a record, got float');
   assert.equal(panicOf(';const k is [1]\n;const m is [k: 2]'), 'type error: a map key must be an int, a string, a boolean, an enum member or a record, got array');
   assert.equal(panicOf(';const m is [1: 2]\n;(m, null)($has)'), 'type error: a map key must be an int, a string, a boolean, an enum member or a record, got null');
-  assert.equal(panicOf(';[1, 2]($keys)'), 'type error: $keys expects a map, got array');
-  assert.equal(panicOf(';[1: 2]($print)'), 'type error: cannot convert map to text; convert it explicitly');
+  assert.equal(panicOf(';fn hide(x) { x }\n;[1, 2](hide)($keys)'), 'type error: $keys expects a map, got array');
+  assert.equal(panicOf(';fn hide(x) { x }\n;[1: 2](hide)($print)'), 'type error: cannot convert map to text; convert it explicitly');
   assert.equal(panicOf(';panic [1: "a", 2: [:]]'), '[1: "a", 2: [:]]');
-  assert.equal(panicOf(';([1: 2] < [1: 2])($print)'), "type error: '<' cannot order map values");
-  assert.equal(panicOf(';"x"[1]($print)'), 'type error: indexing needs an array, a map or a record, got string (use $at for a string)');
+  assert.equal(panicOf(';fn hide(x) { x }\n;([1: 2](hide) < [1: 2])($print)'), "type error: '<' cannot order map values");
+  assert.equal(panicOf(';fn hide(x) { x }\n;"x"(hide)[1]($print)'), 'type error: indexing needs an array, a map or a record, got string (use $at for a string)');
   const r = runMain(';const m is [1: 2]\n;(m, 5)($get)($print)\n;exit\n');
   assert.equal(r.code, 1);
   assert.match(r.err, /unhandled fail \(code 1\) from '\$get'/);
@@ -397,8 +397,8 @@ test('misusing $sort and $sortBy panics', { skip }, () => {
   assert.equal(panicOf(';([{ a: 1 }, 2], "a")($sortBy)'), "type error: reading field 'a' needs a record, got int");
   assert.equal(panicOf(';([1, 2], [1])($sortBy)'), '$sortBy: there are 1 keys for 2 items');
   assert.equal(panicOf(';([1, 2], 5)($sortBy)'), 'type error: $sortBy expects a field name or an array of keys, got int');
-  assert.equal(panicOf(';"abc"($sort)'), 'type error: $sort expects an array, got string');
-  assert.equal(panicOf(';[1: 2]($reverse)'), 'type error: $reverse expects an array, got map');
+  assert.equal(panicOf(';fn hide(x) { x }\n;"abc"(hide)($sort)'), 'type error: $sort expects an array, got string');
+  assert.equal(panicOf(';fn hide(x) { x }\n;[1: 2](hide)($reverse)'), 'type error: $reverse expects an array, got map');
 });
 
 // ---- Draft 0.4: the terminal (§12.2) ----
@@ -538,8 +538,8 @@ test('$sleep shows what was written before pausing', { skip, timeout: 30000 }, a
 });
 
 test('$waitKey and $sleep need an int', { skip }, () => {
-  assert.equal(panicOf(';"x"($sleep)'), 'type error: $sleep expects an int, got string');
-  assert.equal(panicOf(';1.5($waitKey)'), 'type error: $waitKey expects an int, got float');
+  assert.equal(panicOf(';fn hide(x) { x }\n;"x"(hide)($sleep)'), 'type error: $sleep expects an int, got string');
+  assert.equal(panicOf(';fn hide(x) { x }\n;1.5(hide)($waitKey)'), 'type error: $waitKey expects an int, got float');
 });
 
 // ---- Draft 0.6: records as map keys (§10.11) ----
