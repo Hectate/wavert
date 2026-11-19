@@ -502,10 +502,13 @@
         }
         ;if (op == "==" || op == "!=") { ;return tBool }
         ;if (op == "<" || op == ">" || op == "<=" || op == ">=") {
-            // Ordering two values of different types is false (§11.1).
+            // Only numbers, an int with a float too, and strings are ordered (§11.1).
+            ;const numeric is ["int", "float"]
             ;if (lt(known) && rt(known) && lt.t == rt.t && !(["int", "float", "string"], lt.t)(text.contains)) {
                 ;const what is lt.t == "enum" ? "enum members" : "{lt.t} values"
                 ;(e.pos, "'{op}' cannot order {what}", null)(error)
+            } else if (lt(known) && rt(known) && lt.t != rt.t && !((numeric, lt.t)(text.contains) && (numeric, rt.t)(text.contains))) {
+                ;(e.pos, "'{op}' cannot order {lt(typeText)} and {rt(typeText)}", null)(error)
             }
             ;return tBool
         }
@@ -711,6 +714,13 @@
             ;return
         } else if (kind == "while") {
             ;(s.cond, (s.cond, scope, ctx)(expr))(condition)
+            // A loop whose constant condition means it never runs is always a
+            // mistake, unlike ;while (true), which is left with break (§7.4).
+            ;if (s.cond.k == "bool" && s.cond.v == s.neg) {
+                ;const message is s.neg ? "this loop never runs: !while repeats while its condition is false, and true never is"
+                    : "this loop never runs: its condition is always false"
+                ;(s.cond.pos, message, "for a loop that runs until it breaks, write ;while (true)")(error)
+            }
             ;(s.body, scope(newScope), { func: ctx.func, loops: ctx.loops + 1, guards: ctx.guards })(block)
             ;return
         } else if (kind == "for") {

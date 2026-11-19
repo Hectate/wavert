@@ -112,6 +112,11 @@ const typeCases = [
   [';const x is 1.5 & 1\n;exit\n', "1:13: error: '&' requires integers, got float"],
   [';const x is !"yes"\n;exit\n', "1:14: error: '!' requires true or false, got string"],
   [';enum K (a, b)\n;const x is K.a < K.b\n;exit\n', "2:17: error: '<' cannot order enum members"],
+  [';const n is null < 0\n;exit\n', "1:18: error: '<' cannot order null and int"],
+  [';const n is 1 >= "a"\n;exit\n', "1:15: error: '>=' cannot order int and string"],
+  // A loop whose constant condition means it never runs.
+  [';while (false) { }\n;exit\n', '1:9: error: this loop never runs: its condition is always false | for a loop that runs until it breaks, write ;while (true)'],
+  [';!while (true) { ;break }\n;exit\n', '1:10: error: this loop never runs: !while repeats while its condition is false, and true never is | for a loop that runs until it breaks, write ;while (true)'],
   [';const xs is [1, 2]\n;if (xs($length)) { }\n;exit\n', '2:9: error: a condition must be true or false, got int'],
   [';const r is { a: 1 }\n;"{r}"($print)\n;exit\n', "2:4: error: cannot convert record { a } to text; convert it explicitly | use records.toString from $lib/records.wvt, or interpolate its fields"],
   [';const xs is [1]\n;xs($print)\n;exit\n', "2:2: error: cannot convert array to text; convert it explicitly | join its elements with (xs, \", \")($join), or use arrays.toString from $lib/arrays.wvt"],
@@ -144,7 +149,8 @@ const typeOk = [
   ';var xs is []\n;(xs, { a: 1 })($push)\n;xs[0].a($print)\n;exit\n',
   ';for (i, x in [1, 2]) { ;(i + 1)($print) }\n;exit\n',
   ';const n is "5"($toInt) onfail { 0 }\n;(n + 1)($print)\n;exit\n',
-  ';const n is 1 < "a"\n;exit\n',                                      // ordering across types is false (§11.1)
+  ';const n is 1 < 2.5\n;exit\n',                                      // an int and a float are ordered (§11.1)
+  ';while (true) { ;break }\n;!while (false) { ;break }\n;exit\n',     // loops left with break
   ';var xs is [1]\n;(xs, "a")($push)\n;const s is xs[1] + "b"\n;exit\n', // anything may be pushed into a mutable array
   ';const xs is [1, "a"]\n;const s is xs[1] + "b"\n;exit\n',             // elements of different types
   ';fn hide(x) { x }\n;const s is ("ab"(hide), 0, 1)($slice) + "c"\n;exit\n', // $slice of a string or an array

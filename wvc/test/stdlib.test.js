@@ -4,8 +4,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { buildProgram, noZig, readRepo, run } from './helpers.js';
+import { spawn, spawnSync } from 'node:child_process';
+import { closeSync, openSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { buildProgram, noZig, readRepo, run, tempDir } from './helpers.js';
 
 const skip = noZig;
 
@@ -424,6 +426,33 @@ test('$terminalSize fails when stdout is not a terminal', { skip }, () => {
   const r = runMain(';($terminalSize).width($print)\n;exit\n');
   assert.equal(r.code, 1);
   assert.match(r.err, /unhandled fail \(code 1\) from '\$terminalSize'/);
+});
+
+// Screen state set with escape sequences is restored however the program
+// ends (§12.2). WVT_TEST_TERMINAL=1 makes the runtime treat stdout and stderr
+// as terminals; both go to one file here, to show the order of what is written.
+test('the cursor and the alternate screen are restored however a program ends', { skip }, () => {
+  const E = '\u001b';
+  const screen = (source, env = { WVT_TEST_TERMINAL: '1' }) => {
+    const program = buildProgram(`${source}\n;exit\n`);
+    const file = join(tempDir(), 'out.txt');
+    const fd = openSync(file, 'w');
+    const r = spawnSync(program, [], { stdio: ['pipe', fd, fd], env: { ...process.env, ...env } });
+    closeSync(fd);
+    return { code: r.status, all: readFileSync(file, 'utf8') };
+  };
+  const enter = `;"\\u{1B}[?1049h\\u{1B}[?25lplaying"($write)`;
+  // A panic: the alternate screen is left and the cursor shown before the message, which stays visible.
+  const p = screen(`${enter}\n;panic "oops"`);
+  assert.equal(p.code, 1);
+  assert.ok(p.all.startsWith(`${E}[?1049h${E}[?25lplaying${E}[?1049l${E}[?25huncaught panic: oops\n`), JSON.stringify(p.all));
+  // ;exit without undoing them.
+  assert.equal(screen(`${enter}`).all, `${E}[?1049h${E}[?25lplaying${E}[?1049l${E}[?25h`);
+  // A program that undoes them itself gets nothing more; nor does output that is not a terminal.
+  assert.equal(screen(`${enter}\n;"\\u{1B}[?25h\\u{1B}[?1049ldone"($write)`).all, `${E}[?1049h${E}[?25lplaying${E}[?25h${E}[?1049ldone`);
+  assert.equal(screen(`${enter}\n;panic "oops"`, {}).all.split('uncaught')[0], `${E}[?1049h${E}[?25lplaying`);
+  // The older alternate screen modes, and sequences written to stderr, are undone where they were set.
+  assert.equal(screen(`;"\\u{1B}[?47hx"($eprint)`).all, `${E}[?47hx\n${E}[?47l`);
 });
 
 // The code generator checks for a fail only after the stdlib functions in its

@@ -169,6 +169,16 @@ test('for loops panic on a bad range, collection or change to it', { skip }, () 
     'uncaught panic: \'xs\' was set to another value during a for loop over it');
 });
 
+test('ordering is for numbers and strings; across other types it panics', { skip }, () => {
+  const r = run(';("a" < "b")($print)\n;(1 < 1.5)($print)\n;(2.5 >= 2)($print)\n;(null == 0)($print)\n;("1" != 1)($print)\n;exit\n');
+  assert.equal(r.out, 'true\ntrue\ntrue\nfalse\ntrue\n');
+  // The types are hidden from the checker, which would report these at compile time.
+  const panics = (source) => run(`;fn hide(x) { x }\n${source}\n;exit\n`).err.split('\n')[0];
+  assert.equal(panics(';(null(hide) < 0)($print)'), "uncaught panic: type error: '<' cannot order null and int");
+  assert.equal(panics(';("1"(hide) >= 1)($print)'), "uncaught panic: type error: '>=' cannot order string and int");
+  assert.equal(panics(';enum K (a)\n;(K.a(hide) <= 1.5)($print)'), "uncaught panic: type error: '<=' cannot order K and float");
+});
+
 test('match with cases, enums and else', { skip }, () => {
   assert.equal(out(`
 ;enum Color (red, green)

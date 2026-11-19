@@ -665,8 +665,86 @@ static void rt_flush(void) {
   if (out_n) write_raw(1, out_buf, out_n);
   out_n = 0;
 }
+
+// ---- screen state set with escape sequences (§12.2, Terminal state) ----
+// A program may hide the cursor or switch to the alternate screen by writing
+// escape sequences to a terminal. The runtime notes them as they are written,
+// and term_restore undoes what is still in effect however the program ends.
+// Output to a file or a pipe is not looked at, and nothing is added to it.
+static int scr_tty[3] = { 0, -1, -1 }; // per fd: 1 if a terminal, 0 if not, -1 until known
+static int scr_hidden;                 // the cursor is hidden
+static const char *scr_alt;            // the alternate screen's mode ("1049", "1047" or "47"), or NULL
+static int scr_fd = 1;                 // the stream the sequences were written to
+static void catch_ends(void);
+
+// Whether output fd is a terminal. WVT_TEST_TERMINAL=1 makes stdout and
+// stderr count as terminals here, so that tests can see what is restored.
+static int out_is_terminal(int fd) {
+  if (scr_tty[fd] < 0) {
+    const char *test = getenv("WVT_TEST_TERMINAL");
+    if (test && strcmp(test, "1") == 0) return scr_tty[fd] = 1;
+#ifdef _WIN32
+    DWORD mode;
+    scr_tty[fd] = GetConsoleMode(GetStdHandle(fd == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE), &mode) != 0;
+#else
+    scr_tty[fd] = isatty(fd);
+#endif
+  }
+  return scr_tty[fd];
+}
+
+// Notes the screen state that the escape sequences in p change.
+static void scr_note(int fd, const char *p, size_t n) {
+  if (!memchr(p, 0x1B, n) || !out_is_terminal(fd)) return;
+  static const char *const alts[] = { "1049", "1047", "47" };
+  for (const char *e = p + n; (p = memchr(p, 0x1B, e - p)) != NULL; p++) {
+    size_t left = (size_t)(e - p);
+    if (left >= 2 && p[1] == 'c') { scr_hidden = 0; scr_alt = NULL; continue; } // a full reset
+    scr_fd = fd;
+    if (left < 5 || p[1] != '[' || p[2] != '?') continue;
+    const char *q = p + 3;
+    if (left >= 6 && memcmp(q, "25", 2) == 0 && (q[2] == 'l' || q[2] == 'h')) {
+      scr_hidden = q[2] == 'l';
+      catch_ends();
+      continue;
+    }
+    for (int i = 0; i < 3; i++) {
+      size_t k = strlen(alts[i]);
+      if (left >= 4 + k && memcmp(q, alts[i], k) == 0 && (q[k] == 'h' || q[k] == 'l')) {
+        scr_alt = q[k] == 'h' ? alts[i] : NULL;
+        catch_ends();
+        break;
+      }
+    }
+  }
+}
+
+// Undoes the screen state still in effect, leaving the alternate screen first,
+// so that what comes after is on the normal screen. resume: put it back, after
+// a Ctrl+Z. Uses only write_raw, so it may run in a signal handler.
+static void scr_restore(int resume) {
+  static const char *saved_alt;
+  static int saved_hidden;
+  char seq[32];
+  if (resume) {
+    if (saved_alt) { int k = snprintf(seq, sizeof seq, "\x1b[?%sh", saved_alt); write_raw(scr_fd, seq, k); }
+    if (saved_hidden) write_raw(scr_fd, "\x1b[?25l", 6);
+    scr_alt = saved_alt;
+    scr_hidden = saved_hidden;
+    return;
+  }
+  saved_alt = scr_alt;
+  saved_hidden = scr_hidden;
+  // Cleared first: a write that fails ends the program through term_restore.
+  scr_alt = NULL;
+  scr_hidden = 0;
+  if (saved_alt) { int k = snprintf(seq, sizeof seq, "\x1b[?%sl", saved_alt); write_raw(scr_fd, seq, k); }
+  if (saved_hidden) write_raw(scr_fd, "\x1b[?25h", 6);
+}
+
 // Stdout is buffered; stderr is not, and flushes stdout first to keep order.
 static void rt_write(int fd, const char *p, size_t n) {
+  scr_note(fd, p, n);
   if (fd == 2) { rt_flush(); write_raw(2, p, n); return; }
   if (out_n + n > sizeof out_buf) rt_flush();
   if (n > sizeof out_buf) { write_raw(1, p, n); return; }
@@ -702,6 +780,8 @@ static _Noreturn void rt_die(const char *msg, size_t n) {
 #ifdef WVT_TEST_DIE
   WVT_TEST_DIE(msg, n); // the runtime tests report a panic and go on
 #endif
+  rt_flush();
+  scr_restore(0); // leave the alternate screen first, or it would take the message with it
   sb b = { 0 };
   sb_puts(&b, "uncaught panic: ");
   sb_putn(&b, msg, n);
@@ -1297,7 +1377,9 @@ static int eq(wv a, wv b) {
 static wv rt_eq(wv a, wv b) { return rt_b(eq(a, b)); }
 static wv rt_ne(wv a, wv b) { return rt_b(!eq(a, b)); }
 
-// Orders a and b: -1, 0 or 1; 2 when unordered (NaN or different types).
+// Orders a and b: -1, 0 or 1; 2 when unordered (NaN). Only numbers, an int
+// with a float too, and strings have an order (§11.1); ordering anything
+// else, or values of two different types, panics.
 static int order(wv a, wv b, const char *op) {
   if (a.tag == T_INT && b.tag == T_INT) return a.i < b.i ? -1 : a.i > b.i;
   if (isnum(a) && isnum(b)) {
@@ -1307,7 +1389,7 @@ static int order(wv a, wv b, const char *op) {
   if (a.tag == T_STR && b.tag == T_STR) return str_cmp(a.s, b.s);
   if (a.tag == T_MEM && b.tag == T_MEM) rt_fail("type error: '%s' cannot order enum members", op);
   if (a.tag == b.tag) rt_fail("type error: '%s' cannot order %s values", op, type_name(a));
-  return 2;
+  rt_fail("type error: '%s' cannot order %s and %s", op, type_name(a), type_name(b));
 }
 static wv rt_lt(wv a, wv b) { return rt_b(order(a, b, "<") == -1); }
 static wv rt_le(wv a, wv b) { int c = order(a, b, "<="); return rt_b(c == -1 || c == 0); }
@@ -1897,6 +1979,7 @@ static void key_apply(int on) {
 }
 
 static void term_restore(void) {
+  scr_restore(0); // while the console still reads escape sequences
   key_apply(0);
 #ifdef _WIN32
   for (int i = 1; i >= 0; i--) if (vt_out[i]) SetConsoleMode(vt_out[i], vt_saved[i]);
@@ -1939,11 +2022,27 @@ static void key_stop(int sig) {
   raise(SIGTSTP);
   signal(SIGTSTP, key_stop);
   if (was) key_apply(1);
+  scr_restore(1);
 }
 static void key_catch(int sig, void (*handler)(int)) {
   if (signal(sig, handler) == SIG_IGN) signal(sig, SIG_IGN); // a signal the parent ignored stays ignored
 }
 #endif
+
+// Restores the terminal on Ctrl+C and the signals that end a program, once
+// key mode or screen state needs it.
+static void catch_ends(void) {
+  static int caught;
+  if (caught) return;
+  caught = 1;
+#ifdef _WIN32
+  SetConsoleCtrlHandler(key_ctrl, TRUE);
+#else
+  int ends[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGPIPE };
+  for (int i = 0; i < 5; i++) key_catch(ends[i], key_signal);
+  key_catch(SIGTSTP, key_stop);
+#endif
+}
 
 static void key_start(void) {
   if (key_started) return;
@@ -1951,15 +2050,11 @@ static void key_start(void) {
 #ifdef _WIN32
   key_in = GetStdHandle(STD_INPUT_HANDLE);
   key_tty = GetConsoleMode(key_in, &key_saved) != 0;
-  if (!key_tty) return;
-  SetConsoleCtrlHandler(key_ctrl, TRUE);
 #else
   key_tty = isatty(0) && tcgetattr(0, &key_saved) == 0;
-  if (!key_tty) return;
-  int ends[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGPIPE };
-  for (int i = 0; i < 5; i++) key_catch(ends[i], key_signal);
-  key_catch(SIGTSTP, key_stop);
 #endif
+  if (!key_tty) return;
+  catch_ends();
   key_on = 1;
 }
 

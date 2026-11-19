@@ -1,4 +1,4 @@
-# Wavert Language Specification (Draft 0.10)
+# Wavert Language Specification (Draft 0.11)
 
 > Draft 0.1 was the first Wavert specification. Wavert is derived from Γ-- ([wah/wah-spec.md](../wah/wah-spec.md), Draft 0.8). It changes Γ--'s syntax and names and keeps its semantics; [hybrid-syntax.md](hybrid-syntax.md) gives the reasons for each change. Section numbers follow the Γ-- specification, so a reference such as §10.4 means the same topic in both.
 >
@@ -19,6 +19,8 @@
 > Draft 0.9 gives each frame of a panic's stack trace its file and line (§8.1), and has the errors about records describe the record by its fields (§10.8, §10.9).
 >
 > Draft 0.10 reports, as compile errors, operations that the compiler can tell from the types of their values would always panic, such as a missing field of a record built in view, or `"n=" + n`. It knows the types of the elements of frozen arrays, such as array literals (§4.2).
+>
+> Draft 0.11 makes ordering values of two different types panic, except an int with a float (§11.1), where it was `false`, and makes a `while` or `!while` loop that never runs because of its constant condition a compile error (§7.4). The runtime restores a hidden cursor and leaves the alternate screen however a program ends, before a panic's message (§12.2, Terminal state).
 
 ## 1. Overview
 
@@ -278,13 +280,12 @@ What it reports:
 | `a record's field name must be a string, got record { x, y }, indexing record { width, height, cells }` | indexing a grid with a position, which is what a map is for |
 | `indexing needs an array, a map or a record, got string`, `an index must be an int, got string`, `a map key must be ...` | indexing a value that cannot be indexed, or with an index it cannot take |
 | `'+' cannot be applied to string and int` | `"n=" + n`; the hint suggests interpolation |
-| `'*' cannot be applied to array and int`, `'-' cannot be applied to string`, `'&' requires integers, got float`, `'!' requires true or false, got string`, `'<' cannot order enum members` | other operators (§11.1) |
+| `'*' cannot be applied to array and int`, `'-' cannot be applied to string`, `'&' requires integers, got float`, `'!' requires true or false, got string`, `'<' cannot order enum members`, `'<' cannot order null and int` | other operators (§11.1) |
 | `a condition must be true or false, got int` | the condition of `if`, `while` or a ternary |
 | `cannot convert array to text; convert it explicitly` | interpolating, `$print`, `$write`, `$eprint` or `$toString` of an array, record or map (§9.3) |
 | `$keys expects a map, got int` | a standard library argument of the wrong type |
 | `a for loop's range needs ints, got array`, `a for loop's step must be an int, got float`, `a for loop goes through an array, a map, an enum or a range of ints, got string` | a `for` loop (§7.4) |
 
-Ordering values of different types is `false`, not a panic (§11.1), so `1 < "a"` is not reported.
 
 ---
 
@@ -433,6 +434,7 @@ The fix is to parenthesize the value: `([1, 2])`, `((next))`, `(-1)`.
 ### 7.4 Loops
 - `while (cond) { ... }` runs while `cond` is `true`.
 - `!while (cond) { ... }` (until) runs while `cond` is `false`.
+- A loop that never runs because its condition is the constant that stops it, `;while (false)` or `;!while (true)`, is a compile error: `this loop never runs`. It is always a mistake, often a `!` left over from `;!while (done)`; a loop left only with `break` is written `;while (true)`.
 - `for` goes through a range of ints, an array, a map or an enum, binding one or two loop variables on each pass:
   ```
   ;for (i in 0, n) { ... }               // 0, 1, …, n - 1
@@ -858,8 +860,8 @@ Standard semantics throughout.
 - **Arithmetic:** `+ - * / % **`, unary `-` (there is no unary `+`).
 - **Comparison:** `== != < > <= >=`
   - All six promote an int to float when it is compared with a float (§11.2).
-  - Otherwise strict, with no coercion: any other comparison across types is `false` (`true == 1`, `"1" == 1`).
-  - Ordering (`< > <= >=`) two booleans, two arrays, two records, two maps, two enum members or two `null` values panics.
+  - Otherwise strict, with no coercion: any other equality (`==`, `!=`) across types is `false` (`true == 1`, `"1" == 1`, `x == null`).
+  - Only numbers and strings are ordered. Ordering (`< > <= >=`) two booleans, two arrays, two records, two maps, two enum members or two `null` values panics, and so does ordering values of two different types other than an int and a float: `null < 0` panics with `type error: '<' cannot order null and int`, rather than being `false` and hiding the mistake.
 - **Logical:** `&& || !`, booleans only, short-circuiting.
 - **Bitwise:** `& | ^ ~ << >>`, integers only, in the int32 range.
   - A shift amount outside 0–31 panics.
@@ -1067,6 +1069,10 @@ Because redirected input is decoded the same way, a program that reads keys can 
 - Output is not affected: `"\n"` still starts a new line at the left edge.
 - `$readLine` and `$run` restore the normal terminal while they run, and turn key mode back on afterwards. `$readKey` and `$readLine` share one input buffer, so keys read ahead are never lost.
 - The runtime restores the terminal however the program ends: at `;exit`, after a panic, after a broken pipe, and on Ctrl+C.
+- **Screen state.** A program may hide the cursor (`"\u{1B}[?25l"`) or switch to the alternate screen (`"\u{1B}[?1049h"`, or the older `?1047h` and `?47h`) by writing escape sequences to a terminal. The runtime notes them as they are written, and undoes whatever is still in effect when the program ends, in the same ways and on the stream they were written to: it leaves the alternate screen, then shows the cursor.
+  - After a panic it does this before printing the message, so the message and stack trace stay on the normal screen.
+  - Ctrl+C restores it too, whether or not the program reads keys, and Ctrl+Z restores it while the program is suspended and puts it back when it resumes.
+  - Output to a file or a pipe is never looked at or added to. A sequence split across two writes is not noticed.
 - **Ctrl+C** ends the program, at any time, as it does without key mode. It is not a panic or a fail, so nothing can handle it. Where the host has signals, the program is killed by `SIGINT` after the terminal is restored, and shells report status 130 (128 + 2). Elsewhere (Windows) it exits with code 130.
 - **Ctrl+Z** suspends the program on POSIX as usual. The terminal is restored while it is suspended, and key mode comes back when it resumes. On Windows Ctrl+Z is discarded.
 - Other control keys that terminals normally intercept, such as Ctrl+S, Ctrl+Q, Ctrl+V and Ctrl+O, have no special meaning in key mode and are returned as `"ctrl+s"` and so on.

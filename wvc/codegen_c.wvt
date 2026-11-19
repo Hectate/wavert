@@ -1004,7 +1004,8 @@
     // block that raises a panic for a subject that is not one of the members.
     ;fn matchElse(e, t) {
         ;if (e.els != null || e.cases[0].values[0].k != "mem") { ;return e.els }
-        { stmts: [], value: { k: "raw", js: "(rt_no_case({t}), RT_NULL)", pos: null, paren: false }, close: null }
+        // At the match, so that a stack trace points to it.
+        { stmts: [], value: { k: "raw", js: "(rt_no_case({t}), RT_NULL)", pos: e.pos, paren: false }, close: null }
     }
 
     ;fn matchStmt(e) {

@@ -102,6 +102,7 @@ There is no `=`: declare with `is`, assign with `set ... to`, compare with `==`.
 - `/` always gives a float. For integer division use `(a / b)($floor)`, or `math.div`, which is exact. `%` is floored, so `-7 % 3` is `2`.
 - `+` joins two strings only: `"n=" + n` panics, so use `"n={n}"` or `n($toString)`.
 - `==` compares arrays, records and maps **by reference**; `$same` compares their contents.
+- `==` and `!=` across types are just `false`/`true` (`x == null` is normal), but `< > <= >=` order only numbers and strings: `null < 0` panics.
 - Literals are frozen. A `var` binding holds a mutable copy (§10.4).
 - **Copies are shallow:** a `const` snapshot of a record still shares the arrays inside it.
 - Map keys are ints, strings, booleans, enum members, or flat records compared by contents (`{ x: 3, y: 4 }`; §10.11).
